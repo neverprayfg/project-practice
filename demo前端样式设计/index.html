@@ -3,361 +3,146 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>信息学竞赛 AI 自动造数据与数据校验工具 - 前端 Demo</title>
+    <meta name="theme-color" content="#0f6669" />
+    <title>TestForge · 竞赛数据工作台</title>
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
     <div class="app-shell">
-      <aside class="sidebar" aria-label="项目导航">
+      <aside class="sidebar" aria-label="流水线导航">
         <div class="brand">
-          <div class="brand-mark">AI</div>
-          <div>
-            <strong>数据校验工具</strong>
-            <span>Polygon-like Demo</span>
-          </div>
+          <span class="brand-mark" aria-hidden="true"><i data-lucide="database-zap"></i></span>
+          <span class="brand-copy"><strong>TestForge</strong><small>竞赛数据工作台</small></span>
         </div>
 
-        <button class="primary-action" id="newProjectBtn" type="button">
-          <span aria-hidden="true">＋</span>
-          新建项目
+        <button class="button button-primary button-block" id="newProjectBtn" type="button">
+          <i data-lucide="plus"></i><span>新建项目</span>
         </button>
 
-        <nav class="project-list" aria-label="项目列表">
-          <button class="project-item active" type="button" data-project="tree">
-            <span class="project-dot good"></span>
-            <span>
-              <strong>树上路径查询</strong>
-              <small>12 / 12 通过校验</small>
-            </span>
+        <nav class="stage-nav" id="stageNav">
+          <button class="stage-link active" type="button" data-stage="1">
+            <span class="stage-number">1</span><span class="stage-copy"><strong>创建项目</strong><small>题面、标程与难度</small></span><i class="stage-state" data-lucide="circle"></i>
           </button>
-          <button class="project-item" type="button" data-project="string">
-            <span class="project-dot warn"></span>
-            <span>
-              <strong>字符串模式计数</strong>
-              <small>需确认变量名</small>
-            </span>
+          <button class="stage-link" type="button" data-stage="2">
+            <span class="stage-number">2</span><span class="stage-copy"><strong>编译标程</strong><small>Docker 环境检查</small></span><i class="stage-state" data-lucide="circle"></i>
           </button>
-          <button class="project-item" type="button" data-project="graph">
-            <span class="project-dot idle"></span>
-            <span>
-              <strong>稀疏图最短路</strong>
-              <small>等待生成</small>
-            </span>
+          <button class="stage-link" type="button" data-stage="3">
+            <span class="stage-number">3</span><span class="stage-copy"><strong>确认输入结构</strong><small>AI 草稿与问题</small></span><i class="stage-state" data-lucide="circle"></i>
+          </button>
+          <button class="stage-link" type="button" data-stage="4">
+            <span class="stage-number">4</span><span class="stage-copy"><strong>规划子任务</strong><small>范围、数量与复杂度</small></span><i class="stage-state" data-lucide="circle"></i>
+          </button>
+          <button class="stage-link" type="button" data-stage="5">
+            <span class="stage-number">5</span><span class="stage-copy"><strong>编写代码草稿</strong><small>生成器与校验器</small></span><i class="stage-state" data-lucide="circle"></i>
+          </button>
+          <button class="stage-link" type="button" data-stage="6">
+            <span class="stage-number">6</span><span class="stage-copy"><strong>批量生成数据</strong><small>受限容器中运行</small></span><i class="stage-state" data-lucide="circle"></i>
+          </button>
+          <button class="stage-link" type="button" data-stage="7">
+            <span class="stage-number">7</span><span class="stage-copy"><strong>验证与输出</strong><small>validator 与标程</small></span><i class="stage-state" data-lucide="circle"></i>
+          </button>
+          <button class="stage-link" type="button" data-stage="8">
+            <span class="stage-number">8</span><span class="stage-copy"><strong>导出数据包</strong><small>代码与输入输出</small></span><i class="stage-state" data-lucide="circle"></i>
           </button>
         </nav>
 
-        <div class="sidebar-note">
-          <strong>当前边界</strong>
-          <span>不接 OJ，不做课堂系统，不生成标程。</span>
+        <div class="sidebar-footer">
+          <span class="connection-dot" id="sidebarConnectionDot"></span>
+          <span id="sidebarConnectionText">正在连接后端</span>
         </div>
       </aside>
 
       <main class="workspace">
         <header class="topbar">
-          <div>
-            <p class="eyebrow">单题数据生成工作台</p>
-            <h1 id="projectTitle">树上路径查询</h1>
+          <div class="title-group">
+            <p class="breadcrumb"><span id="projectLabel">尚未创建项目</span><i data-lucide="chevron-right"></i><span id="stageLabel">创建项目</span></p>
+            <h1 id="pageTitle">创建数据项目</h1>
           </div>
           <div class="topbar-actions">
-            <button class="ghost-button icon-button" type="button" title="刷新状态" id="refreshBtn" aria-label="刷新状态">⟳</button>
-            <button class="ghost-button" type="button" id="exportBtn">
-              <span aria-hidden="true">⬇</span>
-              导出
-            </button>
+            <span class="api-status" id="apiStatus"><span class="connection-dot"></span><span>连接中</span></span>
+            <button class="icon-button" id="modelSettingsBtn" type="button" title="模型与 API 设置" aria-label="模型与 API 设置"><i data-lucide="settings-2"></i></button>
+            <button class="icon-button" id="refreshBtn" type="button" title="刷新项目状态" aria-label="刷新项目状态"><i data-lucide="refresh-cw"></i></button>
           </div>
         </header>
 
-        <section class="status-strip" aria-label="流程状态">
-          <div class="status-step done"><span>1</span>标程</div>
-          <div class="status-step active"><span>2</span>输入配置</div>
-          <div class="status-step"><span>3</span>AI 分析</div>
-          <div class="status-step"><span>4</span>生成校验</div>
-          <div class="status-step"><span>5</span>报告导出</div>
-        </section>
-
-        <div class="tabbar" role="tablist" aria-label="工作区页面">
-          <button class="tab active" type="button" data-tab="config">输入配置</button>
-          <button class="tab" type="button" data-tab="workflow">智能体流程</button>
-          <button class="tab" type="button" data-tab="plan">测试点计划</button>
-          <button class="tab" type="button" data-tab="code">代码预览</button>
-          <button class="tab" type="button" data-tab="data">数据预览</button>
-          <button class="tab" type="button" data-tab="report">质量报告</button>
+        <div class="mobile-stage-select">
+          <label for="stageSelect">当前阶段</label>
+          <select id="stageSelect"></select>
         </div>
 
-        <section class="tab-panel active" id="config">
-          <div class="work-grid">
-            <section class="panel solution-panel">
-              <div class="panel-heading">
-                <div>
-                  <p class="eyebrow">Main Correct Solution</p>
-                  <h2>标程导入</h2>
-                </div>
-                <span class="badge good">Docker 编译通过</span>
-              </div>
-              <textarea id="solutionCode" class="code-input" spellcheck="false">#include &lt;bits/stdc++.h&gt;
-using namespace std;
-
-int main() {
-    ios::sync_with_stdio(false);
-    cin.tie(nullptr);
-    int N, Q;
-    cin &gt;&gt; N &gt;&gt; Q;
-    vector&lt;int&gt; w(N + 1);
-    for (int i = 1; i &lt;= N; ++i) cin &gt;&gt; w[i];
-    for (int i = 0; i &lt; N - 1; ++i) {
-        int u, v;
-        cin &gt;&gt; u &gt;&gt; v;
-    }
-    while (Q--) {
-        int u, v;
-        cin &gt;&gt; u &gt;&gt; v;
-        cout &lt;&lt; 0 &lt;&lt; '\n';
-    }
-}</textarea>
-              <div class="button-row">
-                <button class="secondary-button" type="button" id="compileBtn">
-                  <span aria-hidden="true">▣</span>
-                  编译标程
-                </button>
-                <button class="secondary-button" type="button" id="formatBtn">
-                  <span aria-hidden="true">⌘</span>
-                  格式化
-                </button>
-              </div>
-            </section>
-
-            <section class="panel input-panel">
-              <div class="panel-heading">
-                <div>
-                  <p class="eyebrow">Input Configuration</p>
-                  <h2>数据范围与规模</h2>
-                </div>
-                <span class="badge warn">待人工确认</span>
-              </div>
-
-              <label class="field">
-                <span>数据范围</span>
-                <textarea id="constraintsInput" class="text-box" rows="7">2 <= N <= 5 * 10^5
-1 <= Q <= 5 * 10^5
-1 <= w_i <= 10^9
-N is an integer
-Edges form a tree on vertices 1..N
-Each query contains two integers u and v</textarea>
-                <small>变量名需要与标程代码中的变量名保持一致，例如 N、Q、u、v。</small>
-              </label>
-
-              <div class="field-grid">
-                <label class="field">
-                  <span>数量规模</span>
-                  <input id="caseCountInput" class="text-input" type="text" inputmode="numeric" value="12" />
-                  <small id="caseCountHint">请输入正整数。</small>
-                </label>
-                <label class="field">
-                  <span>难度等级</span>
-                  <select id="difficultySelect" class="select-input">
-                    <option value="简单">简单</option>
-                    <option value="中等" selected>中等</option>
-                    <option value="较难">较难</option>
-                  </select>
-                  <small>单选下拉框，一次选择一个等级。</small>
-                </label>
-              </div>
-
-              <div class="button-row">
-                <button class="primary-button" type="button" id="analyzeBtn">
-                  <span aria-hidden="true">▶</span>
-                  运行 AI 分析
-                </button>
-                <button class="secondary-button" type="button" id="saveConfigBtn">
-                  <span aria-hidden="true">✓</span>
-                  保存配置
-                </button>
-              </div>
-            </section>
-          </div>
-        </section>
-
-        <section class="tab-panel" id="workflow">
-          <div class="split-layout">
-            <section class="panel">
-              <div class="panel-heading">
-                <div>
-                  <p class="eyebrow">Dify Workflow</p>
-                  <h2>智能体节点</h2>
-                </div>
-                <span class="badge" id="workflowBadge">未运行</span>
-              </div>
-              <div class="agent-list" id="agentList"></div>
-            </section>
-            <section class="panel">
-              <div class="panel-heading">
-                <div>
-                  <p class="eyebrow">Uncertain Fields</p>
-                  <h2>人工确认项</h2>
-                </div>
-              </div>
-              <div class="confirm-list">
-                <label><input type="checkbox" /> Q 是否为查询总数</label>
-                <label><input type="checkbox" /> 边集是否必须无重边</label>
-                <label><input type="checkbox" /> 权值 w_i 是否允许重复</label>
-                <label><input type="checkbox" /> 极限数据是否需要链状树</label>
-              </div>
-            </section>
-          </div>
-        </section>
-
-        <section class="tab-panel" id="plan">
-          <section class="panel">
-            <div class="panel-heading">
-              <div>
-                <p class="eyebrow">Case Planning</p>
-                <h2>测试点计划</h2>
-              </div>
-              <button class="secondary-button" type="button" id="generateBtn">
-                <span aria-hidden="true">▶</span>
-                生成数据
-              </button>
-            </div>
-            <div class="table-wrap">
-              <table class="data-table">
-                <thead>
-                  <tr>
-                    <th>编号</th>
-                    <th>类别</th>
-                    <th>规模</th>
-                    <th>覆盖目标</th>
-                    <th>Seed</th>
-                    <th>状态</th>
-                  </tr>
-                </thead>
-                <tbody id="casePlanBody"></tbody>
-              </table>
-            </div>
-          </section>
-        </section>
-
-        <section class="tab-panel" id="code">
-          <div class="code-grid">
-            <section class="panel">
-              <div class="panel-heading">
-                <div>
-                  <p class="eyebrow">jngen</p>
-                  <h2>generator.cpp</h2>
-                </div>
-                <span class="badge good">编译通过</span>
-              </div>
-              <pre class="code-preview" id="generatorPreview"></pre>
-            </section>
-            <section class="panel">
-              <div class="panel-heading">
-                <div>
-                  <p class="eyebrow">testlib</p>
-                  <h2>validator.cpp</h2>
-                </div>
-                <span class="badge good">校验通过</span>
-              </div>
-              <pre class="code-preview" id="validatorPreview"></pre>
-            </section>
-          </div>
-        </section>
-
-        <section class="tab-panel" id="data">
-          <div class="split-layout">
-            <section class="panel">
-              <div class="panel-heading">
-                <div>
-                  <p class="eyebrow">Dataset</p>
-                  <h2>输入输出预览</h2>
-                </div>
-              </div>
-              <div class="file-preview">
-                <div>
-                  <strong>1.in</strong>
-                  <pre>8 5
-3 1 4 1 5 9 2 6
-1 2
-1 3
-2 4
-2 5
-3 6
-3 7
-7 8
-1 8
-2 6
-4 5
-3 7
-6 8</pre>
-                </div>
-                <div>
-                  <strong>1.out</strong>
-                  <pre>0
-0
-0
-0
-0</pre>
-                </div>
-              </div>
-            </section>
-            <section class="panel">
-              <div class="panel-heading">
-                <div>
-                  <p class="eyebrow">Runtime</p>
-                  <h2>资源记录</h2>
-                </div>
-              </div>
-              <div class="metric-list">
-                <div><span>最大运行时间</span><strong>186 ms</strong></div>
-                <div><span>最大内存</span><strong>42 MB</strong></div>
-                <div><span>最大输入</span><strong>3.8 MB</strong></div>
-                <div><span>最大输出</span><strong>1.1 MB</strong></div>
-              </div>
-            </section>
-          </div>
-        </section>
-
-        <section class="tab-panel" id="report">
-          <section class="panel report-panel">
-            <div class="panel-heading">
-              <div>
-                <p class="eyebrow">Quality Report</p>
-                <h2>质量报告</h2>
-              </div>
-              <span class="badge good">可导出</span>
-            </div>
-            <div class="report-grid">
-              <div class="report-tile">
-                <span>测试点</span>
-                <strong id="reportCases">12</strong>
-                <small>normal / boundary / extreme / special</small>
-              </div>
-              <div class="report-tile">
-                <span>validator</span>
-                <strong>100%</strong>
-                <small>每个 .in 均通过校验</small>
-              </div>
-              <div class="report-tile">
-                <span>标程运行</span>
-                <strong>OK</strong>
-                <small>未超时，未超内存</small>
-              </div>
-              <div class="report-tile">
-                <span>人工确认</span>
-                <strong>4</strong>
-                <small>变量含义和结构约束</small>
-              </div>
-            </div>
-            <div class="report-body">
-              <h3>覆盖摘要</h3>
-              <p>已覆盖小规模样例、链状树、星状树、随机树、极限 N / Q、重复权值、端点查询和高频查询。</p>
-              <h3>导出内容</h3>
-              <p><code>1.in</code> 到 <code>12.in</code>、对应 <code>.out</code>、generator.cpp、validator.cpp、solution.cpp、metadata.json、report.md。</p>
-            </div>
-          </section>
-        </section>
+        <section id="stageContent" class="stage-content" aria-live="polite"></section>
       </main>
     </div>
 
+    <dialog class="settings-dialog" id="modelSettingsDialog" aria-labelledby="modelSettingsTitle">
+      <form id="modelSettingsForm" method="dialog">
+        <header class="settings-dialog-header">
+          <div>
+            <p class="dialog-eyebrow">系统设置</p>
+            <h2 id="modelSettingsTitle">模型与 API</h2>
+          </div>
+          <button class="icon-button" id="closeModelSettingsBtn" type="button" title="关闭" aria-label="关闭模型设置"><i data-lucide="x"></i></button>
+        </header>
+
+        <div class="settings-dialog-body">
+          <div class="model-config-status" id="modelConfigStatus" aria-live="polite"></div>
+
+          <fieldset class="mode-fieldset">
+            <legend>运行模式</legend>
+            <div class="segmented-control" id="modelModeControl">
+              <label><input type="radio" name="modelMode" value="remote" checked><span><i data-lucide="cloud"></i>真实模型</span></label>
+              <label><input type="radio" name="modelMode" value="mock"><span><i data-lucide="flask-conical"></i>Mock 测试</span></label>
+            </div>
+          </fieldset>
+
+          <div class="form-grid model-remote-fields">
+            <label class="field model-url-field">
+              <span class="required">API Base URL</span>
+              <input class="text-input" id="modelBaseUrl" type="url" required spellcheck="false" placeholder="https://api.deepseek.com/v1">
+            </label>
+            <label class="field">
+              <span class="required">模型名称</span>
+              <input class="text-input" id="modelName" type="text" required spellcheck="false" placeholder="deepseek-chat">
+            </label>
+          </div>
+
+          <label class="field model-remote-fields">
+            <span>API Key</span>
+            <div class="secret-input">
+              <input class="text-input" id="modelApiKey" type="password" autocomplete="new-password" spellcheck="false" placeholder="输入新的 API Key">
+              <button class="secret-toggle" id="toggleApiKeyBtn" type="button" title="显示 API Key" aria-label="显示 API Key"><i data-lucide="eye"></i></button>
+            </div>
+            <small id="apiKeyHelp">密钥只保存到后端，不会在页面中回显。</small>
+          </label>
+
+          <div class="form-grid three settings-numeric-grid">
+            <label class="field">
+              <span class="required">请求超时（秒）</span>
+              <input class="number-input" id="modelTimeout" type="number" min="5" max="600" step="1" required>
+            </label>
+            <label class="field">
+              <span class="required">Agent 最大循环次数</span>
+              <input class="number-input" id="agentMaxIterations" type="number" min="1" max="12" step="1" required>
+            </label>
+            <label class="field">
+              <span class="required">每子任务试验种子数</span>
+              <input class="number-input" id="trialSeedsPerSubtask" type="number" min="1" max="5" step="1" required>
+            </label>
+          </div>
+        </div>
+
+        <footer class="settings-dialog-footer">
+          <button class="button button-secondary" id="testModelConnectionBtn" type="button"><i data-lucide="plug-zap"></i><span>测试连接</span></button>
+          <div class="form-actions">
+            <button class="button button-secondary" id="cancelModelSettingsBtn" type="button">取消</button>
+            <button class="button button-primary" id="saveModelSettingsBtn" type="submit"><i data-lucide="save"></i><span>保存配置</span></button>
+          </div>
+        </footer>
+      </form>
+    </dialog>
+
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="./vendor/lucide.min.js"></script>
     <script src="./app.js"></script>
   </body>
 </html>

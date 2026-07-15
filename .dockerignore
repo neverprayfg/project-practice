@@ -1,0 +1,16 @@
+.git
+.DS_Store
+backend/.env
+backend/.venv
+backend/**/__pycache__
+backend/.pytest_cache
+backend/.ruff_cache
+exports/*
+report
+storage/*
+tmp
+deploy/state/
+dify
+agentscope
+langchain
+langgraph

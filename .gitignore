@@ -9,3 +9,15 @@
 *.fls
 *.fdb_latexmk
 *.synctex.gz
+
+# Backend runtime and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+backend/.env
+/.env
+/storage/
+/exports/
+/deploy/state/
