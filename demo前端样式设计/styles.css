@@ -411,6 +411,79 @@ svg {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.history-surface {
+  margin-top: 18px;
+  overflow: hidden;
+}
+
+.history-surface .section-heading {
+  padding: 16px 18px;
+}
+
+.history-list {
+  display: grid;
+}
+
+.history-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px;
+  align-items: center;
+  width: 100%;
+  padding: 14px 18px;
+  border: 0;
+  border-top: 1px solid var(--line);
+  color: inherit;
+  background: transparent;
+  text-align: left;
+}
+
+.history-item:hover:not(:disabled) {
+  background: var(--surface-muted);
+}
+
+.history-item.active {
+  background: #eef7f5;
+}
+
+.history-main,
+.history-meta {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.history-main strong,
+.history-main small,
+.history-meta small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-main strong {
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.history-main small,
+.history-meta small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.history-meta {
+  justify-items: end;
+}
+
+.history-empty {
+  padding: 22px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 13px;
+  text-align: center;
+}
+
 .field {
   display: grid;
   gap: 7px;
@@ -1602,6 +1675,14 @@ svg {
   .action-bar {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .history-item {
+    grid-template-columns: 1fr;
+  }
+
+  .history-meta {
+    justify-items: start;
   }
 
   .confirmation-actions,

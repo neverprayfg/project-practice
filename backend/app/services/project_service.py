@@ -46,6 +46,27 @@ class ProjectService:
     def get(self, project_id: str) -> ProjectRecord:
         return self.storage.load_record(project_id)
 
+    def list_history(self) -> list[dict[str, Any]]:
+        records = [self.get(project_id) for project_id in self.storage.project_ids()]
+        records.sort(key=lambda record: record.updated_at, reverse=True)
+        return [
+            {
+                "project_id": record.project_id,
+                "title": self._history_title(record.problem_description, record.project_id),
+                "problem_description": record.problem_description,
+                "difficulty": record.difficulty,
+                "current_stage": int(record.current_stage),
+                "solution_compiled": record.solution_compiled,
+                "generation_complete": record.generation_complete,
+                "build_complete": record.build_complete,
+                "export_ready": record.export_ready,
+                "last_error": record.last_error,
+                "created_at": record.created_at.isoformat(),
+                "updated_at": record.updated_at.isoformat(),
+            }
+            for record in records
+        ]
+
     def recover_interrupted_checks(self) -> list[str]:
         """Release checking states left behind by a process restart or crash."""
         recovered: list[str] = []
@@ -174,6 +195,14 @@ class ProjectService:
             Stage.CODE_DRAFT: ("generator_code", "validator_code"),
         }[Stage(stage)]
         return {field: draft.get(field) for field in fields}
+
+    @staticmethod
+    def _history_title(problem_description: str, project_id: str) -> str:
+        for line in problem_description.splitlines():
+            title = line.lstrip("#").strip()
+            if title:
+                return title[:80]
+        return f"项目 {project_id[:8]}"
 
     def save_ai_result(
         self,

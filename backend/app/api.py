@@ -77,6 +77,11 @@ async def create_project(payload: ProjectCreate, request: Request) -> dict:
     return request.app.state.projects.get(record.project_id).model_dump(mode="json")
 
 
+@router.get("/api/projects")
+async def list_projects(request: Request) -> dict:
+    return {"projects": request.app.state.projects.list_history()}
+
+
 @router.get("/api/projects/{project_id}")
 async def get_project(project_id: str, request: Request) -> dict:
     storage = request.app.state.storage

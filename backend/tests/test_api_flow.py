@@ -134,6 +134,44 @@ def test_complete_mvp_flow_exports_only_required_files(
         ]
 
 
+def test_project_history_lists_saved_problem_records(
+    app_bundle: tuple[TestClient, FakeSandbox],
+) -> None:
+    client, _sandbox = app_bundle
+    first = client.post(
+        "/api/projects",
+        json={
+            "problem_description": "# First Problem\nRead n.",
+            "solution_code": "int main(){}",
+            "difficulty": "easy",
+        },
+    )
+    second = client.post(
+        "/api/projects",
+        json={
+            "problem_description": "Second Problem\nRead m.",
+            "solution_code": "int main(){}",
+            "difficulty": "medium",
+        },
+    )
+
+    assert first.status_code == 201, first.text
+    assert second.status_code == 201, second.text
+    first_id = first.json()["project_id"]
+    second_id = second.json()["project_id"]
+    client.post(f"/api/projects/{first_id}/solution/compile")
+
+    history = client.get("/api/projects")
+
+    assert history.status_code == 200, history.text
+    projects = history.json()["projects"]
+    assert [project["project_id"] for project in projects] == [first_id, second_id]
+    assert projects[0]["title"] == "First Problem"
+    assert projects[0]["current_stage"] == 3
+    assert projects[0]["solution_compiled"] is True
+    assert projects[1]["title"] == "Second Problem"
+
+
 def test_user_cannot_confirm_before_ai(created_project: tuple[TestClient, str]) -> None:
     client, project_id = created_project
     client.post(f"/api/projects/{project_id}/solution/compile")

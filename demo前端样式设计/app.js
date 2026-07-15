@@ -24,6 +24,7 @@ const state = {
   apiOnline: false,
   apiMode: "",
   modelConfig: null,
+  projectHistory: [],
   modelSettingsBusy: false,
   busy: false,
   busyLabel: "",
@@ -50,6 +51,25 @@ function escapeHtml(value = "") {
 
 function cloneJson(value) {
   return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
+function formatDateTime(value) {
+  if (!value) return "未知时间";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "未知时间";
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function historyStageLabel(project) {
+  const stage = Number(project.current_stage || 1);
+  if (project.last_error) return `阶段 ${stage} 有问题`;
+  if (project.export_ready) return "可导出";
+  return `阶段 ${stage} · ${STAGES[stage - 1] || "进行中"}`;
 }
 
 function draftContent(stage, draft) {
@@ -317,13 +337,15 @@ function busyButton(label = "处理中") {
 }
 
 function renderStage1() {
+  const history = renderProjectHistory();
   if (state.project) {
     return `<div class="page-intro"><div><h2>项目输入</h2><p>项目已创建。题目描述与难度仅用于当前项目，其中难度不会发送给 AI。</p></div><span class="badge success">${icon("check")}已保存</span></div>
       <section class="work-surface"><div class="surface-body form-stack">
         <label class="field"><span>题目描述</span><textarea class="text-area problem" disabled>${escapeHtml(state.project.problem_description)}</textarea></label>
         <div class="form-grid"><label class="field"><span>难度等级</span><input class="text-input" value="${escapeHtml(state.project.difficulty)}" disabled></label><label class="field"><span>项目编号</span><input class="text-input" value="${escapeHtml(state.project.project_id)}" disabled></label></div>
       </div></section>
-      <div class="action-bar"><span class="save-state">${icon("check-circle-2")}阶段 1 已完成</span><div class="form-actions"><button class="button button-primary" id="goCurrentBtn" type="button">前往当前阶段${icon("arrow-right")}</button></div></div>`;
+      <div class="action-bar"><span class="save-state">${icon("check-circle-2")}阶段 1 已完成</span><div class="form-actions"><button class="button button-primary" id="goCurrentBtn" type="button">前往当前阶段${icon("arrow-right")}</button></div></div>
+      ${history}`;
   }
 
   return `<div class="page-intro"><div><h2>录入题目与标准程序</h2><p>三项均为必填。题目描述可粘贴或上传文本，C++ 标程可直接编辑或上传 .cpp 文件。</p></div></div>
@@ -332,7 +354,24 @@ function renderStage1() {
       <label class="field"><span class="required">C++ 标程代码</span><textarea id="solutionCode" class="code-editor" spellcheck="false" placeholder="#include <bits/stdc++.h>\nusing namespace std;\n\nint main() {\n  return 0;\n}"></textarea><div class="upload-actions"><input class="sr-only" id="solutionFile" type="file" accept=".cpp,.cc,.cxx,text/x-c++src"><button class="button button-secondary" data-upload="solutionFile" type="button">${icon("upload")}上传 .cpp 文件</button><span class="file-name" id="solutionFileName">代码将在 Docker 中编译</span></div></label>
       <label class="field"><span class="required">难度等级</span><select id="difficulty" class="select-input"><option value="">请选择</option><option>入门</option><option>普及-</option><option>普及/提高-</option><option>提高+/省选-</option><option>省选/NOI-</option><option>NOI/NOI+/CTSC</option></select><small>用于 Agent1 规范化输入和后续子任务规划。</small></label>
     </div></section>
-    <div class="action-bar"><span class="save-state">${icon("shield-check")}创建后将自动执行标程编译</span><div class="form-actions"><button class="button button-primary" id="createProjectBtn" type="button" ${state.busy ? "disabled" : ""}>${state.busy ? busyButton() : `${icon("play")}创建并编译`}</button></div></div>`;
+    <div class="action-bar"><span class="save-state">${icon("shield-check")}创建后将自动执行标程编译</span><div class="form-actions"><button class="button button-primary" id="createProjectBtn" type="button" ${state.busy ? "disabled" : ""}>${state.busy ? busyButton() : `${icon("play")}创建并编译`}</button></div></div>
+    ${history}`;
+}
+
+function renderProjectHistory() {
+  if (!state.projectHistory.length) {
+    return `<section class="work-surface history-surface"><div class="section-heading"><div><h3>历史题目记录</h3><p>创建过的题目会保留在这里，方便回到之前的进度。</p></div><span class="badge info">${icon("archive")}0 条</span></div><div class="history-empty">暂无历史记录</div></section>`;
+  }
+  return `<section class="work-surface history-surface"><div class="section-heading"><div><h3>历史题目记录</h3><p>每条记录保留题面、标程、阶段草稿、生成批次和导出状态。</p></div><span class="badge info">${icon("archive")}${state.projectHistory.length} 条</span></div>
+    <div class="history-list">${state.projectHistory.map((item) => {
+      const active = item.project_id === state.projectId;
+      const stageLabel = historyStageLabel(item);
+      const badgeClass = item.last_error ? "error" : item.export_ready ? "success" : "warning";
+      return `<button class="history-item ${active ? "active" : ""}" type="button" data-open-project="${escapeHtml(item.project_id)}" ${active ? "disabled" : ""}>
+        <span class="history-main"><strong>${escapeHtml(item.title)}</strong><small>${escapeHtml(item.problem_description || "").slice(0, 120)}</small></span>
+        <span class="history-meta"><span class="badge ${badgeClass}">${escapeHtml(stageLabel)}</span><small>${escapeHtml(item.difficulty)} · 更新 ${escapeHtml(formatDateTime(item.updated_at))}</small></span>
+      </button>`;
+    }).join("")}</div></section>`;
 }
 
 function renderStage2() {
@@ -724,6 +763,9 @@ function bindStage(stage) {
 }
 
 function bindStage1() {
+  $$("[data-open-project]").forEach((button) => {
+    button.addEventListener("click", () => openHistoricalProject(button.dataset.openProject));
+  });
   $$('[data-upload]').forEach((button) => {
     button.addEventListener("click", () => $(`#${button.dataset.upload}`).click());
   });
@@ -760,6 +802,7 @@ function createProject() {
     state.project = response.project;
     state.compileResult = response.result;
     await refreshProject({ silent: true });
+    await loadProjectHistory();
     state.activeStage = state.project.solution_compiled ? 3 : 2;
     if (!state.project.solution_compiled) throw Object.assign(new Error("solution compilation failed"), { payload: state.project.last_error });
   }, "项目已创建，标程编译通过");
@@ -997,6 +1040,44 @@ async function refreshProject({ silent = false, keepError = false } = {}) {
   }
 }
 
+async function loadProjectHistory() {
+  if (!state.apiOnline) return;
+  try {
+    const response = await api("/api/projects");
+    state.projectHistory = response.projects || [];
+  } catch {
+    state.projectHistory = [];
+  }
+}
+
+async function openHistoricalProject(projectId) {
+  if (!projectId || projectId === state.projectId) return;
+  if (!discardUnsavedChangesBeforeNavigation(1)) return;
+  state.projectId = projectId;
+  localStorage.setItem("testforge.projectId", projectId);
+  Object.assign(state, {
+    project: null,
+    drafts: { "3": null, "4": null, "5": null },
+    draftBaselines: { "3": null, "4": null, "5": null },
+    solutionCode: "",
+    solutionBaseline: "",
+    dirtySolution: false,
+    error: null,
+    compileResult: null,
+    preview: null,
+    previewHistory: [],
+    buildResult: null,
+    expandedSubtasks: new Set([0]),
+    dirtyStages: new Set(),
+  });
+  await refreshProject({ silent: true });
+  if (state.project) {
+    state.activeStage = Number(state.project.current_stage);
+    showToast("已切换到历史题目");
+  }
+  render();
+}
+
 async function checkHealth() {
   try {
     const health = await api("/health");
@@ -1204,6 +1285,7 @@ async function init() {
     await checkHealth();
     if (state.apiOnline) {
       try { await loadModelConfiguration(); } catch { /* keep health state visible */ }
+      await loadProjectHistory();
     }
     await refreshProject();
     render();
@@ -1211,6 +1293,7 @@ async function init() {
   await checkHealth();
   if (state.apiOnline) {
     try { await loadModelConfiguration(); } catch { /* health remains authoritative for connectivity */ }
+    await loadProjectHistory();
   }
   if (state.projectId) {
     await refreshProject({ silent: true });
