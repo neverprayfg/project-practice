@@ -1,0 +1,7 @@
+[submodule "jngen"]
+	path = jngen
+	url = https://github.com/ifsmirnov/jngen.git
+
+[submodule "testlib"]
+	path = testlib
+	url = https://github.com/MikeMirzayanov/testlib.git

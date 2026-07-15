@@ -1,0 +1,107 @@
+name: contest-dataset-mvp
+
+x-backend-build: &backend-build
+  context: .
+  dockerfile: docker/backend.Dockerfile
+
+services:
+  docker-api:
+    build: *backend-build
+    image: contest-dataset-backend:0.1.0
+    user: "0:0"
+    command: ["python", "-m", "app.docker_proxy"]
+    environment:
+      DOCKER_PROXY_TIMEOUT_SECONDS: ${DOCKER_PROXY_TIMEOUT_SECONDS:-1200}
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [internal]
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  workspace-init:
+    build: *backend-build
+    image: contest-dataset-backend:0.1.0
+    user: "0:0"
+    command: ["sh", "-c", "chown -R 10001:10001 /workspace /exports"]
+    network_mode: none
+    volumes:
+      - contest_dataset_storage:/workspace
+      - ./exports:/exports
+    cap_drop: ["ALL"]
+    cap_add: ["CHOWN", "DAC_READ_SEARCH"]
+    security_opt:
+      - no-new-privileges:true
+
+  backend:
+    build: *backend-build
+    image: contest-dataset-backend:0.1.0
+    depends_on:
+      docker-api:
+        condition: service_started
+      workspace-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      APP_ENV: development
+      STORAGE_ROOT: /workspace
+      EXPORT_ROOT: /exports
+      TESTLIB_ROOT: /opt/testlib
+      JNGEN_ROOT: /opt/jngen
+      STORAGE_VOLUME: contest_dataset_storage
+      RUNNER_COMPILE_IMAGE: contest-dataset-runner-compiler:0.2.0
+      RUNNER_EXECUTE_IMAGE: contest-dataset-runner-executor:0.2.0
+      RUNNER_CONCURRENCY: ${RUNNER_CONCURRENCY:-2}
+      RUNNER_BATCH_SIZE: ${RUNNER_BATCH_SIZE:-16}
+      MANIFEST_CHECKPOINT_INTERVAL: ${MANIFEST_CHECKPOINT_INTERVAL:-10}
+      DOCKER_HOST: tcp://docker-api:2375
+      MODEL_MODE: ${MODEL_MODE:-mock}
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-https://api.deepseek.com/v1}
+      MODEL_API_KEY: ${MODEL_API_KEY:-}
+      MODEL_NAME: ${MODEL_NAME:-deepseek-chat}
+      MODEL_TIMEOUT_SECONDS: ${MODEL_TIMEOUT_SECONDS:-300}
+      AGENT_MAX_ITERATIONS: ${AGENT_MAX_ITERATIONS:-4}
+      AGENT_JNGEN_DOCUMENT_SELECTION_ROUNDS: ${AGENT_JNGEN_DOCUMENT_SELECTION_ROUNDS:-3}
+      AGENT_JNGEN_DOCUMENTS_PER_ROUND: ${AGENT_JNGEN_DOCUMENTS_PER_ROUND:-2}
+      AGENT_JNGEN_DOCUMENT_CONTEXT_CHARS: ${AGENT_JNGEN_DOCUMENT_CONTEXT_CHARS:-32000}
+    volumes:
+      - contest_dataset_storage:/workspace
+      - ./exports:/exports
+      - ./testlib:/opt/testlib:ro
+      - ./jngen:/opt/jngen:ro
+    networks: [internal]
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  runner-compiler-image:
+    profiles: ["build"]
+    build:
+      context: .
+      dockerfile: docker/runner.Dockerfile
+      target: compiler
+    image: contest-dataset-runner-compiler:0.2.0
+    entrypoint: ["/bin/true"]
+
+  runner-executor-image:
+    profiles: ["build"]
+    build:
+      context: .
+      dockerfile: docker/runner.Dockerfile
+      target: executor
+    image: contest-dataset-runner-executor:0.2.0
+    entrypoint: ["/bin/true"]
+
+networks:
+  internal:
+    name: contest-dataset-internal
+
+volumes:
+  contest_dataset_storage:
+    name: contest_dataset_storage

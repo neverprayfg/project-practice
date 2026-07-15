@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0f6669" />
+    <title>TestForge · 竞赛数据工作台</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="流水线导航">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"><i data-lucide="database-zap"></i></span>
+          <span class="brand-copy"><strong>TestForge</strong><small>竞赛数据工作台</small></span>
+        </div>
+
+        <button class="button button-primary button-block" id="newProjectBtn" type="button">
+          <i data-lucide="plus"></i><span>新建项目</span>
+        </button>
+
+        <nav class="stage-nav" id="stageNav">
+          <button class="stage-link active" type="button" data-stage="1">
+            <span class="stage-number">1</span><span class="stage-copy"><strong>创建项目</strong><small>题面、标程与难度</small></span><i class="stage-state" data-lucide="circle"></i>
+          </button>
+          <button class="stage-link" type="button" data-stage="2">
+            <span class="stage-number">2</span><span class="stage-copy"><strong>编译标程</strong><small>Docker 环境检查</small></span><i class="stage-state" data-lucide="circle"></i>
+          </button>
+          <button class="stage-link" type="button" data-stage="3">
+            <span class="stage-number">3</span><span class="stage-copy"><strong>确认输入结构</strong><small>AI 草稿与问题</small></span><i class="stage-state" data-lucide="circle"></i>
+          </button>
+          <button class="stage-link" type="button" data-stage="4">
+            <span class="stage-number">4</span><span class="stage-copy"><strong>规划子任务</strong><small>范围、数量与复杂度</small></span><i class="stage-state" data-lucide="circle"></i>
+          </button>
+          <button class="stage-link" type="button" data-stage="5">
+            <span class="stage-number">5</span><span class="stage-copy"><strong>编写代码草稿</strong><small>生成器与校验器</small></span><i class="stage-state" data-lucide="circle"></i>
+          </button>
+          <button class="stage-link" type="button" data-stage="6">
+            <span class="stage-number">6</span><span class="stage-copy"><strong>批量生成数据</strong><small>受限容器中运行</small></span><i class="stage-state" data-lucide="circle"></i>
+          </button>
+          <button class="stage-link" type="button" data-stage="7">
+            <span class="stage-number">7</span><span class="stage-copy"><strong>验证与输出</strong><small>validator 与标程</small></span><i class="stage-state" data-lucide="circle"></i>
+          </button>
+          <button class="stage-link" type="button" data-stage="8">
+            <span class="stage-number">8</span><span class="stage-copy"><strong>导出数据包</strong><small>代码与输入输出</small></span><i class="stage-state" data-lucide="circle"></i>
+          </button>
+        </nav>
+
+        <div class="sidebar-footer">
+          <span class="connection-dot" id="sidebarConnectionDot"></span>
+          <span id="sidebarConnectionText">正在连接后端</span>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div class="title-group">
+            <p class="breadcrumb"><span id="projectLabel">尚未创建项目</span><i data-lucide="chevron-right"></i><span id="stageLabel">创建项目</span></p>
+            <h1 id="pageTitle">创建数据项目</h1>
+          </div>
+          <div class="topbar-actions">
+            <span class="api-status" id="apiStatus"><span class="connection-dot"></span><span>连接中</span></span>
+            <button class="icon-button" id="modelSettingsBtn" type="button" title="模型与 API 设置" aria-label="模型与 API 设置"><i data-lucide="settings-2"></i></button>
+            <button class="icon-button" id="refreshBtn" type="button" title="刷新项目状态" aria-label="刷新项目状态"><i data-lucide="refresh-cw"></i></button>
+          </div>
+        </header>
+
+        <div class="mobile-stage-select">
+          <label for="stageSelect">当前阶段</label>
+          <select id="stageSelect"></select>
+        </div>
+
+        <section id="stageContent" class="stage-content" aria-live="polite"></section>
+      </main>
+    </div>
+
+    <dialog class="settings-dialog" id="modelSettingsDialog" aria-labelledby="modelSettingsTitle">
+      <form id="modelSettingsForm" method="dialog">
+        <header class="settings-dialog-header">
+          <div>
+            <p class="dialog-eyebrow">系统设置</p>
+            <h2 id="modelSettingsTitle">模型与 API</h2>
+          </div>
+          <button class="icon-button" id="closeModelSettingsBtn" type="button" title="关闭" aria-label="关闭模型设置"><i data-lucide="x"></i></button>
+        </header>
+
+        <div class="settings-dialog-body">
+          <div class="model-config-status" id="modelConfigStatus" aria-live="polite"></div>
+
+          <fieldset class="mode-fieldset">
+            <legend>运行模式</legend>
+            <div class="segmented-control" id="modelModeControl">
+              <label><input type="radio" name="modelMode" value="remote" checked><span><i data-lucide="cloud"></i>真实模型</span></label>
+              <label><input type="radio" name="modelMode" value="mock"><span><i data-lucide="flask-conical"></i>Mock 测试</span></label>
+            </div>
+          </fieldset>
+
+          <div class="form-grid model-remote-fields">
+            <label class="field model-url-field">
+              <span class="required">API Base URL</span>
+              <input class="text-input" id="modelBaseUrl" type="url" required spellcheck="false" placeholder="https://api.deepseek.com/v1">
+            </label>
+            <label class="field">
+              <span class="required">模型名称</span>
+              <input class="text-input" id="modelName" type="text" required spellcheck="false" placeholder="deepseek-chat">
+            </label>
+          </div>
+
+          <label class="field model-remote-fields">
+            <span>API Key</span>
+            <div class="secret-input">
+              <input class="text-input" id="modelApiKey" type="password" autocomplete="new-password" spellcheck="false" placeholder="输入新的 API Key">
+              <button class="secret-toggle" id="toggleApiKeyBtn" type="button" title="显示 API Key" aria-label="显示 API Key"><i data-lucide="eye"></i></button>
+            </div>
+            <small id="apiKeyHelp">密钥只保存到后端，不会在页面中回显。</small>
+          </label>
+
+          <div class="form-grid three settings-numeric-grid">
+            <label class="field">
+              <span class="required">请求超时（秒）</span>
+              <input class="number-input" id="modelTimeout" type="number" min="5" max="600" step="1" required>
+            </label>
+            <label class="field">
+              <span class="required">Agent 最大循环次数</span>
+              <input class="number-input" id="agentMaxIterations" type="number" min="1" max="12" step="1" required>
+            </label>
+            <label class="field">
+              <span class="required">每子任务试验种子数</span>
+              <input class="number-input" id="trialSeedsPerSubtask" type="number" min="1" max="5" step="1" required>
+            </label>
+          </div>
+        </div>
+
+        <footer class="settings-dialog-footer">
+          <button class="button button-secondary" id="testModelConnectionBtn" type="button"><i data-lucide="plug-zap"></i><span>测试连接</span></button>
+          <div class="form-actions">
+            <button class="button button-secondary" id="cancelModelSettingsBtn" type="button">取消</button>
+            <button class="button button-primary" id="saveModelSettingsBtn" type="submit"><i data-lucide="save"></i><span>保存配置</span></button>
+          </div>
+        </footer>
+      </form>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="./vendor/lucide.min.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>
