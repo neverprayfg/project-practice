@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iostream>
 #include <regex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -25,8 +26,10 @@ struct ProcessResult {
 
 struct GenerateRequest {
     std::string subtask;
+    std::string case_id;
     std::string seed;
     std::string output_file;
+    std::vector<std::string> runtime_arguments;
 };
 
 struct ValidationRequest {
@@ -165,6 +168,7 @@ void write_process_json(
 ) {
     output << "{\"ok\":" << (result.exit_code == 0 ? "true" : "false")
            << ",\"exit_code\":" << result.exit_code
+           << ",\"timed_out\":" << (result.timed_out ? "true" : "false")
            << ",\"stdout\":\"" << json_escape(result.stdout_text) << "\""
            << ",\"stderr\":\"" << json_escape(result.stderr_text) << "\"";
     if (!output_file.empty()) {
@@ -188,6 +192,54 @@ std::vector<std::string> split_fields(const std::string& value) {
         start = separator + 1;
     }
     return fields;
+}
+
+bool parse_runtime_arguments(
+    const std::string& encoded,
+    std::vector<std::string>& arguments
+) {
+    if (encoded.empty()) return false;
+    std::set<std::string> names;
+    std::size_t start = 0;
+    while (true) {
+        const std::size_t separator = encoded.find(';', start);
+        const std::string item = encoded.substr(start, separator - start);
+        const std::size_t equals = item.find('=');
+        if (equals == std::string::npos || item.find('=', equals + 1) != std::string::npos) {
+            return false;
+        }
+        const std::string name = item.substr(0, equals);
+        const std::string value = item.substr(equals + 1);
+        if (!std::regex_match(name, std::regex("^[a-z][a-z0-9_]{0,31}$"))
+            || name == "seed" || name == "subtask" || name == "case"
+            || !std::regex_match(value, std::regex("^[A-Za-z0-9_.:+-]{1,64}$"))) {
+            return false;
+        }
+        if (!names.insert(name).second) return false;
+        arguments.push_back("-" + name + "=" + value);
+        if (arguments.size() > 24) return false;
+        if (separator == std::string::npos) break;
+        start = separator + 1;
+    }
+    return true;
+}
+
+std::vector<std::string> generator_arguments(
+    const fs::path& project,
+    const GenerateRequest& request
+) {
+    std::vector<std::string> arguments = {
+        (project / "bin/generator").string(),
+        "-subtask=" + request.subtask,
+        "-case=" + request.case_id,
+        "-seed=" + request.seed,
+    };
+    arguments.insert(
+        arguments.end(),
+        request.runtime_arguments.begin(),
+        request.runtime_arguments.end()
+    );
+    return arguments;
 }
 
 void emit_generation_batch(
@@ -278,24 +330,31 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    if (operation == "generate" && argc == 6) {
+    if (operation == "generate" && argc == 8) {
         const std::string subtask = argv[3];
-        const std::string seed = argv[4];
-        const std::string relative = argv[5];
+        const std::string case_id = argv[4];
+        const std::string seed = argv[5];
+        const std::string relative = argv[6];
+        std::vector<std::string> runtime_arguments;
         if (!std::regex_match(subtask, std::regex("^[1-9][0-9]*$"))
+            || !std::regex_match(case_id, std::regex("^[1-9][0-9]*$"))
             || !std::regex_match(seed, std::regex("^-?[0-9]+$"))
-            || !valid_relative_path(relative, ".in")) {
+            || !valid_relative_path(relative, ".in")
+            || !parse_runtime_arguments(argv[7], runtime_arguments)) {
             emit(invalid_request("invalid generation arguments"));
             return 0;
         }
         const fs::path output = project / relative;
         fs::create_directories(output.parent_path());
         emit(
-            run_process({
-                (project / "bin/generator").string(),
-                "-subtask=" + subtask,
-                "-seed=" + seed
-            }, "/dev/null", output),
+            run_process(
+                generator_arguments(
+                    project,
+                    {subtask, case_id, seed, relative, runtime_arguments}
+                ),
+                "/dev/null",
+                output
+            ),
             relative
         );
         return 0;
@@ -306,14 +365,19 @@ int main(int argc, char** argv) {
         requests.reserve(static_cast<std::size_t>(argc - 3));
         for (int index = 3; index < argc; ++index) {
             const std::vector<std::string> fields = split_fields(argv[index]);
-            if (fields.size() != 3
+            std::vector<std::string> runtime_arguments;
+            if (fields.size() != 5
                 || !std::regex_match(fields[0], std::regex("^[1-9][0-9]*$"))
-                || !std::regex_match(fields[1], std::regex("^-?[0-9]+$"))
-                || !valid_relative_path(fields[2], ".in")) {
+                || !std::regex_match(fields[1], std::regex("^[1-9][0-9]*$"))
+                || !std::regex_match(fields[2], std::regex("^-?[0-9]+$"))
+                || !valid_relative_path(fields[3], ".in")
+                || !parse_runtime_arguments(fields[4], runtime_arguments)) {
                 emit(invalid_request("invalid generation batch arguments"));
                 return 0;
             }
-            requests.push_back({fields[0], fields[1], fields[2]});
+            requests.push_back(
+                {fields[0], fields[1], fields[2], fields[3], runtime_arguments}
+            );
         }
 
         std::vector<ProcessResult> results;
@@ -321,11 +385,13 @@ int main(int argc, char** argv) {
         for (const GenerateRequest& request : requests) {
             const fs::path output = project / request.output_file;
             fs::create_directories(output.parent_path());
-            results.push_back(run_process({
-                (project / "bin/generator").string(),
-                "-subtask=" + request.subtask,
-                "-seed=" + request.seed
-            }, "/dev/null", output));
+            results.push_back(
+                run_process(
+                    generator_arguments(project, request),
+                    "/dev/null",
+                    output
+                )
+            );
         }
         emit_generation_batch(requests, results);
         return 0;

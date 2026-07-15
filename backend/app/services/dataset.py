@@ -12,6 +12,7 @@ from app.config import Settings
 from app.errors import AppError
 from app.models import Stage, StageStatus, Subtask, SubtaskPlanDraft
 from app.services.project_service import ProjectService
+from app.services.runtime_parameters import profile_for_case, serialized_arguments
 from app.services.sandbox import GenerationJob, Sandbox, ValidationJob
 from app.storage import ProjectStorage
 
@@ -90,7 +91,17 @@ class DatasetService:
                 stem = f"{subtask.id}_{internal_id}"
                 input_relative = f"data/{stem}.in"
                 seed = base_seed + subtask.id * 1_000_000 + internal_id
-                jobs.append(GenerationJob(subtask.id, seed, input_relative))
+                profile = profile_for_case(subtask, internal_id)
+                runtime_arguments = serialized_arguments(profile)
+                jobs.append(
+                    GenerationJob(
+                        subtask.id,
+                        seed,
+                        input_relative,
+                        case_id=internal_id,
+                        runtime_arguments=runtime_arguments,
+                    )
+                )
                 job_details[input_relative] = (subtask, internal_id, seed, stem)
 
         batches = await asyncio.gather(
@@ -126,6 +137,7 @@ class DatasetService:
                     "subtask_id": subtask.id,
                     "internal_id": internal_id,
                     "seed": seed,
+                    "runtime_arguments": job.runtime_arguments,
                     "input_file": f"{stem}.in",
                     "generation": self._result_summary(generated),
                 }
@@ -348,7 +360,18 @@ class DatasetService:
         raw = self.storage.load_draft(project_id, 4)
         if raw is None:
             raise AppError("PREREQUISITE_REQUIRED", "缺少子任务配置。", stage=4)
-        return SubtaskPlanDraft.model_validate(raw)
+        plan = SubtaskPlanDraft.model_validate(raw)
+        missing = [
+            subtask.id for subtask in plan.subtasks if not subtask.runtime_parameters
+        ]
+        if missing:
+            raise AppError(
+                "PREREQUISITE_REQUIRED",
+                "子任务缺少逐测试点运行时参数，请返回阶段 4 重新确认。",
+                stage=4,
+                details={"subtask_ids": missing},
+            )
+        return plan
 
     @staticmethod
     def _select_subtasks(
@@ -380,6 +403,7 @@ class DatasetService:
         entry = {
             "code": code,
             "message": message,
+            "failure_category": self._failure_category(code, serialized),
             "workflow_revision": record.workflow_revision,
             "input_revision": record.input_revision,
             "subtasks_revision": record.subtasks_revision,
@@ -396,6 +420,20 @@ class DatasetService:
         error = {"code": code, "message": message, "stage": 5, "details": entry}
         self.projects.mark_pipeline_failure(project_id, Stage.CODE_DRAFT, error)
         raise AppError(code, message, stage=5, details=entry)
+
+    @staticmethod
+    def _failure_category(code: str, feedback: dict[str, Any]) -> str:
+        result = feedback.get("result")
+        if isinstance(result, dict) and result.get("timed_out"):
+            return "timeout"
+        return {
+            "COMPILE_FAILED": "compile",
+            "GENERATION_FAILED": "generation",
+            "INPUT_MISSING": "generation",
+            "VALIDATION_FAILED": "validation",
+            "SOLUTION_FAILED": "solution",
+            "OUTPUT_MISSING": "solution",
+        }.get(code, "unknown")
 
     def _manifest_matches(self, record: Any, manifest: dict[str, Any]) -> bool:
         return (

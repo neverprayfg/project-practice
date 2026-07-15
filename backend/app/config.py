@@ -21,8 +21,8 @@ class Settings(BaseSettings):
     testlib_root: Path = Path("/opt/testlib")
     jngen_root: Path = Path("/opt/jngen")
     storage_volume: str = "contest_dataset_storage"
-    runner_compile_image: str = "contest-dataset-runner-compiler:0.2.0"
-    runner_execute_image: str = "contest-dataset-runner-executor:0.2.0"
+    runner_compile_image: str = "contest-dataset-runner-compiler:0.3.0"
+    runner_execute_image: str = "contest-dataset-runner-executor:0.3.0"
     runner_memory: str = "512m"
     runner_nano_cpus: int = 1_000_000_000
     runner_timeout_seconds: int = 30
@@ -32,7 +32,6 @@ class Settings(BaseSettings):
     max_tool_calls_per_run: int = 8
     max_log_chars: int = 16_000
 
-    model_mode: Literal["remote", "mock"] = "remote"
     model_base_url: str = "https://api.deepseek.com/v1"
     model_api_key: str = ""
     model_name: str = "deepseek-chat"
@@ -43,8 +42,9 @@ class Settings(BaseSettings):
     # consuming the document-selection budget.
     agent_jngen_document_selection_rounds: int = Field(default=3, ge=2, le=5)
     agent_jngen_documents_per_round: int = Field(default=2, ge=1, le=3)
-    agent_jngen_document_context_chars: int = Field(default=32_000, ge=8_000, le=100_000)
+    agent_jngen_document_context_chars: int = Field(default=64_000, ge=8_000, le=100_000)
     agent_trial_seeds_per_subtask: int = Field(default=1, ge=1, le=5)
+    agent_allow_legacy_keyword_routing: bool = False
 
     docker_host: str | None = Field(default=None, validation_alias="DOCKER_HOST")
 

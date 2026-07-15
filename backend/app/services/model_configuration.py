@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import Any
 
@@ -10,7 +11,7 @@ from pydantic import ValidationError
 from app.config import Settings
 from app.errors import AppError
 from app.models import ModelConfigurationUpdate, ModelRuntimeConfiguration
-from app.services.model_client import AgentModel, MockAgentModel, OpenAICompatibleAgentModel
+from app.services.model_client import AgentModel, OpenAICompatibleAgentModel
 from app.storage import ProjectStorage
 
 
@@ -34,14 +35,11 @@ class ModelConfigurationService:
         return self._config.model_copy(deep=True)
 
     def build_model(self) -> AgentModel:
-        if self._config.mode == "mock":
-            return MockAgentModel()
         return OpenAICompatibleAgentModel(self.settings)
 
     def public_view(self) -> dict[str, Any]:
         key = self._config.api_key
         return {
-            "mode": self._config.mode,
             "base_url": self._config.base_url,
             "model_name": self._config.model_name,
             "api_key_configured": bool(key),
@@ -55,7 +53,6 @@ class ModelConfigurationService:
         current = self._config.model_dump()
         supplied_key = (payload.api_key or "").strip()
         current.update(
-            mode=payload.mode,
             base_url=payload.base_url,
             model_name=payload.model_name,
             timeout_seconds=payload.timeout_seconds,
@@ -79,20 +76,7 @@ class ModelConfigurationService:
         self, payload: ModelConfigurationUpdate | None = None
     ) -> dict[str, Any]:
         config = self.resolve(payload) if payload is not None else self.config
-        if config.mode == "mock":
-            return {
-                "ok": True,
-                "mode": "mock",
-                "model_name": config.model_name,
-                "latency_ms": 0,
-                "message": "Mock 模式无需连接外部模型服务。",
-            }
-        if not config.api_key:
-            raise AppError(
-                "MODEL_NOT_CONFIGURED",
-                "请先填写 API Key，再测试模型连接。",
-                status_code=400,
-            )
+        self._ensure_configured(config, status_code=400)
 
         owns_client = self._client is None
         client = self._client or httpx.AsyncClient(timeout=config.timeout_seconds)
@@ -126,7 +110,6 @@ class ModelConfigurationService:
                 await client.aclose()
         return {
             "ok": True,
-            "mode": "remote",
             "model_name": config.model_name,
             "latency_ms": round((time.perf_counter() - started) * 1000),
             "message": "模型连接测试通过。",
@@ -135,9 +118,11 @@ class ModelConfigurationService:
     def _load(self) -> ModelRuntimeConfiguration:
         if self.path.is_file():
             try:
-                return ModelRuntimeConfiguration.model_validate_json(
-                    self.path.read_text(encoding="utf-8")
-                )
+                value = json.loads(self.path.read_text(encoding="utf-8"))
+                legacy_mode = value.pop("mode", None)
+                if legacy_mode not in {None, "remote"}:
+                    raise ValueError("Mock model configuration is no longer supported")
+                return ModelRuntimeConfiguration.model_validate(value)
             except (OSError, ValidationError, ValueError) as exc:
                 raise AppError(
                     "MODEL_CONFIG_INVALID",
@@ -146,7 +131,6 @@ class ModelConfigurationService:
                     details={"path": str(self.path)},
                 ) from exc
         return ModelRuntimeConfiguration(
-            mode=self.settings.model_mode,
             base_url=self.settings.model_base_url,
             model_name=self.settings.model_name,
             api_key=self.settings.model_api_key,
@@ -162,10 +146,21 @@ class ModelConfigurationService:
         self.path.chmod(0o600)
 
     def _apply_to_settings(self, config: ModelRuntimeConfiguration) -> None:
-        self.settings.model_mode = config.mode
         self.settings.model_base_url = config.base_url
         self.settings.model_name = config.model_name
         self.settings.model_api_key = config.api_key
         self.settings.model_timeout_seconds = config.timeout_seconds
         self.settings.agent_max_iterations = config.max_iterations
         self.settings.agent_trial_seeds_per_subtask = config.trial_seeds_per_subtask
+
+    @staticmethod
+    def _ensure_configured(
+        config: ModelRuntimeConfiguration, *, status_code: int = 500
+    ) -> None:
+        if config.api_key:
+            return
+        raise AppError(
+            "MODEL_NOT_CONFIGURED",
+            "未配置模型 API Key，请先在模型设置中完成配置。",
+            status_code=status_code,
+        )

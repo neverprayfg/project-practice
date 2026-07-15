@@ -2,16 +2,23 @@ from __future__ import annotations
 
 import json
 import stat
+from pathlib import Path
 
+import pytest
 from conftest import FakeSandbox
 from fastapi.testclient import TestClient
 
+from app.config import Settings
+from app.errors import AppError
+from app.main import create_app
+from app.models import TaskType
 from app.services.model_client import OpenAICompatibleAgentModel
+from app.services.model_configuration import ModelConfigurationService
+from app.storage import ProjectStorage
 
 
 def model_payload(**updates: object) -> dict:
     payload = {
-        "mode": "remote",
         "base_url": "https://api.deepseek.com/v1",
         "model_name": "deepseek-chat",
         "api_key": "sk-test-secret-1234",
@@ -62,24 +69,94 @@ def test_blank_api_key_keeps_existing_secret(
     assert client.app.state.settings.model_api_key == "sk-test-secret-1234"
 
 
-def test_mock_connection_can_be_tested_without_external_api(
+def test_model_configuration_can_clear_api_key_and_disable_ai(
     app_bundle: tuple[TestClient, FakeSandbox],
 ) -> None:
     client, _sandbox = app_bundle
+    client.put("/api/settings/model", json=model_payload())
 
-    response = client.post(
-        "/api/settings/model/test",
-        json=model_payload(mode="mock", api_key=None),
+    response = client.put(
+        "/api/settings/model",
+        json=model_payload(api_key=None, clear_api_key=True),
     )
 
     assert response.status_code == 200, response.text
-    assert response.json() == {
-        "ok": True,
-        "mode": "mock",
-        "model_name": "deepseek-chat",
-        "latency_ms": 0,
-        "message": "Mock 模式无需连接外部模型服务。",
-    }
+    assert response.json()["api_key_configured"] is False
+    assert client.app.state.settings.model_api_key == ""
+    path = client.app.state.storage.root / "_system" / "model_config.json"
+    assert json.loads(path.read_text(encoding="utf-8"))["api_key"] == ""
+
+
+def test_app_starts_without_model_configuration(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None,
+        app_env="test",
+        storage_root=tmp_path,
+        model_api_key="",
+    )
+
+    app = create_app(settings, sandbox=FakeSandbox(tmp_path))
+    with TestClient(app) as client:
+        health = client.get("/health")
+        configuration = client.get("/api/settings/model")
+
+    assert health.status_code == 200
+    assert health.json()["model_api_configured"] is False
+    assert configuration.status_code == 200
+    assert configuration.json()["api_key_configured"] is False
+
+
+@pytest.mark.asyncio
+async def test_ai_operation_requires_model_configuration(tmp_path: Path) -> None:
+    storage = ProjectStorage(tmp_path / "storage")
+    service = ModelConfigurationService(
+        Settings(_env_file=None, storage_root=storage.root, model_api_key=""),
+        storage,
+    )
+
+    with pytest.raises(AppError) as exc_info:
+        await service.build_model().run(
+            TaskType.INPUT_STRUCTURE,
+            "generate",
+            {},
+            {},
+            {},
+            [],
+        )
+
+    assert exc_info.value.code == "MODEL_NOT_CONFIGURED"
+
+
+def test_legacy_remote_configuration_is_migrated(tmp_path: Path) -> None:
+    storage = ProjectStorage(tmp_path / "storage")
+    path = storage.root / "_system" / "model_config.json"
+    legacy = model_payload(mode="remote")
+    legacy.pop("clear_api_key")
+    ProjectStorage.write_json(path, legacy)
+
+    service = ModelConfigurationService(
+        Settings(_env_file=None, storage_root=storage.root, model_api_key=""),
+        storage,
+    )
+
+    assert service.config.api_key == "sk-test-secret-1234"
+    assert "mode" not in service.public_view()
+
+
+def test_legacy_mock_configuration_is_rejected(tmp_path: Path) -> None:
+    storage = ProjectStorage(tmp_path / "storage")
+    path = storage.root / "_system" / "model_config.json"
+    legacy = model_payload(mode="mock")
+    legacy.pop("clear_api_key")
+    ProjectStorage.write_json(path, legacy)
+
+    with pytest.raises(AppError) as exc_info:
+        ModelConfigurationService(
+            Settings(_env_file=None, storage_root=storage.root, model_api_key=""),
+            storage,
+        )
+
+    assert exc_info.value.code == "MODEL_CONFIG_INVALID"
 
 
 def test_model_configuration_rejects_busy_pipeline_and_invalid_url(

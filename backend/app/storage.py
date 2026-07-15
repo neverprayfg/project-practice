@@ -151,7 +151,18 @@ class ProjectStorage:
     def save_code_draft(self, project_id: str, draft: CodeDraft) -> CodeDraft:
         previous_revision = self.current_revision(project_id)
         digest = hashlib.sha256(
-            (draft.generator_code + "\0" + draft.validator_code).encode()
+            (
+                draft.generator_code
+                + "\0"
+                + draft.validator_code
+                + "\0"
+                + json.dumps(
+                    [item.model_dump(mode="json") for item in draft.constraint_coverage],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            ).encode()
         ).hexdigest()[:12]
         saved = draft.model_copy(update={"revision_id": digest})
         project_dir = self.project_dir(project_id)
@@ -211,6 +222,7 @@ class ProjectStorage:
 
     def append_audit(self, project_id: str, entry: dict[str, Any]) -> None:
         path = self.project_dir(project_id) / "logs" / "tool-audit.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(entry, ensure_ascii=True, separators=(",", ":")) + "\n")
 
@@ -219,9 +231,34 @@ class ProjectStorage:
     ) -> None:
         """Append a content-free trace of Agent4's document retrieval."""
         path = self.project_dir(project_id) / "logs" / "agent4-document-selection.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
         value = {"timestamp": datetime.now(UTC).isoformat(), **entry}
         with path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+    def append_agent4_timing(self, project_id: str, entry: dict[str, Any]) -> None:
+        """Append one stage-5 timing event without candidate or source content."""
+        path = self.project_dir(project_id) / "logs" / "agent4-timings.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        value = {"timestamp": datetime.now(UTC).isoformat(), **entry}
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+    def load_agent4_timings(self, project_id: str) -> list[dict[str, Any]]:
+        path = self.project_dir(project_id) / "logs" / "agent4-timings.jsonl"
+        if not path.is_file():
+            return []
+        events: list[dict[str, Any]] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                events.append(value)
+        return events
 
     def clear_directory(self, project_id: str, name: str) -> Path:
         if name not in {"preview", "data", "bin", "export"}:

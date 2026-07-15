@@ -1,17 +1,24 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 from app.errors import AppError
 from app.models import JngenDocumentSelection
+from app.services.structure_tag_catalog import StructureTagCatalog
 
 
 class JngenDocumentContext:
     """Builds the bounded, structured Jngen context used by Agent4."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        tag_catalog: StructureTagCatalog | None = None,
+    ) -> None:
         self.root = root
+        self.tag_catalog = tag_catalog
 
     def available_filenames(self) -> list[str]:
         if not self.root.is_dir():
@@ -46,6 +53,96 @@ class JngenDocumentContext:
             }
             for filename in available_filenames
         ]
+
+    def route_documents(
+        self,
+        context: dict[str, Any],
+        maximum_context_characters: int,
+    ) -> dict[str, Any] | None:
+        """Resolve docs only from confirmed stage-three structure tags."""
+        structure_tags = context.get("confirmed_structure_tags")
+        if not isinstance(structure_tags, list) or not structure_tags:
+            return None
+        if self.tag_catalog is None:
+            raise AppError(
+                "TAG_CATALOG_MISSING",
+                "结构标签目录未加载。",
+                stage=3,
+            )
+        issues = self.tag_catalog.validate_structure_tags(structure_tags)
+        if issues:
+            raise AppError(
+                "STRUCTURE_TAG_REVIEW_REQUIRED",
+                "阶段三结构标签需要复核。",
+                stage=3,
+                status_code=409,
+                details={"issues": issues},
+            )
+        tag_ids = list(
+            dict.fromkeys(
+                str(item["tag_id"])
+                for item in structure_tags
+                if isinstance(item, dict) and item.get("tag_id")
+            )
+        )
+        return self.tag_catalog.resolve_documents(
+            tag_ids,
+            maximum_context_characters,
+            validate_conflicts=False,
+        )
+
+    def legacy_route_documents(self, context: dict[str, Any]) -> dict[str, Any] | None:
+        """Temporary keyword route retained only behind an explicit feature flag."""
+        index_path = self.root / "index.json"
+        if not index_path.is_file():
+            return None
+        try:
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return None
+        topics = index.get("topics")
+        if not isinstance(topics, dict):
+            return None
+        searchable = json.dumps(
+            {
+                "input": context.get("input", {}),
+                "subtasks": context.get("subtasks", []),
+            },
+            ensure_ascii=False,
+        ).casefold()
+        matched_topics: list[str] = []
+        filenames: list[str] = []
+        for topic, metadata in topics.items():
+            if not isinstance(metadata, dict):
+                continue
+            keywords = metadata.get("keywords", [])
+            if not any(
+                isinstance(keyword, str) and keyword.casefold() in searchable
+                for keyword in keywords
+            ):
+                continue
+            matched_topics.append(str(topic))
+            filenames.extend(metadata.get("documents", []))
+            filenames.extend(metadata.get("dependencies", []))
+        if not matched_topics:
+            return None
+        routed = [*index.get("base_documents", []), *filenames]
+        available = set(self.available_filenames())
+        selected_filenames = list(
+            dict.fromkeys(
+                filename
+                for filename in routed
+                if isinstance(filename, str) and filename in available
+            )
+        )
+        if not selected_filenames:
+            return None
+        return {
+            "route_method": "legacy_keyword_routing",
+            "index_version": int(index.get("version", 1)),
+            "matched_topics": matched_topics,
+            "selected_filenames": selected_filenames,
+        }
 
     def format_selected_documents(
         self,

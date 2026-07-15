@@ -24,6 +24,7 @@ const state = {
   apiOnline: false,
   apiMode: "",
   modelConfig: null,
+  tagCatalog: { version: null, tags: [] },
   modelSettingsBusy: false,
   busy: false,
   busyLabel: "",
@@ -56,6 +57,7 @@ function draftContent(stage, draft) {
   if (stage === 3) {
     return {
       template: String(draft?.template || "").trim(),
+      structure_tags: Array.isArray(draft?.structure_tags) ? cloneJson(draft.structure_tags) : [],
     };
   }
   if (stage === 4) {
@@ -69,12 +71,19 @@ function draftContent(stage, draft) {
           count: Number(item.count || 0),
           description: String(item.description || "").trim(),
         })) : [],
+        runtime_parameters: Array.isArray(subtask.runtime_parameters)
+          ? cloneJson(subtask.runtime_parameters)
+          : [],
+        subtask_tags: Array.isArray(subtask.subtask_tags) ? [...subtask.subtask_tags] : [],
       })) : [],
     };
   }
   return {
     generator_code: String(draft?.generator_code || "").trim(),
     validator_code: String(draft?.validator_code || "").trim(),
+    constraint_coverage: Array.isArray(draft?.constraint_coverage)
+      ? cloneJson(draft.constraint_coverage)
+      : [],
   };
 }
 
@@ -149,6 +158,10 @@ function errorMessage(error) {
     JNGEN_DOCUMENT_SELECTION_INCOMPLETE: "文档检索未明确结束，请重新运行 Agent4。",
     JNGEN_DOCUMENT_SELECTION_INVALID: "文档选择包含无效或重复文件，请重新运行 Agent4。",
     JNGEN_DOCUMENT_CONTEXT_TOO_LARGE: "所选文档过多，请重新运行 Agent4 进行更精简的选择。",
+    STRUCTURE_TAG_REVIEW_REQUIRED: "阶段 3 结构标签尚未确认或存在冲突，请返回复核。",
+    STRUCTURE_TAG_DOCUMENT_BUDGET_EXCEEDED: "标签所需 jngen 文档超过上下文预算，请复核标签或调整预算。",
+    INVALID_STRUCTURE_TAGS: "阶段 3 结构标签不在目录中、不受支持或存在冲突。",
+    INVALID_SUBTASK_TAGS: "子任务结构细化标签无效或与已确认标签冲突。",
     STALE_STAGE: "该阶段已不是当前活动阶段，请刷新项目状态。",
     INVALID_REQUEST: "配置内容不符合要求，请检查必填项和字段格式。",
   };
@@ -387,10 +400,14 @@ function renderStage3() {
   if (!state.project || !canOpenStage(3)) return lockedEmpty(3);
   const draft = state.drafts["3"];
   const template = draft?.template || "";
+  const structureTags = draft?.structure_tags || [];
+  const supportedTags = (state.tagCatalog.tags || []).filter((item) => item.status === "supported");
   const info = state.project.stages?.["3"] || {};
   return `${confirmationBand(3)}<div class="page-intro"><div><h2>输入结构模板</h2><p>AI 综合题目描述与标程读取逻辑生成非结构化文本，统一变量名称并说明读取顺序、类型和依赖关系；用户可直接审核和修改。</p></div><span class="badge info">确认后保存为 Template</span></div>
     <section class="work-surface"><div class="surface-body">
       <label class="field"><span class="required">输入结构描述</span><textarea id="inputStructureTemplate" class="text-area structure-template" placeholder="运行 AI 分析后将在此生成输入结构模板；也可以先手动填写。">${escapeHtml(template)}</textarea><small>该文本确认后将作为阶段 4 的只读模板；需要修改时必须返回本阶段重新确认。</small></label>
+      <label class="field"><span class="required">已识别的结构标签</span><textarea id="structureTagsInput" class="text-area" rows="9" placeholder='[{"tag_id":"graph.directed.weighted","applies_to":"边表","evidence":"M 行起点、终点和边权"}]'>${escapeHtml(JSON.stringify(structureTags, null, 2))}</textarea><small>标签与模板一起由用户确认；混合结构应保留多个标签及各自适用部分。目录版本：${escapeHtml(state.tagCatalog.version ?? "-")}</small></label>
+      <div class="tag-catalog"><span class="helper-text">当前可用标签：</span>${supportedTags.map((item) => `<span class="badge">${escapeHtml(item.id)}</span>`).join(" ")}</div>
       ${stageIssues(draft, 3)}
     </div></section>
     ${interactiveActionBar(3, Boolean(template.trim()), info)}`;
@@ -404,7 +421,7 @@ function defaultSubtaskPlan() {
 }
 
 function emptySubtask(id) {
-  return { id, constraints: "", test_count: 10, expected_complexity: "O(n)", special_cases: [] };
+  return { id, constraints: "", test_count: 10, expected_complexity: "O(n)", special_cases: [], runtime_parameters: [], subtask_tags: [] };
 }
 
 function complexityControl(value, index) {
@@ -430,6 +447,8 @@ function renderSubtask(subtask, index) {
       <section class="subtask-column constraints-column"><h4 class="column-title"><span>数据限制描述</span><span class="badge">自由文本</span></h4><textarea class="text-area constraint-editor" data-plan-key="constraints" data-subtask="${index}" placeholder="请参照输入结构描述约束，例如：n: [1000, 5000]">${escapeHtml(subtask.constraints || "")}</textarea><p class="helper-text">支持自然语言、数学不等式、键值范围、区间和分行文本，无需改写为固定句式。轻微名称差别会由 AI 自动修正。</p></section>
       <section class="subtask-column form-stack"><h4 class="column-title">数量与复杂度</h4><label class="field"><span class="required">测试点总数</span><input class="number-input" type="number" min="1" step="1" data-plan-key="test-count" data-subtask="${index}" value="${escapeHtml(subtask.test_count)}"></label><label class="field"><span class="required">期望通过的算法复杂度</span>${complexityControl(subtask.expected_complexity, index)}</label></section>
       <section class="subtask-column"><h4 class="column-title"><span>非规模性特殊测试点</span><button class="link-button" data-add-special="${index}" type="button">${icon("plus")}添加一项</button></h4><div class="special-list">${specials || `<p class="helper-text">当前没有特殊测试点，全部测试点按普通规模生成。</p>`}</div></section>
+      <section class="subtask-column constraints-column"><h4 class="column-title"><span>逐测试点运行时参数</span><span class="badge">JSON</span></h4><textarea class="text-area constraint-editor" data-plan-key="runtime-parameters" data-subtask="${index}" placeholder='[{"case_id":1,"parameters":[{"name":"n_max","value":10,"category":"size"}]}]'>${escapeHtml(JSON.stringify(subtask.runtime_parameters || [], null, 2))}</textarea><p class="helper-text">case_id 必须覆盖 1..测试点总数；参数会作为白名单命令行选项传给 generator。</p></section>
+      <section class="subtask-column constraints-column"><h4 class="column-title"><span>子任务结构细化</span><span class="badge">JSON</span></h4><textarea class="text-area constraint-editor" data-plan-key="subtask-tags" data-subtask="${index}" placeholder='["graph.dag"]'>${escapeHtml(JSON.stringify(subtask.subtask_tags || [], null, 2))}</textarea><p class="helper-text">仅填写该子任务新增的结构属性，不得删除阶段 3 全局标签。</p></section>
     </div>
     <div class="count-summary" ${expanded ? "" : "hidden"}><div><span>特殊测试点</span><strong data-special-total>${specialTotal}</strong></div><div><span>测试点总数</span><strong data-test-total>${subtask.test_count}</strong></div><div class="${normalCount < 0 ? "invalid-count" : ""}" data-normal-box><span>普通规模测试点</span><strong data-normal-total>${normalCount}</strong></div></div>
   </article>`;
@@ -441,9 +460,10 @@ function renderStage4() {
   const draft = state.drafts["4"];
   const info = state.project.stages?.["4"] || {};
   const template = state.drafts["3"]?.template || "";
+  const globalTags = state.drafts["3"]?.structure_tags || [];
   return `${confirmationBand(4)}<div class="page-intro"><div><h2>模板与子任务配置</h2><p>左侧模板来自阶段 3 且不可编辑；右侧以自由文本描述各子任务的数据限制。</p></div><button class="button button-secondary" id="addSubtaskBtn" type="button">${icon("plus")}添加子任务</button></div>
     <div class="stage4-layout">
-      <aside class="template-reference"><div class="section-heading"><div><h3>输入结构 Template</h3><p>阶段 3 已确认版本</p></div><span class="badge success">只读</span></div><textarea class="template-view" readonly aria-label="已确认输入结构模板">${escapeHtml(template)}</textarea><p class="helper-text">如需修改，请返回阶段 3，重新运行 AI 检查并确认。</p></aside>
+      <aside class="template-reference"><div class="section-heading"><div><h3>输入结构 Template</h3><p>阶段 3 已确认版本</p></div><span class="badge success">只读</span></div><textarea class="template-view" readonly aria-label="已确认输入结构模板">${escapeHtml(template)}</textarea><p class="helper-text">全局标签：${escapeHtml(globalTags.map((item) => item.tag_id).join(", ") || "无")}</p><p class="helper-text">如需修改，请返回阶段 3，重新运行 AI 检查并确认。</p></aside>
       <section class="stage4-planner"><div class="section-heading"><div><h3>子任务配置</h3><p>特殊测试点总数不得超过所属子任务测试点总数</p></div><span class="badge">${draft.subtasks.length} 个子任务</span></div><div class="subtask-list" id="subtaskList">${draft.subtasks.length ? draft.subtasks.map(renderSubtask).join("") : `<div class="planner-empty">${icon("list-plus")}<strong>等待 Agent3 规划</strong><span>直接运行 AI 检查将根据题目自动生成 5 个初始子任务，也可以先手动添加。</span></div>`}</div><div class="planner-issues">${stageIssues(draft, 4)}</div></section>
     </div>
     ${interactiveActionBar(4, draft.subtasks.length > 0, info)}`;
@@ -456,13 +476,14 @@ function renderStage5() {
   const hasBoth = Boolean(draft.generator_code && draft.validator_code);
   const preview = state.preview;
   const subtasks = state.drafts["4"]?.subtasks || [];
-  return `${confirmationBand(5)}<div class="page-intro"><div><h2>代码草稿</h2><p>Agent4 会先分轮选择并读取 jngen 文档，再生成 generator 与 validator；随后在受限容器中循环编译、试生成和修复。</p></div><span class="badge ${hasBoth ? "info" : "warning"}">${hasBoth ? `revision ${escapeHtml(draft.revision_id || "draft")}` : "等待生成"}</span></div>
+  return `${confirmationBand(5)}<div class="page-intro"><div><h2>代码草稿</h2><p>Agent4 会按输入中的全部结构加载 jngen 专题文档，再生成 generator 与 validator；随后分级执行静态检查、冒烟测试和完整验证。</p></div><span class="badge ${hasBoth ? "info" : "warning"}">${hasBoth ? `revision ${escapeHtml(draft.revision_id || "draft")}` : "等待生成"}</span></div>
     <div class="code-grid">
       <section class="work-surface code-pane"><div class="section-heading"><div><h3>generator.cpp</h3><p>testlib / jngen</p></div></div><textarea id="generatorCode" class="code-editor" spellcheck="false" placeholder="运行 AI 生成 generator.cpp">${escapeHtml(draft.generator_code)}</textarea></section>
       <section class="work-surface code-pane"><div class="section-heading"><div><h3>validator.cpp</h3><p>testlib strict validation</p></div></div><textarea id="validatorCode" class="code-editor" spellcheck="false" placeholder="运行 AI 生成 validator.cpp">${escapeHtml(draft.validator_code)}</textarea></section>
     </div>
+    <details class="work-surface" style="margin-top:16px"><summary class="section-heading" style="padding:12px 16px;cursor:pointer"><div><h3>约束覆盖表</h3><p>逐子任务、逐测试点关联运行时参数与生成/校验策略</p></div><span class="badge">${draft.constraint_coverage?.length || 0} 项</span></summary><div class="surface-body"><pre>${escapeHtml(JSON.stringify(draft.constraint_coverage || [], null, 2))}</pre></div></details>
     <div class="preview-layout">
-      <section class="work-surface preview-controls form-stack"><div><h3 style="margin:0;font-size:15px">种子试运行</h3><p class="helper-text">选择子任务作为本次预览上下文，可反复更换种子直至数据满意。</p></div><label class="field"><span>子任务</span><select id="previewSubtask" class="select-input">${subtasks.map((item) => `<option value="${item.id}">子任务 ${item.id}</option>`).join("")}</select></label><label class="field"><span>种子</span><input id="previewSeed" class="number-input" type="number" step="1" value="${preview?.seed ?? 42}"></label><button class="button button-secondary" id="previewBtn" type="button" ${hasBoth && !state.busy ? "" : "disabled"}>${icon("play")}编译并试运行</button><ul class="preview-history">${state.previewHistory.map((item) => `<li><span>子任务 ${item.subtaskId} · seed ${item.seed}</span><strong>${item.ok ? "通过" : "失败"}</strong></li>`).join("")}</ul></section>
+      <section class="work-surface preview-controls form-stack"><div><h3 style="margin:0;font-size:15px">种子试运行</h3><p class="helper-text">选择子任务和测试点；对应的数据与规模限制会通过命令行传给 generator。</p></div><label class="field"><span>子任务</span><select id="previewSubtask" class="select-input">${subtasks.map((item) => `<option value="${item.id}">子任务 ${item.id}</option>`).join("")}</select></label><label class="field"><span>测试点</span><input id="previewCase" class="number-input" type="number" min="1" step="1" value="${preview?.case_id ?? 1}"></label><label class="field"><span>种子</span><input id="previewSeed" class="number-input" type="number" step="1" value="${preview?.seed ?? 42}"></label><button class="button button-secondary" id="previewBtn" type="button" ${hasBoth && !state.busy ? "" : "disabled"}>${icon("play")}编译并试运行</button><ul class="preview-history">${state.previewHistory.map((item) => `<li><span>子任务 ${item.subtaskId} · 测试点 ${item.caseId} · seed ${item.seed}</span><strong>${item.ok ? "通过" : "失败"}</strong></li>`).join("")}</ul></section>
       <section class="work-surface preview-output"><div class="section-heading" style="margin-bottom:12px"><div><h3>输入数据预览</h3><p>${preview ? `seed ${escapeHtml(preview.seed)} · validator ${preview.validator?.ok ? "通过" : "未通过"}` : "尚未运行"}</p></div>${preview ? `<span class="badge ${preview.validator?.ok ? "success" : "error"}">${preview.validator?.ok ? "合法输入" : "校验失败"}</span>` : ""}</div><pre>${escapeHtml(preview?.content || "运行生成器后在此查看输入数据。")}</pre></section>
     </div>
     <section class="work-surface" style="margin-top:16px"><div class="surface-body">${stageIssues(draft, 5)}</div></section>
@@ -547,14 +568,22 @@ function readIssues() {
 }
 
 function readStructureDraft() {
+  let structureTags;
+  try {
+    structureTags = JSON.parse($("#structureTagsInput")?.value.trim() || "[]");
+  } catch {
+    throw new Error("结构标签不是合法 JSON。");
+  }
   return {
     template: $("#inputStructureTemplate")?.value.trim() || "",
+    structure_tags: structureTags,
     issues: readIssues(),
   };
 }
 
 function validateStructure(draft) {
   if (!draft.template) throw new Error("输入结构模板不能为空，请先运行 AI 分析或手动填写。");
+  if (!Array.isArray(draft.structure_tags)) throw new Error("结构标签必须是 JSON 数组。");
 }
 
 function readPlanDraft() {
@@ -573,7 +602,21 @@ function readPlanDraft() {
         description: $(`[data-special-description="${specialIndex}"][data-subtask="${index}"]`)?.value.trim() || "",
       };
     });
-    return { id: subtask.id, constraints, test_count: testCount, expected_complexity: complexity || "", special_cases: specialCases };
+    const runtimeText = $(`[data-plan-key="runtime-parameters"][data-subtask="${index}"]`)?.value.trim() || "[]";
+    let runtimeParameters;
+    try {
+      runtimeParameters = JSON.parse(runtimeText);
+    } catch {
+      throw new Error(`子任务 ${subtask.id} 的运行时参数不是合法 JSON。`);
+    }
+    const tagText = $(`[data-plan-key="subtask-tags"][data-subtask="${index}"]`)?.value.trim() || "[]";
+    let subtaskTags;
+    try {
+      subtaskTags = JSON.parse(tagText);
+    } catch {
+      throw new Error(`子任务 ${subtask.id} 的结构细化标签不是合法 JSON。`);
+    }
+    return { id: subtask.id, constraints, test_count: testCount, expected_complexity: complexity || "", special_cases: specialCases, runtime_parameters: runtimeParameters, subtask_tags: subtaskTags };
   });
   return { subtasks, issues: readIssues() };
 }
@@ -584,6 +627,8 @@ function validatePlan(draft) {
     if (!subtask.constraints) throw new Error(`子任务 ${subtask.id} 缺少数据限制描述。`);
     if (!Number.isInteger(subtask.test_count) || subtask.test_count <= 0) throw new Error(`子任务 ${subtask.id} 的测试点总数必须为正整数。`);
     if (!subtask.expected_complexity) throw new Error(`子任务 ${subtask.id} 缺少期望复杂度。`);
+    if (!Array.isArray(subtask.runtime_parameters) || subtask.runtime_parameters.length !== subtask.test_count) throw new Error(`子任务 ${subtask.id} 必须为每个测试点提供一组运行时参数。`);
+    if (!Array.isArray(subtask.subtask_tags) || subtask.subtask_tags.some((item) => typeof item !== "string")) throw new Error(`子任务 ${subtask.id} 的结构细化标签必须是字符串数组。`);
     let specialTotal = 0;
     for (const item of subtask.special_cases) {
       if (!Number.isInteger(item.count) || item.count <= 0 || !item.description) throw new Error(`子任务 ${subtask.id} 的特殊测试点需要填写正整数数量与完整描述。`);
@@ -597,6 +642,7 @@ function readCodeDraft() {
   return {
     generator_code: $("#generatorCode")?.value.trim() || "",
     validator_code: $("#validatorCode")?.value.trim() || "",
+    constraint_coverage: cloneJson(state.drafts["5"]?.constraint_coverage || []),
     revision_id: state.drafts["5"]?.revision_id || null,
     issues: readIssues(),
   };
@@ -798,7 +844,7 @@ function bindStage2() {
 }
 
 function bindStage3() {
-  bindInteractiveStage(3, readStructureDraft, validateStructure, "#inputStructureTemplate");
+  bindInteractiveStage(3, readStructureDraft, validateStructure, "#inputStructureTemplate, #structureTagsInput");
 }
 
 function preservePlanAndRender(mutator) {
@@ -858,13 +904,15 @@ function bindStage5() {
     const draft = readCodeDraft();
     const seed = Number($("#previewSeed").value);
     const subtaskId = Number($("#previewSubtask").value);
+    const caseId = Number($("#previewCase").value);
     try { validateCodeDraft(draft); } catch (error) { showToast(error.message, "error"); return; }
     if (!Number.isInteger(seed)) { showToast("种子必须为整数。", "error"); return; }
+    if (!Number.isInteger(caseId) || caseId <= 0) { showToast("测试点必须为正整数。", "error"); return; }
     runMutation("试运行中", async () => {
       if (draftContentChanged(5, draft)) await saveDraft(5, draft);
-      const preview = await api(`/api/projects/${state.projectId}/preview`, { method: "POST", body: JSON.stringify({ subtask_id: subtaskId, seed }) });
+      const preview = await api(`/api/projects/${state.projectId}/preview`, { method: "POST", body: JSON.stringify({ subtask_id: subtaskId, case_id: caseId, seed }) });
       state.preview = { ...preview, subtaskId };
-      state.previewHistory.unshift({ seed, subtaskId, ok: preview.validator?.ok });
+      state.previewHistory.unshift({ seed, subtaskId, caseId, ok: preview.validator?.ok });
       state.previewHistory = state.previewHistory.slice(0, 5);
     }, `种子 ${seed} 试运行完成`);
   });
@@ -970,6 +1018,7 @@ async function refreshProject({ silent = false, keepError = false } = {}) {
       api(`/api/projects/${state.projectId}/solution`),
     ]);
     state.project = projectResponse.project;
+    state.tagCatalog = projectResponse.structure_tag_catalog || { version: null, tags: [] };
     state.drafts = projectResponse.drafts;
     state.draftBaselines = Object.fromEntries([3, 4, 5].map((stage) => {
       const baseline = cloneJson(projectResponse.drafts[String(stage)]);
@@ -1001,10 +1050,9 @@ async function checkHealth() {
   try {
     const health = await api("/health");
     state.apiOnline = health.status === "ok";
-    state.apiMode = health.model_mode === "remote" ? "真实模型" : "Mock 模式";
+    state.apiMode = "真实模型";
     if (!state.modelConfig) {
       state.modelConfig = {
-        mode: health.model_mode,
         model_name: health.model_name || state.apiMode,
         api_key_configured: Boolean(health.model_api_configured),
       };
@@ -1018,7 +1066,7 @@ async function checkHealth() {
 async function loadModelConfiguration() {
   const config = await api("/api/settings/model");
   state.modelConfig = config;
-  state.apiMode = config.mode === "remote" ? "真实模型" : "Mock 模式";
+  state.apiMode = "真实模型";
   return config;
 }
 
@@ -1026,31 +1074,16 @@ function renderModelConfigStatus(config, result = null) {
   const target = $("#modelConfigStatus");
   if (!target) return;
   if (result) {
-    target.innerHTML = `${icon("badge-check")}<span><strong>${escapeHtml(result.message)}</strong> ${result.mode === "remote" ? `响应 ${escapeHtml(result.latency_ms)} ms` : ""}</span>`;
+    target.innerHTML = `${icon("badge-check")}<span><strong>${escapeHtml(result.message)}</strong> 响应 ${escapeHtml(result.latency_ms)} ms</span>`;
     hydrateIcons();
     return;
   }
-  const mode = config.mode === "remote" ? "真实模型" : "Mock 测试";
-  const key = config.mode === "mock" ? "无需密钥" : config.api_key_configured ? config.api_key_hint : "API Key 未配置";
-  target.innerHTML = `${icon(config.mode === "remote" ? "cloud" : "flask-conical")}<span><strong>${escapeHtml(mode)} · ${escapeHtml(config.model_name)}</strong><br>${escapeHtml(key)}</span>`;
+  const key = config.api_key_configured ? config.api_key_hint : "API Key 未配置";
+  target.innerHTML = `${icon("cloud")}<span><strong>真实模型 · ${escapeHtml(config.model_name)}</strong><br>${escapeHtml(key)}</span>`;
   hydrateIcons();
 }
 
-function updateModelModeFields() {
-  const mode = $('input[name="modelMode"]:checked')?.value || "remote";
-  const disabled = mode === "mock";
-  $$(".model-remote-fields").forEach((field) => field.classList.toggle("is-disabled", disabled));
-  ["#modelBaseUrl", "#modelName", "#modelApiKey", "#toggleApiKeyBtn"].forEach((selector) => {
-    const control = $(selector);
-    if (control) control.disabled = disabled;
-  });
-  const config = state.modelConfig || {};
-  renderModelConfigStatus({ ...config, mode });
-}
-
 function fillModelSettings(config) {
-  const modeControl = $(`input[name="modelMode"][value="${config.mode}"]`);
-  if (modeControl) modeControl.checked = true;
   $("#modelBaseUrl").value = config.base_url || "https://api.deepseek.com/v1";
   $("#modelName").value = config.model_name || "deepseek-chat";
   $("#modelApiKey").type = "password";
@@ -1067,14 +1100,13 @@ function fillModelSettings(config) {
   $("#modelTimeout").value = config.timeout_seconds ?? 120;
   $("#agentMaxIterations").value = config.max_iterations ?? 4;
   $("#trialSeedsPerSubtask").value = config.trial_seeds_per_subtask ?? 1;
-  updateModelModeFields();
+  renderModelConfigStatus(config);
 }
 
 function readModelSettings() {
   const form = $("#modelSettingsForm");
   if (!form.reportValidity()) return null;
   return {
-    mode: $('input[name="modelMode"]:checked')?.value || "remote",
     base_url: $("#modelBaseUrl").value.trim(),
     model_name: $("#modelName").value.trim(),
     api_key: $("#modelApiKey").value.trim() || null,
@@ -1146,7 +1178,7 @@ async function saveModelSettings(event) {
       body: JSON.stringify(payload),
     });
     state.modelConfig = config;
-    state.apiMode = config.mode === "remote" ? "真实模型" : "Mock 模式";
+    state.apiMode = "真实模型";
     $("#modelApiKey").value = "";
     $("#modelSettingsDialog").close();
     renderConnection();
@@ -1190,7 +1222,6 @@ async function init() {
   $("#testModelConnectionBtn").addEventListener("click", testModelConnection);
   $("#closeModelSettingsBtn").addEventListener("click", () => $("#modelSettingsDialog").close());
   $("#cancelModelSettingsBtn").addEventListener("click", () => $("#modelSettingsDialog").close());
-  $$('input[name="modelMode"]').forEach((input) => input.addEventListener("change", updateModelModeFields));
   $("#toggleApiKeyBtn").addEventListener("click", () => {
     const input = $("#modelApiKey");
     const reveal = input.type === "password";

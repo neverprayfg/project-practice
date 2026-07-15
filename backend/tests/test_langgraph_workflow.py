@@ -77,7 +77,6 @@ async def test_langgraph_agent_self_repairs_then_interrupts_for_user(
     settings = Settings(
         app_env="test",
         storage_root=tmp_path,
-        model_mode="mock",
         agent_max_iterations=3,
     )
     storage = ProjectStorage(tmp_path)
@@ -163,7 +162,6 @@ async def test_last_allowed_repair_is_verified_before_loop_exhaustion(
     settings = Settings(
         app_env="test",
         storage_root=tmp_path,
-        model_mode="mock",
         agent_max_iterations=1,
     )
     storage = ProjectStorage(tmp_path)
@@ -292,8 +290,8 @@ async def test_code_agent_selects_and_embeds_documents_before_verification(
     settings = Settings(
         app_env="test",
         storage_root=storage.root,
-        model_mode="mock",
         agent_max_iterations=2,
+        agent_allow_legacy_keyword_routing=True,
     )
     model = SelectThenGenerateModel()
     verifier = AlwaysPassVerifier()
@@ -366,10 +364,13 @@ class DiagnosticDrivenCodeModel:
             )
         if execution.get("ok"):
             return WorkflowOutput(confirmation=Confirmation.PASS, result=candidate)
-        assert context["recovery_feedback"][-1]["source"] == "deterministic_verifier"
-        assert context["recovery_feedback"][-1]["execution"]["checks"][0][
-            "diagnostics"
-        ][0]["message"] == "unknown compiler failure"
+        if context.get("recovery_feedback"):
+            assert context["recovery_feedback"][-1]["source"] == (
+                "deterministic_verifier"
+            )
+            assert context["recovery_feedback"][-1]["execution"]["checks"][0][
+                "diagnostics"
+            ][0]["message"] == "unknown compiler failure"
         return WorkflowOutput(
             confirmation=Confirmation.REVISE,
             result={"generator_code": "fixed", "validator_code": "validator"},
@@ -377,6 +378,9 @@ class DiagnosticDrivenCodeModel:
 
 
 class DiagnosticDrivenVerifier:
+    def __init__(self, *, retrieval_required: bool = True) -> None:
+        self.retrieval_required = retrieval_required
+
     async def verify(
         self,
         project_id: str,
@@ -390,6 +394,10 @@ class DiagnosticDrivenVerifier:
         return candidate, {
             "ok": False,
             "message": "generator 编译失败。",
+            "failure_category": (
+                "library_api" if self.retrieval_required else "compile"
+            ),
+            "retrieval_required": self.retrieval_required,
             "checks": [
                 {
                     "operation": "compile",
@@ -420,8 +428,8 @@ async def test_code_agent_reselects_documents_from_structured_failure_feedback(
         Settings(
             app_env="test",
             storage_root=storage.root,
-            model_mode="mock",
             agent_max_iterations=1,
+            agent_allow_legacy_keyword_routing=True,
         ),
         storage,
         model,
@@ -448,6 +456,46 @@ async def test_code_agent_reselects_documents_from_structured_failure_feedback(
     assert model.selection_contexts[2]["recovery_feedback"][-1]["source"] == (
         "deterministic_verifier"
     )
+
+
+@pytest.mark.asyncio
+async def test_code_agent_does_not_retrieve_documents_for_compile_failure(
+    tmp_path: Path,
+) -> None:
+    storage = ProjectStorage(tmp_path / "storage")
+    docs_root = tmp_path / "jngen-docs"
+    docs_root.mkdir()
+    (docs_root / "graph.md").write_text("Graph APIs", encoding="utf-8")
+    model = DiagnosticDrivenCodeModel()
+    runner = LangGraphAgentRunner(
+        Settings(
+            app_env="test",
+            storage_root=storage.root,
+            agent_max_iterations=1,
+            agent_allow_legacy_keyword_routing=True,
+        ),
+        storage,
+        model,
+        DiagnosticDrivenVerifier(retrieval_required=False),  # type: ignore[arg-type]
+        JngenDocumentContext(docs_root),
+    )
+    try:
+        _thread_id, output, waiting_user = await runner.run(
+            "0" * 32,
+            TaskType.CODE_DRAFT,
+            {"input": {}, "subtasks": []},
+            None,
+            requires_user=False,
+        )
+    finally:
+        await runner.close()
+
+    assert output.confirmation == Confirmation.PASS
+    assert output.result is not None
+    assert output.result["generator_code"] == "fixed"
+    assert waiting_user is False
+    assert len(model.selection_contexts) == 2
+    assert all("recovery_feedback" not in item for item in model.selection_contexts)
 
 
 @pytest.mark.asyncio

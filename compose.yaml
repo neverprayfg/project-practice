@@ -54,13 +54,12 @@ services:
       TESTLIB_ROOT: /opt/testlib
       JNGEN_ROOT: /opt/jngen
       STORAGE_VOLUME: contest_dataset_storage
-      RUNNER_COMPILE_IMAGE: contest-dataset-runner-compiler:0.2.0
-      RUNNER_EXECUTE_IMAGE: contest-dataset-runner-executor:0.2.0
+      RUNNER_COMPILE_IMAGE: contest-dataset-runner-compiler:0.3.0
+      RUNNER_EXECUTE_IMAGE: contest-dataset-runner-executor:0.3.0
       RUNNER_CONCURRENCY: ${RUNNER_CONCURRENCY:-2}
       RUNNER_BATCH_SIZE: ${RUNNER_BATCH_SIZE:-16}
       MANIFEST_CHECKPOINT_INTERVAL: ${MANIFEST_CHECKPOINT_INTERVAL:-10}
       DOCKER_HOST: tcp://docker-api:2375
-      MODEL_MODE: ${MODEL_MODE:-mock}
       MODEL_BASE_URL: ${MODEL_BASE_URL:-https://api.deepseek.com/v1}
       MODEL_API_KEY: ${MODEL_API_KEY:-}
       MODEL_NAME: ${MODEL_NAME:-deepseek-chat}
@@ -68,7 +67,7 @@ services:
       AGENT_MAX_ITERATIONS: ${AGENT_MAX_ITERATIONS:-4}
       AGENT_JNGEN_DOCUMENT_SELECTION_ROUNDS: ${AGENT_JNGEN_DOCUMENT_SELECTION_ROUNDS:-3}
       AGENT_JNGEN_DOCUMENTS_PER_ROUND: ${AGENT_JNGEN_DOCUMENTS_PER_ROUND:-2}
-      AGENT_JNGEN_DOCUMENT_CONTEXT_CHARS: ${AGENT_JNGEN_DOCUMENT_CONTEXT_CHARS:-32000}
+      AGENT_JNGEN_DOCUMENT_CONTEXT_CHARS: ${AGENT_JNGEN_DOCUMENT_CONTEXT_CHARS:-64000}
     volumes:
       - contest_dataset_storage:/workspace
       - ./exports:/exports
@@ -86,7 +85,7 @@ services:
       context: .
       dockerfile: docker/runner.Dockerfile
       target: compiler
-    image: contest-dataset-runner-compiler:0.2.0
+    image: contest-dataset-runner-compiler:0.3.0
     entrypoint: ["/bin/true"]
 
   runner-executor-image:
@@ -95,7 +94,7 @@ services:
       context: .
       dockerfile: docker/runner.Dockerfile
       target: executor
-    image: contest-dataset-runner-executor:0.2.0
+    image: contest-dataset-runner-executor:0.3.0
     entrypoint: ["/bin/true"]
 
 networks:

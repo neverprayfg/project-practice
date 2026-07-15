@@ -1,13 +1,33 @@
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime
 from enum import IntEnum, StrEnum
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictFloat,
+    StrictInt,
+    StringConstraints,
+    model_validator,
+)
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+RuntimeString = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    ),
+]
+RuntimeScalar = StrictBool | StrictInt | StrictFloat | RuntimeString
 
 
 class StrictModel(BaseModel):
@@ -53,7 +73,6 @@ class ProjectCreate(StrictModel):
 
 
 class ModelRuntimeConfiguration(StrictModel):
-    mode: Literal["remote", "mock"] = "remote"
     base_url: NonEmptyText = "https://api.deepseek.com/v1"
     model_name: NonEmptyText = "deepseek-chat"
     api_key: str = ""
@@ -74,7 +93,6 @@ class ModelRuntimeConfiguration(StrictModel):
 
 
 class ModelConfigurationUpdate(StrictModel):
-    mode: Literal["remote", "mock"]
     base_url: NonEmptyText
     model_name: NonEmptyText
     api_key: str | None = None
@@ -178,8 +196,23 @@ class ProjectRecord(StrictModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class StructureTag(StrictModel):
+    tag_id: Annotated[
+        str,
+        StringConstraints(
+            strip_whitespace=True,
+            min_length=1,
+            max_length=64,
+            pattern=r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$",
+        ),
+    ]
+    applies_to: NonEmptyText
+    evidence: NonEmptyText
+
+
 class InputStructureDraft(StrictModel):
     template: NonEmptyText
+    structure_tags: list[StructureTag] = Field(default_factory=list)
     issues: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
@@ -193,12 +226,56 @@ class InputStructureDraft(StrictModel):
             field_type = str(field.get("type") or "未注明类型").strip()
             description = str(field.get("description") or "").strip()
             lines.append(f"{index}. {name}（{field_type}）：{description or '输入值。'}")
-        return {"template": "\n".join(lines), "issues": value.get("issues") or []}
+        return {
+            "template": "\n".join(lines),
+            "structure_tags": value.get("structure_tags") or [],
+            "issues": value.get("issues") or [],
+        }
 
 
 class SpecialCase(StrictModel):
     count: int = Field(gt=0)
     description: NonEmptyText
+
+
+class RuntimeParameter(StrictModel):
+    name: Annotated[
+        str,
+        StringConstraints(
+            strip_whitespace=True,
+            min_length=1,
+            max_length=32,
+            pattern=r"^[a-z][a-z0-9_]*$",
+        ),
+    ]
+    value: RuntimeScalar
+    category: Literal["size", "limit", "structure"]
+
+    @model_validator(mode="after")
+    def value_fits_runner_argument(self) -> RuntimeParameter:
+        if isinstance(self.value, float) and not math.isfinite(self.value):
+            raise ValueError("runtime parameter floats must be finite")
+        serialized = "1" if self.value is True else "0" if self.value is False else str(self.value)
+        if len(serialized) > 64:
+            raise ValueError("runtime parameter value exceeds runner argument limit")
+        return self
+
+
+class TestPointRuntimeParameters(StrictModel):
+    case_id: int = Field(gt=0)
+    parameters: list[RuntimeParameter] = Field(min_length=1, max_length=24)
+
+    @model_validator(mode="after")
+    def parameter_names_are_unique_and_reserved_names_are_rejected(
+        self,
+    ) -> TestPointRuntimeParameters:
+        names = [parameter.name for parameter in self.parameters]
+        if len(names) != len(set(names)):
+            raise ValueError("runtime parameter names must be unique within a test point")
+        reserved = {"seed", "subtask", "case"}.intersection(names)
+        if reserved:
+            raise ValueError("runtime parameter names cannot shadow runner arguments")
+        return self
 
 
 class Subtask(StrictModel):
@@ -207,6 +284,8 @@ class Subtask(StrictModel):
     test_count: int = Field(gt=0)
     expected_complexity: NonEmptyText
     special_cases: list[SpecialCase] = Field(default_factory=list)
+    runtime_parameters: list[TestPointRuntimeParameters] = Field(default_factory=list)
+    subtask_tags: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -227,6 +306,14 @@ class Subtask(StrictModel):
     def special_count_fits_total(self) -> Subtask:
         if sum(item.count for item in self.special_cases) > self.test_count:
             raise ValueError("special case count exceeds the subtask test count")
+        if self.runtime_parameters:
+            case_ids = [profile.case_id for profile in self.runtime_parameters]
+            if case_ids != list(range(1, self.test_count + 1)):
+                raise ValueError(
+                    "runtime parameter case ids must exactly match 1..test_count"
+                )
+        if len(self.subtask_tags) != len(set(self.subtask_tags)):
+            raise ValueError("subtask structure tags must be unique")
         return self
 
 
@@ -242,9 +329,28 @@ class SubtaskPlanDraft(StrictModel):
         return self
 
 
+class ConstraintCoverage(StrictModel):
+    subtask_id: int = Field(gt=0)
+    case_id: int = Field(gt=0)
+    parameter_names: list[str] = Field(min_length=1)
+    structure_tags: list[str] = Field(default_factory=list)
+    generator_strategy: NonEmptyText
+    validator_strategy: NonEmptyText
+    boundary_or_special: NonEmptyText
+
+    @model_validator(mode="after")
+    def parameter_names_are_unique(self) -> ConstraintCoverage:
+        if len(self.parameter_names) != len(set(self.parameter_names)):
+            raise ValueError("constraint coverage parameter names must be unique")
+        if len(self.structure_tags) != len(set(self.structure_tags)):
+            raise ValueError("constraint coverage structure tags must be unique")
+        return self
+
+
 class CodeDraft(StrictModel):
     generator_code: NonEmptyText
     validator_code: NonEmptyText
+    constraint_coverage: list[ConstraintCoverage] = Field(default_factory=list)
     revision_id: str | None = None
     input_revision: int | None = Field(default=None, ge=1)
     subtasks_revision: int | None = Field(default=None, ge=1)
@@ -320,7 +426,7 @@ class ToolRequest(StrictModel):
 
 class WorkflowOutput(StrictModel):
     confirmation: Confirmation
-    result: dict[str, Any] = Field(default_factory=dict)
+    result: dict[str, Any] | None = None
     issues: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -344,6 +450,7 @@ class UserConfirmation(StrictModel):
 
 class PreviewRequest(StrictModel):
     subtask_id: int = Field(gt=0)
+    case_id: int = Field(default=1, gt=0)
     seed: int
 
 
@@ -366,6 +473,7 @@ class ToolExecutionResult(StrictModel):
 class SandboxResult(StrictModel):
     ok: bool
     exit_code: int
+    timed_out: bool = False
     stdout: str = ""
     stderr: str = ""
     output_file: str | None = None

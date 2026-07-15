@@ -15,6 +15,11 @@ WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/contest-runner"]
 
 FROM common AS compiler
+USER root
+RUN g++ -std=c++17 -O2 -pipe -Wall -Wextra \
+      -x c++-header /opt/jngen/jngen.h -o /opt/jngen/jngen.h.gch \
+    || rm -f /opt/jngen/jngen.h.gch
+USER runner
 
 FROM common AS runtime-libraries
 USER root

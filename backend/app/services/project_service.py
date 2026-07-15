@@ -20,12 +20,18 @@ from app.models import (
     StageStatus,
     SubtaskPlanDraft,
 )
+from app.services.structure_tag_catalog import StructureTagCatalog
 from app.storage import ProjectStorage
 
 
 class ProjectService:
-    def __init__(self, storage: ProjectStorage) -> None:
+    def __init__(
+        self,
+        storage: ProjectStorage,
+        tag_catalog: StructureTagCatalog | None = None,
+    ) -> None:
         self.storage = storage
+        self.tag_catalog = tag_catalog or StructureTagCatalog()
 
     def create(self, payload: ProjectCreate) -> ProjectRecord:
         record = ProjectRecord(
@@ -169,9 +175,13 @@ class ProjectService:
     @staticmethod
     def _draft_content(stage: int, draft: dict[str, Any]) -> dict[str, Any]:
         fields = {
-            Stage.INPUT_STRUCTURE: ("template",),
+            Stage.INPUT_STRUCTURE: ("template", "structure_tags"),
             Stage.SUBTASK_PLAN: ("subtasks",),
-            Stage.CODE_DRAFT: ("generator_code", "validator_code"),
+            Stage.CODE_DRAFT: (
+                "generator_code",
+                "validator_code",
+                "constraint_coverage",
+            ),
         }[Stage(stage)]
         return {field: draft.get(field) for field in fields}
 
@@ -185,7 +195,12 @@ class ProjectService:
         issues: list[str],
     ) -> dict[str, Any]:
         record = self.get(project_id)
-        validated = self.validate_draft(project_id, stage, result)
+        validated = self.validate_draft(
+            project_id,
+            stage,
+            result,
+            allow_tag_review=True,
+        )
         current = self.storage.load_draft(project_id, stage)
         content_changed = current is None or self._draft_content(
             stage, current
@@ -362,10 +377,29 @@ class ProjectService:
         self.storage.save_record(record)
         return record
 
-    def validate_draft(self, project_id: str, stage: int, draft: dict[str, Any]) -> dict[str, Any]:
+    def validate_draft(
+        self,
+        project_id: str,
+        stage: int,
+        draft: dict[str, Any],
+        *,
+        allow_tag_review: bool = False,
+    ) -> dict[str, Any]:
         try:
             if stage == Stage.INPUT_STRUCTURE:
-                return InputStructureDraft.model_validate(draft).model_dump(mode="json")
+                model = InputStructureDraft.model_validate(draft)
+                if model.structure_tags:
+                    tag_issues = self.tag_catalog.validate_structure_tags(
+                        model.structure_tags
+                    )
+                    if tag_issues and not allow_tag_review:
+                        raise AppError(
+                            "INVALID_STRUCTURE_TAGS",
+                            "阶段三结构标签需要复核。",
+                            stage=stage,
+                            details={"issues": tag_issues},
+                        )
+                return model.model_dump(mode="json")
             if stage == Stage.SUBTASK_PLAN:
                 model = SubtaskPlanDraft.model_validate(draft)
                 structure = self.storage.load_draft(project_id, Stage.INPUT_STRUCTURE)
@@ -376,6 +410,22 @@ class ProjectService:
                         stage=stage,
                         status_code=409,
                     )
+                global_tag_ids = [
+                    str(item["tag_id"])
+                    for item in structure.get("structure_tags", [])
+                    if isinstance(item, dict) and item.get("tag_id")
+                ]
+                for subtask in model.subtasks:
+                    tag_issues = self.tag_catalog.validate_tag_ids(
+                        [*global_tag_ids, *subtask.subtask_tags]
+                    )
+                    if tag_issues and not allow_tag_review:
+                        raise AppError(
+                            "INVALID_SUBTASK_TAGS",
+                            f"子任务 {subtask.id} 的结构标签需要复核。",
+                            stage=stage,
+                            details={"issues": tag_issues},
+                        )
                 return model.model_dump(mode="json")
             if stage == Stage.CODE_DRAFT:
                 return CodeDraft.model_validate(draft).model_dump(mode="json")

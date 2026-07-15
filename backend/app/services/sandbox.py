@@ -23,6 +23,8 @@ class GenerationJob:
     subtask_id: int
     seed: int
     output_relative: str
+    case_id: int = 1
+    runtime_arguments: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -80,7 +82,7 @@ class DockerSandbox:
         "generator": "generated/generator.cpp",
         "validator": "generated/validator.cpp",
     }
-    COMPILER_FINGERPRINT = "g++-std=c++17-O2-pipe-Wall-Wextra-testlib-jngen-v1"
+    COMPILER_FINGERPRINT = "g++-std=c++17-O2-pipe-Wall-Wextra-testlib-jngen-pch-v2"
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -153,11 +155,22 @@ class DockerSandbox:
         for job in jobs:
             if job.subtask_id <= 0:
                 raise AppError("TOOL_DENIED", "subtask id must be positive")
+            if job.case_id <= 0:
+                raise AppError("TOOL_DENIED", "case id must be positive")
             self._validate_relative(job.output_relative, {"preview", "data"})
             if job.output_relative in expected:
                 raise AppError("TOOL_DENIED", "duplicate batch output path")
             expected.add(job.output_relative)
-            arguments.append(f"{job.subtask_id}|{job.seed}|{job.output_relative}")
+            runtime_arguments = self._validated_runtime_arguments(
+                job.runtime_arguments or {}
+            )
+            serialized = ";".join(
+                f"{name}={value}" for name, value in sorted(runtime_arguments.items())
+            )
+            arguments.append(
+                f"{job.subtask_id}|{job.case_id}|{job.seed}|"
+                f"{job.output_relative}|{serialized}"
+            )
         payload = await self._run_payload(arguments, self.settings.runner_execute_image)
         raw_results = payload.get("results")
         if not isinstance(raw_results, list):
@@ -328,6 +341,18 @@ class DockerSandbox:
         path = PurePosixPath(value)
         if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] not in roots:
             raise AppError("TOOL_DENIED", "invalid managed workspace path")
+
+    @staticmethod
+    def _validated_runtime_arguments(arguments: dict[str, str]) -> dict[str, str]:
+        if len(arguments) > 24:
+            raise AppError("TOOL_DENIED", "too many generator runtime arguments")
+        reserved = {"seed", "subtask", "case"}
+        for name, value in arguments.items():
+            if name in reserved or not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", name):
+                raise AppError("TOOL_DENIED", "invalid generator runtime argument name")
+            if not re.fullmatch(r"[A-Za-z0-9_.:+-]{1,64}", value):
+                raise AppError("TOOL_DENIED", "invalid generator runtime argument value")
+        return arguments
 
     @staticmethod
     def _invalid_runner_response(message: str) -> AppError:

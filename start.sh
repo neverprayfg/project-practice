@@ -8,8 +8,8 @@ command -v docker >/dev/null 2>&1 || { printf '启动失败：未找到 Docker\n
 docker version >/dev/null 2>&1 || { printf '启动失败：Docker Engine 不可用\n' >&2; exit 1; }
 for image in \
   contest-dataset-backend:0.1.0 \
-  contest-dataset-runner-compiler:0.2.0 \
-  contest-dataset-runner-executor:0.2.0
+  contest-dataset-runner-compiler:0.3.0 \
+  contest-dataset-runner-executor:0.3.0
 do
   docker image inspect "$image" >/dev/null 2>&1 \
     || { printf '启动失败：缺少镜像 %s，请先运行 ./deploy.sh\n' "$image" >&2; exit 1; }

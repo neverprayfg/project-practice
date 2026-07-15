@@ -21,6 +21,7 @@ from app.services.model_configuration import ModelConfigurationService
 from app.services.pipeline import PipelineService
 from app.services.project_service import ProjectService
 from app.services.sandbox import DockerSandbox, Sandbox, UnavailableSandbox
+from app.services.structure_tag_catalog import StructureTagCatalog
 from app.storage import ProjectStorage
 
 
@@ -32,7 +33,9 @@ def create_app(
 ) -> FastAPI:
     settings = settings or get_settings()
     storage = ProjectStorage(settings.storage_root)
-    projects = ProjectService(storage)
+    jngen_document_root = Path(__file__).parent / "jngen_doc_context"
+    tag_catalog = StructureTagCatalog(jngen_document_root)
+    projects = ProjectService(storage, tag_catalog)
     model_configuration = ModelConfigurationService(settings, storage)
     if sandbox is None:
         try:
@@ -40,11 +43,9 @@ def create_app(
         except AppError:
             sandbox = UnavailableSandbox()
     model = model or model_configuration.build_model()
-    contexts = AgentContextProvider(storage)
-    jngen_documents = JngenDocumentContext(
-        Path(__file__).parent / "jngen_doc_context"
-    )
-    verifier = AgentCandidateVerifier(settings, storage, sandbox)
+    contexts = AgentContextProvider(storage, tag_catalog)
+    jngen_documents = JngenDocumentContext(jngen_document_root, tag_catalog)
+    verifier = AgentCandidateVerifier(settings, storage, sandbox, tag_catalog)
     agent_runner = LangGraphAgentRunner(
         settings,
         storage,
@@ -79,6 +80,7 @@ def create_app(
     app.state.model_configuration = model_configuration
     app.state.agent_runner = agent_runner
     app.state.contexts = contexts
+    app.state.tag_catalog = tag_catalog
     app.state.pipeline = pipeline
     app.state.datasets = datasets
     install_error_handlers(app)

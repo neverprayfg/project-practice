@@ -7,11 +7,19 @@ from typing import Any
 from uuid import uuid4
 
 from app.errors import AppError
-from app.models import Confirmation, GlobalInput, Stage, StageStatus, TaskType
+from app.models import (
+    Confirmation,
+    GlobalInput,
+    Stage,
+    StageStatus,
+    SubtaskPlanDraft,
+    TaskType,
+)
 from app.services.context_provider import AgentContextProvider
 from app.services.langgraph_runner import LangGraphAgentRunner
 from app.services.project_service import ProjectService
-from app.services.sandbox import Sandbox
+from app.services.runtime_parameters import profile_for_case, serialized_arguments
+from app.services.sandbox import GenerationJob, Sandbox
 from app.storage import ProjectStorage
 
 STAGE_TASKS = {
@@ -206,7 +214,9 @@ class PipelineService:
             self.projects.pop_stage_thread(project_id, stage)
             return confirmed
 
-    async def preview(self, project_id: str, subtask_id: int, seed: int) -> dict[str, Any]:
+    async def preview(
+        self, project_id: str, subtask_id: int, case_id: int, seed: int
+    ) -> dict[str, Any]:
         async with self._locks[project_id]:
             record = self.projects.get(project_id)
             if record.current_stage < Stage.CODE_DRAFT:
@@ -214,6 +224,14 @@ class PipelineService:
             plan = self.storage.load_draft(project_id, 4)
             if plan is None or not any(item.get("id") == subtask_id for item in plan["subtasks"]):
                 raise AppError("INVALID_SUBTASK", "预览子任务不存在。", stage=5)
+            parsed_plan = SubtaskPlanDraft.model_validate(plan)
+            subtask = next(item for item in parsed_plan.subtasks if item.id == subtask_id)
+            try:
+                profile = profile_for_case(subtask, case_id)
+            except ValueError as exc:
+                raise AppError(
+                    "INVALID_TEST_CASE", "预览测试点不存在。", stage=5
+                ) from exc
             for role in ("generator", "validator", "solution"):
                 compiled = await self.sandbox.compile(project_id, role)
                 if not compiled.ok:
@@ -226,12 +244,20 @@ class PipelineService:
             preview_id = uuid4().hex[:12]
             input_relative = f"preview/{preview_id}.in"
             output_relative = f"preview/{preview_id}.out"
-            generated = await self.sandbox.generate(
-                project_id,
-                subtask_id,
-                seed,
-                input_relative,
-            )
+            generated = (
+                await self.sandbox.generate_batch(
+                    project_id,
+                    [
+                        GenerationJob(
+                            subtask_id,
+                            seed,
+                            input_relative,
+                            case_id=case_id,
+                            runtime_arguments=serialized_arguments(profile),
+                        )
+                    ],
+                )
+            )[0].result
             if not generated.ok:
                 raise AppError("GENERATION_FAILED", "预览生成失败。", stage=5)
             validated = await self.sandbox.validate(project_id, input_relative)
@@ -240,7 +266,9 @@ class PipelineService:
             return {
                 "preview_id": preview_id,
                 "subtask_id": subtask_id,
+                "case_id": case_id,
                 "seed": seed,
+                "runtime_arguments": serialized_arguments(profile),
                 "content": path.read_text(encoding="utf-8"),
                 "validator": validated.model_dump(mode="json"),
                 "solution": solved.model_dump(mode="json"),
