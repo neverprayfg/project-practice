@@ -42,6 +42,7 @@ class AgentContextProvider:
         if task_type in {TaskType.SUBTASK_PLAN, TaskType.CODE_DRAFT}:
             plan = self.storage.load_draft(project_id, 4)
             context["subtasks"] = (plan or {}).get("subtasks", [])
+            context["subtasks_revision"] = record.subtasks_revision
         if task_type == TaskType.CODE_DRAFT:
             code_revision = self.storage.current_revision(project_id)
             context["recovery_feedback"] = [

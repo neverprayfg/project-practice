@@ -15,8 +15,8 @@ from app.models import (
     SubtaskPlanDraft,
     TaskType,
 )
+from app.services.agent_graphs import AgentGraphCoordinator
 from app.services.context_provider import AgentContextProvider
-from app.services.langgraph_runner import LangGraphAgentRunner
 from app.services.project_service import ProjectService
 from app.services.runtime_parameters import profile_for_case, serialized_arguments
 from app.services.sandbox import GenerationJob, Sandbox
@@ -34,13 +34,13 @@ class PipelineService:
         self,
         storage: ProjectStorage,
         projects: ProjectService,
-        runner: LangGraphAgentRunner,
+        agents: AgentGraphCoordinator,
         contexts: AgentContextProvider,
         sandbox: Sandbox,
     ) -> None:
         self.storage = storage
         self.projects = projects
-        self.runner = runner
+        self.agents = agents
         self.contexts = contexts
         self.sandbox = sandbox
         self._locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -56,12 +56,8 @@ class PipelineService:
             task_type = TaskType.INPUT_NORMALIZATION
             context = self.contexts.build(project_id, task_type)
             candidate = self.storage.load_input(project_id).model_dump(mode="json")
-            _thread_id, output, waiting_user = await self.runner.run(
-                project_id,
-                task_type,
-                context,
-                candidate,
-                requires_user=False,
+            _thread_id, output, waiting_user = await self.agents.run_agent1(
+                project_id, context, candidate
             )
             if waiting_user or output.confirmation != Confirmation.PASS:
                 raise AppError(
@@ -138,29 +134,51 @@ class PipelineService:
                     "stage": stage,
                 }
                 self.storage.save_record(record)
+            retry_thread = (
+                record.failed_stage_threads.get(stage)
+                if stage == Stage.CODE_DRAFT
+                else None
+            )
             state.status = StageStatus.CHECKING
             state.ai_confirmed = False
             state.user_confirmed = False
             state.updated_at = datetime.now(UTC)
             record.last_error = None
+            record.failed_stage_threads.pop(stage, None)
             self.storage.save_record(record)
             try:
                 current = self.storage.load_draft(project_id, stage)
-                initial_issues: list[str] = []
                 if current is not None:
                     current = dict(current)
-                    initial_issues = [
-                        str(issue) for issue in current.pop("issues", []) if str(issue).strip()
-                    ]
+                    current.pop("issues", None)
                 context = self.contexts.build(project_id, task_type)
-                thread_id, output, waiting_user = await self.runner.run(
-                    project_id,
-                    task_type,
-                    context,
-                    current,
-                    requires_user=True,
-                    initial_issues=initial_issues,
-                )
+                if task_type == TaskType.INPUT_STRUCTURE:
+                    thread_id, output, waiting_user = await self.agents.run_agent2(
+                        project_id, context, current or {}, requires_user=True
+                    )
+                elif task_type == TaskType.SUBTASK_PLAN:
+                    thread_id, output, waiting_user = await self.agents.run_agent3(
+                        project_id, context, current or {}, requires_user=True
+                    )
+                else:
+                    thread_id = retry_thread or self.agents.new_agent4_thread_id(
+                        project_id, context
+                    )
+                    active_record = self.projects.get(project_id)
+                    active_record.failed_stage_threads[stage] = thread_id
+                    self.storage.save_record(active_record)
+                    if retry_thread:
+                        thread_id, output, waiting_user = await self.agents.retry_agent4(
+                            retry_thread
+                        )
+                    else:
+                        thread_id, output, waiting_user = await self.agents.run_agent4(
+                            project_id,
+                            context,
+                            current or {},
+                            requires_user=True,
+                            thread_id=thread_id,
+                        )
                 result = dict(output.result)
                 result["issues"] = output.issues
                 saved = self.projects.save_ai_result(
@@ -185,7 +203,14 @@ class PipelineService:
             except AppError as exc:
                 if exc.stage is None:
                     exc.stage = stage
-                self._record_failure(project_id, stage, exc)
+                if retry_thread and stage == Stage.CODE_DRAFT:
+                    details = dict(exc.details) if isinstance(exc.details, dict) else {}
+                    details.setdefault("thread_id", retry_thread)
+                    exc.details = details
+                if exc.code == "UPSTREAM_CONTRACT_INVALID":
+                    self._return_to_stage_four(project_id, exc)
+                else:
+                    self._record_failure(project_id, stage, exc)
                 raise
             except Exception as exc:
                 error = AppError(
@@ -195,6 +220,9 @@ class PipelineService:
                     status_code=500,
                     details={"exception_type": type(exc).__name__},
                 )
+                thread_id = getattr(exc, "agent_thread_id", None) or retry_thread
+                if thread_id:
+                    error.details = {"thread_id": thread_id, **(error.details or {})}
                 self._record_failure(project_id, stage, error)
                 raise error from exc
 
@@ -209,7 +237,7 @@ class PipelineService:
                     stage=stage,
                     status_code=409,
                 )
-            await self.runner.resume_confirmation(thread_id)
+            await self.agents.resume_confirmation(thread_id)
             confirmed = self.projects.confirm(project_id, stage)
             self.projects.pop_stage_thread(project_id, stage)
             return confirmed
@@ -229,9 +257,7 @@ class PipelineService:
             try:
                 profile = profile_for_case(subtask, case_id)
             except ValueError as exc:
-                raise AppError(
-                    "INVALID_TEST_CASE", "预览测试点不存在。", stage=5
-                ) from exc
+                raise AppError("INVALID_TEST_CASE", "预览测试点不存在。", stage=5) from exc
             for role in ("generator", "validator", "solution"):
                 compiled = await self.sandbox.compile(project_id, role)
                 if not compiled.ok:
@@ -298,6 +324,34 @@ class PipelineService:
         state.issues = [error.message]
         state.updated_at = datetime.now(UTC)
         record.stage_threads.pop(stage, None)
+        details = error.details if isinstance(error.details, dict) else {}
+        thread_id = details.get("thread_id")
+        if stage == Stage.CODE_DRAFT and isinstance(thread_id, str):
+            record.failed_stage_threads[stage] = thread_id
+        else:
+            record.failed_stage_threads.pop(stage, None)
+        record.last_error = error.payload()
+        record.updated_at = datetime.now(UTC)
+        self.storage.save_record(record)
+
+    def _return_to_stage_four(self, project_id: str, error: AppError) -> None:
+        record = self.projects.get(project_id)
+        record.current_stage = Stage.SUBTASK_PLAN
+        record.stage_threads.pop(Stage.CODE_DRAFT, None)
+        record.failed_stage_threads.pop(Stage.CODE_DRAFT, None)
+        stage4 = record.stages[Stage.SUBTASK_PLAN]
+        stage4.status = StageStatus.DRAFT
+        stage4.ai_confirmed = False
+        stage4.user_confirmed = False
+        details = error.details if isinstance(error.details, dict) else {}
+        stage4.issues = [str(item) for item in details.get("issues", [error.message])]
+        stage4.updated_at = datetime.now(UTC)
+        stage5 = record.stages[Stage.CODE_DRAFT]
+        stage5.status = StageStatus.FAILED
+        stage5.ai_confirmed = False
+        stage5.user_confirmed = False
+        stage5.issues = ["上游契约无效，阶段五未进入修复循环。"]
+        stage5.updated_at = datetime.now(UTC)
         record.last_error = error.payload()
         record.updated_at = datetime.now(UTC)
         self.storage.save_record(record)

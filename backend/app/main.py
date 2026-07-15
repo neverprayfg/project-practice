@@ -11,11 +11,11 @@ from fastapi.staticfiles import StaticFiles
 from app.api import router
 from app.config import Settings, get_settings
 from app.errors import AppError, install_error_handlers
-from app.services.candidate_verifier import AgentCandidateVerifier
+from app.services.agent_graphs import AgentGraphCoordinator
+from app.services.candidate_verifier import Agent4CandidateVerifier
 from app.services.context_provider import AgentContextProvider
 from app.services.dataset import DatasetService
 from app.services.jngen_document_context import JngenDocumentContext
-from app.services.langgraph_runner import LangGraphAgentRunner
 from app.services.model_client import AgentModel
 from app.services.model_configuration import ModelConfigurationService
 from app.services.pipeline import PipelineService
@@ -45,25 +45,26 @@ def create_app(
     model = model or model_configuration.build_model()
     contexts = AgentContextProvider(storage, tag_catalog)
     jngen_documents = JngenDocumentContext(jngen_document_root, tag_catalog)
-    verifier = AgentCandidateVerifier(settings, storage, sandbox, tag_catalog)
-    agent_runner = LangGraphAgentRunner(
+    verifier = Agent4CandidateVerifier(settings, storage, sandbox, tag_catalog)
+    agent_graphs = AgentGraphCoordinator(
         settings,
         storage,
         model,
         verifier,
         jngen_documents,
+        tag_catalog,
     )
-    pipeline = PipelineService(storage, projects, agent_runner, contexts, sandbox)
+    pipeline = PipelineService(storage, projects, agent_graphs, contexts, sandbox)
     datasets = DatasetService(settings, storage, projects, sandbox)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         projects.recover_interrupted_checks()
-        await agent_runner.start()
+        await agent_graphs.start()
         try:
             yield
         finally:
-            await agent_runner.close()
+            await agent_graphs.close()
 
     app = FastAPI(title=settings.app_name, version="0.2.0", lifespan=lifespan)
     app.add_middleware(
@@ -78,7 +79,7 @@ def create_app(
     app.state.sandbox = sandbox
     app.state.model = model
     app.state.model_configuration = model_configuration
-    app.state.agent_runner = agent_runner
+    app.state.agent_graphs = agent_graphs
     app.state.contexts = contexts
     app.state.tag_catalog = tag_catalog
     app.state.pipeline = pipeline

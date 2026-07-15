@@ -81,8 +81,11 @@ function draftContent(stage, draft) {
   return {
     generator_code: String(draft?.generator_code || "").trim(),
     validator_code: String(draft?.validator_code || "").trim(),
-    constraint_coverage: Array.isArray(draft?.constraint_coverage)
-      ? cloneJson(draft.constraint_coverage)
+    proof_obligations: Array.isArray(draft?.proof_obligations)
+      ? cloneJson(draft.proof_obligations)
+      : [],
+    implementation_mapping: Array.isArray(draft?.implementation_mapping)
+      ? cloneJson(draft.implementation_mapping)
       : [],
   };
 }
@@ -481,7 +484,7 @@ function renderStage5() {
       <section class="work-surface code-pane"><div class="section-heading"><div><h3>generator.cpp</h3><p>testlib / jngen</p></div></div><textarea id="generatorCode" class="code-editor" spellcheck="false" placeholder="运行 AI 生成 generator.cpp">${escapeHtml(draft.generator_code)}</textarea></section>
       <section class="work-surface code-pane"><div class="section-heading"><div><h3>validator.cpp</h3><p>testlib strict validation</p></div></div><textarea id="validatorCode" class="code-editor" spellcheck="false" placeholder="运行 AI 生成 validator.cpp">${escapeHtml(draft.validator_code)}</textarea></section>
     </div>
-    <details class="work-surface" style="margin-top:16px"><summary class="section-heading" style="padding:12px 16px;cursor:pointer"><div><h3>约束覆盖表</h3><p>逐子任务、逐测试点关联运行时参数与生成/校验策略</p></div><span class="badge">${draft.constraint_coverage?.length || 0} 项</span></summary><div class="surface-body"><pre>${escapeHtml(JSON.stringify(draft.constraint_coverage || [], null, 2))}</pre></div></details>
+    <details class="work-surface" style="margin-top:16px"><summary class="section-heading" style="padding:12px 16px;cursor:pointer"><div><h3>证明义务与实现映射</h3><p>约束 ID 对应源码位置、实际参数、文档/API 证据与构造策略</p></div><span class="badge">${draft.proof_obligations?.length || 0} 项</span></summary><div class="surface-body"><h4>Proof Obligations</h4><pre>${escapeHtml(JSON.stringify(draft.proof_obligations || [], null, 2))}</pre><h4>Implementation Mapping</h4><pre>${escapeHtml(JSON.stringify(draft.implementation_mapping || [], null, 2))}</pre></div></details>
     <div class="preview-layout">
       <section class="work-surface preview-controls form-stack"><div><h3 style="margin:0;font-size:15px">种子试运行</h3><p class="helper-text">选择子任务和测试点；对应的数据与规模限制会通过命令行传给 generator。</p></div><label class="field"><span>子任务</span><select id="previewSubtask" class="select-input">${subtasks.map((item) => `<option value="${item.id}">子任务 ${item.id}</option>`).join("")}</select></label><label class="field"><span>测试点</span><input id="previewCase" class="number-input" type="number" min="1" step="1" value="${preview?.case_id ?? 1}"></label><label class="field"><span>种子</span><input id="previewSeed" class="number-input" type="number" step="1" value="${preview?.seed ?? 42}"></label><button class="button button-secondary" id="previewBtn" type="button" ${hasBoth && !state.busy ? "" : "disabled"}>${icon("play")}编译并试运行</button><ul class="preview-history">${state.previewHistory.map((item) => `<li><span>子任务 ${item.subtaskId} · 测试点 ${item.caseId} · seed ${item.seed}</span><strong>${item.ok ? "通过" : "失败"}</strong></li>`).join("")}</ul></section>
       <section class="work-surface preview-output"><div class="section-heading" style="margin-bottom:12px"><div><h3>输入数据预览</h3><p>${preview ? `seed ${escapeHtml(preview.seed)} · validator ${preview.validator?.ok ? "通过" : "未通过"}` : "尚未运行"}</p></div>${preview ? `<span class="badge ${preview.validator?.ok ? "success" : "error"}">${preview.validator?.ok ? "合法输入" : "校验失败"}</span>` : ""}</div><pre>${escapeHtml(preview?.content || "运行生成器后在此查看输入数据。")}</pre></section>
@@ -642,7 +645,8 @@ function readCodeDraft() {
   return {
     generator_code: $("#generatorCode")?.value.trim() || "",
     validator_code: $("#validatorCode")?.value.trim() || "",
-    constraint_coverage: cloneJson(state.drafts["5"]?.constraint_coverage || []),
+    proof_obligations: cloneJson(state.drafts["5"]?.proof_obligations || []),
+    implementation_mapping: cloneJson(state.drafts["5"]?.implementation_mapping || []),
     revision_id: state.drafts["5"]?.revision_id || null,
     issues: readIssues(),
   };
@@ -1098,7 +1102,6 @@ function fillModelSettings(config) {
     ? `后端已保存密钥（${config.api_key_hint}），页面不会读取原值。`
     : "密钥只保存到后端，不会在页面中回显。";
   $("#modelTimeout").value = config.timeout_seconds ?? 120;
-  $("#agentMaxIterations").value = config.max_iterations ?? 4;
   $("#trialSeedsPerSubtask").value = config.trial_seeds_per_subtask ?? 1;
   renderModelConfigStatus(config);
 }
@@ -1112,7 +1115,6 @@ function readModelSettings() {
     api_key: $("#modelApiKey").value.trim() || null,
     clear_api_key: false,
     timeout_seconds: Number($("#modelTimeout").value),
-    max_iterations: Number($("#agentMaxIterations").value),
     trial_seeds_per_subtask: Number($("#trialSeedsPerSubtask").value),
   };
 }

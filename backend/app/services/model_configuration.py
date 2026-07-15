@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from typing import Any
 
@@ -13,6 +14,8 @@ from app.errors import AppError
 from app.models import ModelConfigurationUpdate, ModelRuntimeConfiguration
 from app.services.model_client import AgentModel, OpenAICompatibleAgentModel
 from app.storage import ProjectStorage
+
+logger = logging.getLogger(__name__)
 
 
 class ModelConfigurationService:
@@ -45,7 +48,6 @@ class ModelConfigurationService:
             "api_key_configured": bool(key),
             "api_key_hint": f"末四位 {key[-4:]}" if key else "未配置",
             "timeout_seconds": self._config.timeout_seconds,
-            "max_iterations": self._config.max_iterations,
             "trial_seeds_per_subtask": self._config.trial_seeds_per_subtask,
         }
 
@@ -56,7 +58,6 @@ class ModelConfigurationService:
             base_url=payload.base_url,
             model_name=payload.model_name,
             timeout_seconds=payload.timeout_seconds,
-            max_iterations=payload.max_iterations,
             trial_seeds_per_subtask=payload.trial_seeds_per_subtask,
         )
         if payload.clear_api_key:
@@ -87,16 +88,30 @@ class ModelConfigurationService:
                 headers={"Authorization": f"Bearer {config.api_key}"},
                 json={
                     "model": config.model_name,
-                    "messages": [{"role": "user", "content": "仅回复 OK"}],
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "只返回 JSON（json）对象，不要输出解释或 Markdown。",
+                        },
+                        {
+                            "role": "user",
+                            "content": '请严格返回这个 JSON 示例：{"ok": true}',
+                        },
+                    ],
                     "temperature": 0,
-                    "max_tokens": 8,
+                    "response_format": {"type": "json_object"},
+                    "max_tokens": 64,
                 },
             )
             response.raise_for_status()
             body = response.json()
             if not body.get("choices"):
                 raise ValueError("响应中缺少 choices")
-        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            content = body["choices"][0]["message"]["content"]
+            parsed = json.loads(content)
+            if not isinstance(parsed, dict) or parsed.get("ok") is not True:
+                raise ValueError("JSON Output 未返回预期内容")
+        except (httpx.HTTPError, KeyError, ValueError, TypeError) as exc:
             status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
             details = {"http_status": status} if status is not None else None
             raise AppError(
@@ -119,23 +134,26 @@ class ModelConfigurationService:
         if self.path.is_file():
             try:
                 value = json.loads(self.path.read_text(encoding="utf-8"))
-                legacy_mode = value.pop("mode", None)
-                if legacy_mode not in {None, "remote"}:
-                    raise ValueError("Mock model configuration is no longer supported")
                 return ModelRuntimeConfiguration.model_validate(value)
             except (OSError, ValidationError, ValueError) as exc:
-                raise AppError(
-                    "MODEL_CONFIG_INVALID",
-                    "已保存的模型配置无效，请检查配置文件。",
-                    status_code=500,
-                    details={"path": str(self.path)},
-                ) from exc
+                logger.warning(
+                    "Discarding invalid persisted model configuration: path=%s error=%s",
+                    self.path,
+                    type(exc).__name__,
+                )
+                try:
+                    self.path.unlink(missing_ok=True)
+                except OSError as cleanup_error:
+                    logger.warning(
+                        "Unable to delete invalid model configuration: path=%s error=%s",
+                        self.path,
+                        type(cleanup_error).__name__,
+                    )
         return ModelRuntimeConfiguration(
             base_url=self.settings.model_base_url,
             model_name=self.settings.model_name,
             api_key=self.settings.model_api_key,
             timeout_seconds=self.settings.model_timeout_seconds,
-            max_iterations=self.settings.agent_max_iterations,
             trial_seeds_per_subtask=self.settings.agent_trial_seeds_per_subtask,
         )
 
@@ -150,7 +168,6 @@ class ModelConfigurationService:
         self.settings.model_name = config.model_name
         self.settings.model_api_key = config.api_key
         self.settings.model_timeout_seconds = config.timeout_seconds
-        self.settings.agent_max_iterations = config.max_iterations
         self.settings.agent_trial_seeds_per_subtask = config.trial_seeds_per_subtask
 
     @staticmethod

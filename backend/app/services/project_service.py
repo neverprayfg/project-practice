@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from app.errors import AppError
 from app.models import (
     CodeDraft,
+    CounterexampleLedger,
     GlobalInput,
     InputStructureDraft,
     ProblemInput,
@@ -109,6 +110,7 @@ class ProjectService:
         record.code_input_revision = None
         record.code_subtasks_revision = None
         record.stage_threads = {}
+        record.failed_stage_threads = {}
         record.last_error = None
         for state in record.stages.values():
             state.status = StageStatus.DRAFT
@@ -127,9 +129,13 @@ class ProjectService:
         self._require_reached(record, stage)
         validated = self.validate_draft(project_id, stage, draft)
         current = self.storage.load_draft(project_id, stage)
-        if current is not None and self._draft_content(stage, current) == self._draft_content(
-            stage, validated
-        ):
+        unchanged = current is not None and self._draft_content(
+            stage, current
+        ) == self._draft_content(stage, validated)
+        waiting_for_confirmation = (
+            record.stages[stage].status == StageStatus.WAITING_USER or stage in record.stage_threads
+        )
+        if unchanged and not waiting_for_confirmation:
             return current
         validated["issues"] = []
         if stage == Stage.CODE_DRAFT:
@@ -158,6 +164,7 @@ class ProjectService:
         state.issues = list(validated.get("issues", []))
         state.updated_at = datetime.now(UTC)
         record.stage_threads.pop(stage, None)
+        record.failed_stage_threads.pop(stage, None)
         self._invalidate_downstream(record, stage)
         self.storage.invalidate_downstream_artifacts(project_id, stage)
         record.current_stage = Stage(stage)
@@ -180,7 +187,8 @@ class ProjectService:
             Stage.CODE_DRAFT: (
                 "generator_code",
                 "validator_code",
-                "constraint_coverage",
+                "proof_obligations",
+                "implementation_mapping",
             ),
         }[Stage(stage)]
         return {field: draft.get(field) for field in fields}
@@ -210,6 +218,15 @@ class ProjectService:
             validated["subtasks_revision"] = record.subtasks_revision
             saved = self.storage.save_code_draft(project_id, CodeDraft.model_validate(validated))
             validated = saved.model_dump(mode="json")
+            if confirmed:
+                ledger = CounterexampleLedger.model_validate(
+                    self.storage.load_agent4_ledger(project_id)
+                )
+                ledger.last_valid_candidate_revision = saved.revision_id
+                self.storage.save_agent4_ledger(
+                    project_id, ledger.model_dump(mode="json")
+                )
+                self.storage.save_agent4_last_valid_candidate(project_id, validated)
         else:
             self.storage.save_draft(project_id, stage, validated)
 
@@ -225,6 +242,7 @@ class ProjectService:
         state.status = StageStatus.WAITING_USER if confirmed else StageStatus.DRAFT
         state.updated_at = datetime.now(UTC)
         record.stage_threads.pop(stage, None)
+        record.failed_stage_threads.pop(stage, None)
         self._invalidate_downstream(record, stage)
         if content_changed:
             self.storage.invalidate_downstream_artifacts(project_id, stage)
@@ -300,10 +318,9 @@ class ProjectService:
             if was_compiled or record.current_stage > Stage.SOLUTION_COMPILE:
                 record.workflow_revision += 1
                 record.stage_threads = {}
+                record.failed_stage_threads = {}
                 self._invalidate_downstream(record, Stage.SOLUTION_COMPILE)
-                self.storage.invalidate_downstream_artifacts(
-                    project_id, Stage.SOLUTION_COMPILE
-                )
+                self.storage.invalidate_downstream_artifacts(project_id, Stage.SOLUTION_COMPILE)
                 record.build_complete = False
                 record.export_ready = False
                 record.generation_complete = False
@@ -389,9 +406,7 @@ class ProjectService:
             if stage == Stage.INPUT_STRUCTURE:
                 model = InputStructureDraft.model_validate(draft)
                 if model.structure_tags:
-                    tag_issues = self.tag_catalog.validate_structure_tags(
-                        model.structure_tags
-                    )
+                    tag_issues = self.tag_catalog.validate_structure_tags(model.structure_tags)
                     if tag_issues and not allow_tag_review:
                         raise AppError(
                             "INVALID_STRUCTURE_TAGS",
@@ -442,6 +457,7 @@ class ProjectService:
     def _invalidate_downstream(record: ProjectRecord, stage: int) -> None:
         for downstream in range(stage + 1, 6):
             record.stage_threads.pop(downstream, None)
+            record.failed_stage_threads.pop(downstream, None)
             state = record.stages[downstream]
             state.status = StageStatus.DRAFT
             state.ai_confirmed = False

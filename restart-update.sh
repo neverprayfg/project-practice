@@ -3,50 +3,39 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
+ACTION_NAME="更新"
+# shellcheck source=scripts/runtime-common.sh
+source "$ROOT/scripts/runtime-common.sh"
 
-command -v docker >/dev/null 2>&1 || { printf '更新失败：未找到 Docker\n' >&2; exit 1; }
-command -v tar >/dev/null 2>&1 || { printf '更新失败：未找到 tar\n' >&2; exit 1; }
-docker version >/dev/null 2>&1 || { printf '更新失败：Docker Engine 不可用\n' >&2; exit 1; }
+require_runtime_layout
+require_docker
+validate_compose_config
+require_health_client
+require_command tar
+require_command git
+assert_no_active_runners
 
-printf '[1/4] 使用当前源码重建后端镜像\n'
-tar -cf - \
-  backend/pyproject.toml \
-  backend/uv.lock \
-  backend/app \
-  demo前端样式设计 \
-  docker/backend.Dockerfile \
-  | docker build --pull=false --progress=plain \
-      -t contest-dataset-backend:0.1.0 -f docker/backend.Dockerfile -
+printf '[1/6] 同步 testlib/jngen 固定版本\n'
+sync_fixed_dependencies
 
-printf '[2/4] 使用固定依赖重建受限 runner 双镜像\n'
-tar -cf - \
-  docker/runner/runner.cpp \
-  docker/runner.Dockerfile \
-  testlib/testlib.h \
-  jngen/jngen.h \
-| docker build --pull=false --progress=plain \
-      --target compiler \
-      -t contest-dataset-runner-compiler:0.3.0 -f docker/runner.Dockerfile -
-tar -cf - \
-  docker/runner/runner.cpp \
-  docker/runner.Dockerfile \
-  testlib/testlib.h \
-  jngen/jngen.h \
-| docker build --pull=false --progress=plain \
-      --target executor \
-      -t contest-dataset-runner-executor:0.3.0 -f docker/runner.Dockerfile -
+printf '[2/6] 使用当前源码重建后端镜像\n'
+build_backend_image
 
-printf '[3/4] 重建应用容器\n'
-docker compose up -d --no-build --force-recreate docker-api workspace-init backend
+printf '[3/6] 暂停任务入口\n'
+assert_application_idle
+assert_no_active_runners
+compose_cmd stop --timeout 30 backend \
+  || fail "后端停止失败，未重建 runner 镜像"
 
-printf '[4/4] 等待应用就绪'
-for _ in $(seq 1 60); do
-  if curl -fsS http://localhost:8000/health >/dev/null 2>&1; then
-    printf ' 完成\n\n更新已生效，业务状态与 LangGraph checkpoint 已保留。\n'
-    exit 0
-  fi
-  printf '.'
-  sleep 1
-done
-printf '\n更新失败：应用未在 60 秒内就绪\n' >&2
-exit 1
+printf '[4/6] 使用固定依赖重建受限 runner 双镜像\n'
+build_runner_images
+
+printf '[5/6] 重建应用容器\n'
+assert_no_active_runners
+compose_cmd up -d --no-build --force-recreate --remove-orphans \
+  docker-api workspace-init backend \
+  || fail "应用容器重建失败"
+
+printf '[6/6] '
+wait_for_backend 60 || fail "应用未在 60 秒内就绪"
+printf '\n更新已生效，业务状态、模型配置与 LangGraph checkpoint 已保留。\n'

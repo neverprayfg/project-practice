@@ -58,6 +58,31 @@ CODE_DRAFT = {
     "validator_code": (
         '#include "testlib.h"\nint main(int argc,char** argv){registerValidation(argc,argv);}'
     ),
+    "proof_obligations": [
+        {
+            "constraint_id": "placeholder:code",
+            "scope": "candidate",
+            "severity": "blocker",
+            "verification_method": "static",
+            "requirement": "由 Agent4 运行时替换。",
+        }
+    ],
+    "implementation_mapping": [
+        {
+            "constraint_id": "placeholder:code",
+            "locations": [
+                {
+                    "target_file": "generator.cpp",
+                    "symbol": "include",
+                    "line_start": 1,
+                    "line_end": 1,
+                }
+            ],
+            "used_parameters": [],
+            "document_evidence": [],
+            "test_strategy": "由 Agent4 运行时替换。",
+        }
+    ],
     "issues": [],
 }
 
@@ -85,6 +110,37 @@ def test_structure_tag_catalog_is_exposed(app_bundle) -> None:
     assert response.status_code == 200
     assert response.json()["version"] == 1
     assert any(item["id"] == "tree" for item in response.json()["tags"])
+
+
+def test_stage_five_contract_preflight_returns_project_to_stage_four(app_bundle) -> None:
+    client, _sandbox = app_bundle
+    created = client.post(
+        "/api/projects",
+        json={
+            "problem_description": "Read n.",
+            "solution_code": "int main(){}",
+            "difficulty": "easy",
+        },
+    )
+    project_id = created.json()["project_id"]
+    client.post(f"/api/projects/{project_id}/solution/compile")
+    save_run_confirm(client, project_id, 3, INPUT_DRAFT)
+    save_run_confirm(client, project_id, 4, PLAN_DRAFT)
+    storage = client.app.state.storage
+    corrupted = storage.load_draft(project_id, 4)
+    assert corrupted is not None
+    corrupted["subtasks"][0]["runtime_parameters"] = []
+    storage.save_draft(project_id, 4, corrupted)
+
+    response = client.post(f"/api/projects/{project_id}/stages/5/run", json={})
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "UPSTREAM_CONTRACT_INVALID"
+    assert response.json()["stage"] == 4
+    project = client.get(f"/api/projects/{project_id}").json()["project"]
+    assert project["current_stage"] == 4
+    assert project["stages"]["4"]["status"] == "draft"
+    assert project["stages"]["5"]["status"] == "failed"
 
 
 def test_complete_mvp_flow_exports_only_required_files(
@@ -116,7 +172,7 @@ def test_complete_mvp_flow_exports_only_required_files(
         "compile",
         "trial_generation",
         "validation",
-        "review",
+        "semantic_audit",
         "workflow_total",
     }.issubset({event["segment"] for event in timing_payload["events"]})
     assert len(timing_payload["runs"]) == 1
@@ -124,6 +180,21 @@ def test_complete_mvp_flow_exports_only_required_files(
     assert timing_run["workflow_total_ms"] >= timing_run["measured_segments_ms"]
     assert timing_run["rounds"][0]["round"] == 1
     assert timing_run["segments"]["compile"]["calls"] == 1
+    decisions = client.get(f"/api/projects/{project_id}/stage5/decisions")
+    assert decisions.status_code == 200, decisions.text
+    decision_events = decisions.json()["events"]
+    assert decision_events
+    assert {
+        "candidate_revision",
+        "target_defect_id",
+        "model_call_type",
+        "modified_files",
+        "before",
+        "after",
+        "progress",
+        "decision",
+        "reason",
+    }.issubset(decision_events[-1])
 
     preview = client.post(
         f"/api/projects/{project_id}/preview",
@@ -143,12 +214,14 @@ def test_complete_mvp_flow_exports_only_required_files(
 
     client.app.state.storage.save_batch_manifest = tracked_save_manifest
     sandbox.batch_calls.clear()
-    built = client.post(f"/api/projects/{project_id}/build", json={"base_seed": 9})
-    assert built.status_code == 200, built.text
-    assert built.json()["ok"] is True
-    assert built.json()["generated_tests"] == 2
-    assert built.json()["validated_tests"] == 2
-    assert built.json()["export_ready"] is True
+    generated = client.post(f"/api/projects/{project_id}/generate", json={"base_seed": 9})
+    assert generated.status_code == 200, generated.text
+    assert generated.json()["ok"] is True
+    assert generated.json()["generated_tests"] == 2
+    validated = client.post(f"/api/projects/{project_id}/validate", json={})
+    assert validated.status_code == 200, validated.text
+    assert validated.json()["validated_tests"] == 2
+    assert validated.json()["export_ready"] is True
     assert sandbox.batch_calls == [("generate", 2), ("validate_solve", 2)]
     assert manifest_writes == 4
     generated_paths = [
@@ -219,7 +292,7 @@ def test_stage_three_runs_langgraph_and_waits_for_user(
     assert response.json()["agent"]["waiting_user"] is True
     project = client.get(f"/api/projects/{project_id}").json()["project"]
     assert project["stages"]["3"]["status"] == "waiting_user"
-    assert project["stage_threads"]["3"].startswith(f"{project_id}:input_structure:")
+    assert project["stage_threads"]["3"].startswith(f"{project_id}:agent2:")
 
 
 def test_agent_three_creates_five_subtasks_on_initial_run(
@@ -273,9 +346,7 @@ def test_generate_selected_subtask_then_validate_as_separate_stages(
     assert project["build_complete"] is False
     assert project["export_ready"] is False
     generated_paths = [
-        call[4]
-        for call in sandbox.calls
-        if call[0] == "generate" and call[4].startswith("data/")
+        call[4] for call in sandbox.calls if call[0] == "generate" and call[4].startswith("data/")
     ]
     assert generated_paths == ["data/2_1.in", "data/2_2.in", "data/2_3.in"]
 
@@ -488,7 +559,9 @@ def test_validator_failure_returns_project_to_stage_five(
     save_run_confirm(client, project_id, 5, CODE_DRAFT)
     sandbox.fail_validation = True
 
-    response = client.post(f"/api/projects/{project_id}/build", json={"base_seed": 1})
+    generated = client.post(f"/api/projects/{project_id}/generate", json={"base_seed": 1})
+    assert generated.status_code == 200, generated.text
+    response = client.post(f"/api/projects/{project_id}/validate", json={})
     assert response.status_code == 400
     assert response.json()["stage"] == 5
     assert response.json()["details"]["failure_category"] == "validation"

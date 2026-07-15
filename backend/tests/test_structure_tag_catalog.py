@@ -74,9 +74,7 @@ def test_document_union_is_language_independent_and_budgeted() -> None:
     )
 
     assert chinese == english
-    assert {"tree.md", "generic_graph.md", "random.md"}.issubset(
-        chinese["selected_filenames"]
-    )
+    assert {"tree.md", "generic_graph.md", "random.md"}.issubset(chinese["selected_filenames"])
     with pytest.raises(AppError) as error:
         documents.route_documents(
             {"confirmed_structure_tags": tags},
@@ -85,7 +83,7 @@ def test_document_union_is_language_independent_and_budgeted() -> None:
     assert error.value.code == "STRUCTURE_TAG_DOCUMENT_BUDGET_EXCEEDED"
 
 
-def test_tree_runtime_parameters_require_n_and_m_equals_n_minus_one() -> None:
+def test_runtime_parameter_requirements_are_driven_by_catalog_metadata() -> None:
     catalog = StructureTagCatalog(ROOT)
     plan = SubtaskPlanDraft.model_validate(
         {
@@ -101,7 +99,6 @@ def test_tree_runtime_parameters_require_n_and_m_equals_n_minus_one() -> None:
                             "case_id": 1,
                             "parameters": [
                                 {"name": "n", "value": 10, "category": "size"},
-                                {"name": "m", "value": 10, "category": "size"},
                             ],
                         }
                     ],
@@ -112,7 +109,7 @@ def test_tree_runtime_parameters_require_n_and_m_equals_n_minus_one() -> None:
 
     issues = structure_tag_parameter_issues(plan, ["tree"], catalog)
 
-    assert any("m = n - 1" in issue for issue in issues)
+    assert any("缺少标签必需参数：m" in issue for issue in issues)
 
 
 def test_ai_result_preserves_manual_tag_for_visible_review(tmp_path: Path) -> None:

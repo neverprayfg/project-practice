@@ -313,11 +313,6 @@ class DatasetService:
             "export_ready": True,
         }
 
-    async def build(self, project_id: str, base_seed: int) -> dict[str, Any]:
-        generated = await self.generate_inputs(project_id, base_seed, None)
-        validated = await self.validate_and_solve(project_id, None)
-        return {**generated, **validated}
-
     def export(self, project_id: str) -> Path:
         record = self.projects.get(project_id)
         if not record.export_ready:

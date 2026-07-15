@@ -49,7 +49,6 @@ try {
         "MODEL_API_KEY=$ApiKey"
         "MODEL_NAME=$Model"
         "MODEL_TIMEOUT_SECONDS=300"
-        "AGENT_MAX_ITERATIONS=4"
     )
     [IO.File]::WriteAllLines(
         (Join-Path $Root ".env"),

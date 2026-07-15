@@ -2,43 +2,53 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
-import httpx
 import pytest
 from pydantic import ValidationError
 
 from app.config import Settings
 from app.models import (
     CodeDraft,
-    Confirmation,
+    ConstraintImplementationClaim,
     InputStructureDraft,
-    ProjectCreate,
-    RuntimeParameter,
-    SpecialCase,
     Subtask,
-    TaskType,
-    ToolRequest,
+    SubtaskPlanDraft,
 )
 from app.models import (
-    TestPointRuntimeParameters as RuntimeParameterProfile,
+    TestPointRuntimeParameters as RuntimeProfile,
 )
-from app.services.context_provider import AgentContextProvider
 from app.services.jngen_document_context import JngenDocumentContext
-from app.services.jngen_policy import jngen_usage_issues
-from app.services.model_client import OpenAICompatibleAgentModel
-from app.services.project_service import ProjectService
+from app.services.model_client import (
+    AGENT1_PROMPT,
+    AGENT2_PROMPT,
+    AGENT3_PROMPT,
+    AGENT4_AUDIT_PROMPT,
+    AGENT4_GENERATE_PROMPT,
+    AGENT4_RECHECK_PROMPT,
+    AGENT4_REPAIR_PROMPT,
+    OpenAICompatibleAgentModel,
+)
+from app.services.proof_obligations import (
+    Agent4ContractPreflight,
+    resolve_implementation_mapping,
+)
 from app.services.structure_tag_catalog import StructureTagCatalog
-from app.storage import ProjectStorage
+
+
+def _catalog() -> StructureTagCatalog:
+    root = Path(__file__).parents[1] / "app" / "jngen_doc_context"
+    return StructureTagCatalog(root)
 
 
 def test_special_case_count_cannot_exceed_subtask_total() -> None:
     with pytest.raises(ValidationError):
         Subtask(
             id=1,
-            constraints="n 至少为 1。",
+            constraints="n <= 10",
             test_count=1,
             expected_complexity="O(n)",
-            special_cases=[SpecialCase(count=2, description="boundaries")],
+            special_cases=[{"count": 2, "description": "boundary"}],
         )
 
 
@@ -46,735 +56,211 @@ def test_runtime_parameters_must_cover_each_test_point_in_order() -> None:
     with pytest.raises(ValidationError):
         Subtask(
             id=1,
-            constraints="1 <= n <= 100",
+            constraints="n <= 10",
             test_count=2,
             expected_complexity="O(n)",
             runtime_parameters=[
-                RuntimeParameterProfile(
-                    case_id=2,
-                    parameters=[
-                        RuntimeParameter(name="n_max", value=100, category="size")
-                    ],
-                )
+                {
+                    "case_id": 2,
+                    "parameters": [{"name": "n", "value": 10, "category": "size"}],
+                }
             ],
         )
 
 
-def test_mixed_structure_route_loads_every_matching_topic() -> None:
-    root = Path(__file__).parents[1] / "app/jngen_doc_context"
-    docs = JngenDocumentContext(root, StructureTagCatalog(root))
-
-    route = docs.route_documents(
-        {
-            "confirmed_structure_tags": [
-                {
-                    "tag_id": "collection.array",
-                    "applies_to": "values",
-                    "evidence": "n integers",
-                },
-                {
-                    "tag_id": "tree",
-                    "applies_to": "edges",
-                    "evidence": "n-1 edges",
-                },
-            ]
-        },
-        100_000,
-    )
-
-    assert route is not None
-    assert route["selected_tag_ids"] == ["collection.array", "tree"]
-    assert {"array.md", "tree.md", "generic_graph.md"}.issubset(
-        route["selected_filenames"]
-    )
+def test_runtime_parameter_names_are_unique_and_reserved_names_rejected() -> None:
+    with pytest.raises(ValidationError):
+        RuntimeProfile(
+            case_id=1,
+            parameters=[
+                {"name": "seed", "value": 1, "category": "size"},
+                {"name": "seed", "value": 2, "category": "size"},
+            ],
+        )
 
 
 def test_input_structure_accepts_unstructured_template_text() -> None:
-    draft = InputStructureDraft(
-        template="第一行读取 n，第二行读取由 n 个整数组成的 nums。"
+    value = InputStructureDraft(
+        template="第一行 n，随后 n 行每行两个整数。",
+        structure_tags=[{"tag_id": "primitive.integer", "applies_to": "n", "evidence": "整数"}],
     )
-    assert "nums" in draft.template
+    assert value.template.startswith("第一行")
 
 
-def test_model_prompt_disables_tools_and_embeds_testlib_for_code_draft() -> None:
-    code_prompt = OpenAICompatibleAgentModel._system_prompt(TaskType.CODE_DRAFT, "generate")
-    input_prompt = OpenAICompatibleAgentModel._system_prompt(
-        TaskType.INPUT_STRUCTURE,
-        "generate",
+def test_mixed_structure_route_loads_documents_for_global_and_subtask_tags() -> None:
+    root = Path(__file__).parents[1] / "app" / "jngen_doc_context"
+    catalog = StructureTagCatalog(root)
+    documents = JngenDocumentContext(root, catalog)
+    route = documents.route_documents(
+        {
+            "confirmed_structure_tags": [
+                {
+                    "tag_id": "graph.directed.weighted",
+                    "applies_to": "edges",
+                    "evidence": "directed weighted graph",
+                }
+            ],
+            "subtasks": [{"subtask_tags": ["tree"]}],
+        },
+        200_000,
+    )
+    assert route is not None
+    assert {"graph.md", "generic_graph.md", "tree.md"}.issubset(route["selected_filenames"])
+
+
+def test_document_index_exposes_digest_symbols_and_targeted_fragments() -> None:
+    root = Path(__file__).parents[1] / "app" / "jngen_doc_context"
+    documents = JngenDocumentContext(root, StructureTagCatalog(root))
+    loaded = documents.load_documents(["getting_started.md", "getopt.md"])
+    assert all(len(item["digest"]) == 64 for item in loaded["selected_documents"])
+    assert all(item["symbols"] for item in loaded["selected_documents"])
+    fragments = documents.repair_fragments(
+        loaded,
+        {
+            "defect_id": "defect_" + "0" * 20,
+            "identity": {
+                "category": "library_api",
+                "constraint_id": "system:getopt",
+                "error_code": "GETOPT_MISSING",
+            },
+            "evidence": {"check": {"issues": ["getOpt runtime parameter"]}},
+        },
+        8_000,
+    )
+    assert fragments["selection_method"] == "stable_defect_fragment_index"
+    assert sum(len(item["content"]) for item in fragments["selected_fragments"]) <= 8_000
+
+
+def test_backend_resolves_document_digest_instead_of_asking_model_to_echo_it() -> None:
+    digest = "a" * 64
+    claims = [
+        ConstraintImplementationClaim(
+            constraint_id="subtask:1:constraints",
+            locations=[
+                {
+                    "target_file": "generator.cpp",
+                    "symbol": "main",
+                    "line_start": 1,
+                    "line_end": 1,
+                }
+            ],
+            document_evidence=[{"filename": "graph.md", "symbol": "Graph"}],
+            test_strategy="按约束构造。",
+        )
+    ]
+
+    resolved = resolve_implementation_mapping(
+        claims,
+        [{"filename": "graph.md", "digest": digest, "content": "Graph"}],
     )
 
-    assert "不得输出 tool_requests 字段" in code_prompt
-    assert "selected_documents" in code_prompt
-    assert "registerGen(argc, argv, 1)" in code_prompt
-    assert "registerValidation(argc, argv)" in code_prompt
-    assert "不得输出 tool_requests 字段" in input_prompt
+    assert resolved[0].document_evidence[0].digest == digest
 
 
-def _valid_model_result(task_type: TaskType) -> dict:
-    if task_type == TaskType.INPUT_NORMALIZATION:
-        return {
-            "problem": {
-                "description": "读取 n 并输出 n。",
-                "input_description": "一个整数 n。",
-                "output_description": "输出 n。",
-                "samples": [{"input": "1", "output": "1", "note": ""}],
-                "difficulty": "easy",
-            },
-            "solution": {
-                "language": "cpp",
-                "source": "int main(){}",
-                "compile": {"status": "pending", "log": ""},
-            },
-            "input_structure": {"template": "", "status": "pending", "revision": 0},
-            "revision": 1,
-        }
-    if task_type == TaskType.INPUT_STRUCTURE:
-        return {"template": "第一行读取整数 n。"}
-    if task_type == TaskType.SUBTASK_PLAN:
-        return {
+def test_agent_prompts_are_independent_and_review_operations_are_read_only() -> None:
+    assert "Agent1" in AGENT1_PROMPT and "Agent2" not in AGENT1_PROMPT
+    assert "Agent2" in AGENT2_PROMPT and "Agent3" not in AGENT2_PROMPT
+    assert "Agent3" in AGENT3_PROMPT and "子任务契约" in AGENT3_PROMPT
+    assert "implementation_mapping" in AGENT4_GENERATE_PROMPT
+    assert "绝对禁止" in AGENT4_AUDIT_PROMPT
+    assert "只处理 target_defect" in AGENT4_REPAIR_PROMPT
+    assert "不得报告新缺陷" in AGENT4_RECHECK_PROMPT
+
+
+def test_preflight_builds_generic_proof_obligations() -> None:
+    obligations, issues = Agent4ContractPreflight(_catalog()).inspect(
+        {
+            "confirmed_structure_tags": [
+                {
+                    "tag_id": "primitive.integer",
+                    "applies_to": "n",
+                    "evidence": "integer",
+                }
+            ],
             "subtasks": [
                 {
                     "id": 1,
                     "constraints": "1 <= n <= 10",
                     "test_count": 1,
                     "expected_complexity": "O(n)",
-                    "special_cases": [],
-                }
-            ]
-        }
-    return {
-        "generator_code": '#include "jngen.h"\nint main(){}',
-        "validator_code": '#include "testlib.h"\nint main(){}',
-    }
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "task_type",
-    [
-        TaskType.INPUT_NORMALIZATION,
-        TaskType.INPUT_STRUCTURE,
-        TaskType.SUBTASK_PLAN,
-        TaskType.CODE_DRAFT,
-    ],
-)
-async def test_every_agent_request_uses_structured_envelope_and_result_schema(
-    task_type: TaskType,
-) -> None:
-    captured: list[dict] = []
-    result = _valid_model_result(task_type)
-
-    def respond(request: httpx.Request) -> httpx.Response:
-        captured.append(json.loads(request.content))
-        return httpx.Response(
-            200,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "content": json.dumps(
-                                {
-                                    "confirmation": "revise",
-                                    "result": result,
-                                    "issues": [],
-                                },
-                                ensure_ascii=False,
-                            )
+                    "special_cases": [{"count": 1, "description": "n=1"}],
+                    "runtime_parameters": [
+                        {
+                            "case_id": 1,
+                            "parameters": [{"name": "n", "value": 1, "category": "size"}],
                         }
-                    }
-                ]
-            },
-        )
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-        model = OpenAICompatibleAgentModel(
-            Settings(model_api_key="test-key"),
-            client,
-        )
-        output = await model.run(
-            task_type,
-            "generate",
-            {"input": {"revision": 1}},
-            result,
-            {"ok": False},
-            ["待修复问题"],
-        )
-
-    payload = captured[0]
-    sent = json.loads(payload["messages"][1]["content"])
-    assert payload["response_format"] == {"type": "json_object"}
-    assert sent["format_version"] == 1
-    assert sent["request"] == {"task_type": task_type.value, "phase": "generate"}
-    assert set(sent["inputs"]) == {
-        "context",
-        "candidate",
-        "execution",
-        "previous_issues",
-    }
-    contract = sent["response_contract"]
-    assert contract["additionalProperties"] is False
-    assert contract["required"] == [
-        "confirmation",
-        "result",
-        "issues",
-    ]
-    assert "tool_requests" not in contract["properties"]
-    assert contract["properties"]["result"]["type"] == "object"
-    if task_type == TaskType.CODE_DRAFT:
-        code_properties = contract["properties"]["result"]["properties"]
-        assert "trial_results" not in code_properties
-        assert "revision_id" not in code_properties
-    assert output.result == result
-
-
-@pytest.mark.asyncio
-async def test_passing_code_review_uses_null_result_and_strips_server_fields() -> None:
-    captured: list[dict] = []
-    candidate = {
-        **_valid_model_result(TaskType.CODE_DRAFT),
-        "constraint_coverage": [],
-        "revision_id": "server-owned",
-        "input_revision": 2,
-        "subtasks_revision": 3,
-        "trial_results": [{"operation": "compile", "large": "payload"}],
-    }
-
-    def respond(request: httpx.Request) -> httpx.Response:
-        captured.append(json.loads(request.content))
-        return httpx.Response(
-            200,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "content": json.dumps(
-                                {
-                                    "confirmation": "pass",
-                                    "result": candidate,
-                                    "issues": [],
-                                }
-                            )
-                        }
-                    }
-                ]
-            },
-        )
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-        model = OpenAICompatibleAgentModel(Settings(model_api_key="test-key"), client)
-        output = await model.run(
-            TaskType.CODE_DRAFT,
-            "review",
-            {"input": {}},
-            candidate,
-            {"ok": True},
-            [],
-        )
-
-    sent = json.loads(captured[0]["messages"][1]["content"])
-    assert set(sent["inputs"]["candidate"]) == {
-        "generator_code",
-        "validator_code",
-        "constraint_coverage",
-    }
-    result_contract = sent["response_contract"]["properties"]["result"]
-    assert result_contract["anyOf"][1] == {"type": "null"}
-    assert output.confirmation == Confirmation.PASS
-    assert output.result is None
-
-
-@pytest.mark.asyncio
-async def test_revised_code_review_merges_a_field_patch() -> None:
-    captured: list[dict] = []
-    candidate = {
-        **_valid_model_result(TaskType.CODE_DRAFT),
-        "constraint_coverage": [],
-    }
-
-    def respond(request: httpx.Request) -> httpx.Response:
-        captured.append(json.loads(request.content))
-        return httpx.Response(
-            200,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "content": json.dumps(
-                                {
-                                    "confirmation": "revise",
-                                    "result": {
-                                        "validator_code": (
-                                            '#include "testlib.h"\n'
-                                            "int main(){return 0;}"
-                                        )
-                                    },
-                                    "issues": ["已修复校验器。"],
-                                },
-                                ensure_ascii=False,
-                            )
-                        }
-                    }
-                ]
-            },
-        )
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-        model = OpenAICompatibleAgentModel(Settings(model_api_key="test-key"), client)
-        output = await model.run(
-            TaskType.CODE_DRAFT,
-            "review",
-            {"input": {}},
-            candidate,
-            {"ok": False},
-            [],
-        )
-
-    sent = json.loads(captured[0]["messages"][1]["content"])
-    patch_contract = sent["response_contract"]["properties"]["result"]["anyOf"][0]
-    assert patch_contract["minProperties"] == 1
-    assert "required" not in patch_contract
-    assert output.result is not None
-    assert output.result["generator_code"] == candidate["generator_code"]
-    assert output.result["validator_code"].endswith("int main(){return 0;}")
-    assert output.result["constraint_coverage"] == []
-
-
-def test_tool_request_accepts_openai_style_tool_and_params_aliases() -> None:
-    request = ToolRequest.model_validate(
-        {
-            "tool": "list_dir",
-            "params": {"root": "jngen", "path": "doc", "pattern": "*.md"},
-        }
-    )
-
-    assert request.name == "list_dir"
-    assert request.arguments["path"] == "doc"
-
-
-def test_tool_request_accepts_flat_readonly_tool_arguments() -> None:
-    request = ToolRequest.model_validate(
-        {"name": "read_doc", "root": "jngen", "path": "doc/graph.md"}
-    )
-
-    assert request.arguments == {"root": "jngen", "path": "doc/graph.md"}
-
-
-def test_legacy_input_fields_are_converted_to_template_text() -> None:
-    draft = InputStructureDraft(
-        fields=[
-            {
-                "name": "nums",
-                "type": "integer sequence",
-                "order": 2,
-                "group": None,
-                "repeat_by": "n",
-                "relation": None,
-            }
-        ]
-    )
-
-    assert draft.model_dump() == {
-        "template": "输入结构：\n1. nums（integer sequence）：输入值。",
-        "structure_tags": [],
-        "issues": [],
-    }
-
-
-def test_legacy_subtask_ranges_are_converted_to_constraints_text() -> None:
-    subtask = Subtask.model_validate(
-        {
-            "id": 1,
-            "ranges": [{"field": "n", "constraint": "1 <= n <= 10"}],
-            "test_count": 2,
-            "expected_complexity": "O(n)",
-            "special_cases": [],
-        }
-    )
-
-    assert subtask.constraints == "n：1 <= n <= 10"
-
-
-@pytest.mark.parametrize(
-    "constraints",
-    [
-        "n：1e3 <= n <= 5e3",
-        "1e3 <= n <= 5e3",
-        "n 的范围是 1e3 到 5e3",
-        "数组长度 n 不小于 1000，且不超过 5000",
-        "n: [1000, 5000]",
-        "n >= 1000\nn <= 5000",
-    ],
-)
-def test_subtask_accepts_clear_free_form_constraints(constraints: str) -> None:
-    subtask = Subtask(
-        id=1,
-        constraints=constraints,
-        test_count=1,
-        expected_complexity="O(n)",
-    )
-
-    assert subtask.constraints == constraints
-
-
-def test_global_input_is_sent_as_single_agent_context(tmp_path: Path) -> None:
-    storage = ProjectStorage(tmp_path / "storage")
-    projects = ProjectService(storage)
-    record = projects.create(
-        ProjectCreate(
-            problem_description="A graph problem",
-            solution_code="int main(){}",
-            difficulty="very hard",
-        )
-    )
-    provider = AgentContextProvider(storage)
-    context = provider.build(record.project_id, TaskType.INPUT_STRUCTURE)
-    assert context["input"]["problem"]["difficulty"] == "very hard"
-    assert context["input"]["solution"]["source"] == "int main(){}"
-    assert context["library_guidance"] == []
-
-
-def test_agent4_context_keeps_testlib_out_of_user_message(
-    tmp_path: Path,
-) -> None:
-    storage = ProjectStorage(tmp_path / "storage")
-    projects = ProjectService(storage)
-    record = projects.create(
-        ProjectCreate(
-            problem_description="problem",
-            solution_code="int main(){}",
-            difficulty="easy",
-        )
-    )
-    storage.save_code_draft(
-        record.project_id, CodeDraft(generator_code="g1", validator_code="v1")
-    )
-    code_revision = storage.current_revision(record.project_id)
-    storage.append_agent4_feedback(
-        record.project_id,
-        {
-            "code": "GENERATION_FAILED",
-            "message": "生成失败",
-            "workflow_revision": record.workflow_revision,
-            "input_revision": record.input_revision,
-            "subtasks_revision": record.subtasks_revision,
-            "code_revision": code_revision,
-        },
-    )
-    provider = AgentContextProvider(storage)
-    context = provider.build(record.project_id, TaskType.CODE_DRAFT)
-    assert context["recovery_feedback"][0]["code"] == "GENERATION_FAILED"
-    assert context["library_guidance"] == []
-    assert "jngen_documentation" not in context
-
-
-def test_input_structure_context_does_not_include_downstream_subtasks(
-    tmp_path: Path,
-) -> None:
-    storage = ProjectStorage(tmp_path / "storage")
-    projects = ProjectService(storage)
-    record = projects.create(
-        ProjectCreate(
-            problem_description="problem",
-            solution_code="int main(){}",
-            difficulty="easy",
-        )
-    )
-    storage.save_draft(
-        record.project_id,
-        4,
-        {
-            "subtasks": [
-                {
-                    "id": 1,
-                    "constraints": "n <= 10",
-                    "test_count": 1,
-                    "expected_complexity": "O(n)",
-                    "special_cases": [],
+                    ],
+                    "subtask_tags": [],
                 }
             ],
-            "issues": [],
-        },
-    )
-
-    provider = AgentContextProvider(storage)
-    context = provider.build(record.project_id, TaskType.INPUT_STRUCTURE)
-
-    assert "subtasks" not in context
-
-
-def test_agent4_base_context_leaves_jngen_selection_to_runner(
-    tmp_path: Path,
-) -> None:
-    storage = ProjectStorage(tmp_path / "storage")
-    projects = ProjectService(storage)
-    record = projects.create(
-        ProjectCreate(
-            problem_description="graph problem",
-            solution_code="int main(){}",
-            difficulty="hard",
-        )
-    )
-    input_data = storage.load_input(record.project_id)
-    input_data.input_structure.template = "输入 n 个顶点和 m 条有向边。"
-    storage.save_input(record.project_id, input_data)
-
-    provider = AgentContextProvider(storage)
-    context = provider.build(record.project_id, TaskType.CODE_DRAFT)
-
-    assert context["library_guidance"] == []
-    assert "jngen_documentation" not in context
-    assert "required_jngen_structures" not in context
-
-
-def test_jngen_usage_check_rejects_mentions_that_only_appear_in_comments() -> None:
-    issues = jngen_usage_issues(
-        '// #include "jngen.h"\n// Graph::random(10, 20)\nint main(){}',
-    )
-
-    assert any("jngen.h" in issue for issue in issues)
-    assert any("数据生成接口" in issue for issue in issues)
-
-
-def test_tool_request_ignores_repeated_workflow_confirmation() -> None:
-    request = ToolRequest.model_validate(
-        {
-            "tool": "list_dir",
-            "params": {"root": "jngen", "path": "doc"},
-            "confirmation": "revise",
         }
     )
+    assert issues == []
+    ids = {item.constraint_id for item in obligations}
+    assert "input:tag:primitive.integer" in ids
+    assert "subtask:1:constraints" in ids
+    assert "subtask:1:special:1" in ids
+    assert "subtask:1:case:1:parameter:n" in ids
 
-    assert request.name == "list_dir"
-    assert request.arguments == {"root": "jngen", "path": "doc"}
+
+def test_code_draft_requires_proof_and_implementation_mapping() -> None:
+    with pytest.raises(ValidationError):
+        CodeDraft(generator_code="code", validator_code="code")
+
+
+class _Response:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, Any]:
+        return self.payload
+
+
+class _RecordingClient:
+    def __init__(self, content: dict[str, Any]) -> None:
+        self.content = content
+        self.requests: list[dict[str, Any]] = []
+
+    async def post(self, url: str, **kwargs: Any) -> _Response:
+        self.requests.append({"url": url, **kwargs})
+        return _Response({"choices": [{"message": {"content": json.dumps(self.content)}}]})
 
 
 @pytest.mark.asyncio
-async def test_remote_model_retries_when_tool_request_is_returned() -> None:
-    calls = 0
+async def test_remote_model_uses_explicit_operation_and_pydantic_schema() -> None:
+    client = _RecordingClient({"defects": []})
+    model = OpenAICompatibleAgentModel(Settings(model_api_key="test-key"), client)  # type: ignore[arg-type]
+    audit = await model.agent4_audit({}, {}, {"ok": True})
 
-    def respond(_request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
-        tool_requests = (
-            [
+    assert audit.defects == []
+    message = json.loads(client.requests[0]["json"]["messages"][1]["content"])
+    request_payload = client.requests[0]["json"]
+    assert message["operation"] == "agent4.semantic_audit"
+    assert message["response_contract"]["title"] == "SemanticAudit"
+    assert "JSON" in request_payload["messages"][0]["content"]
+    assert "JSON" in message["output_instructions"]
+    assert request_payload["response_format"] == {"type": "json_object"}
+    assert request_payload["max_tokens"] == 32_768
+
+
+def test_subtask_plan_ids_remain_unique() -> None:
+    with pytest.raises(ValidationError):
+        SubtaskPlanDraft(
+            subtasks=[
                 {
-                    "name": "list_dir",
-                    "arguments": {
-                        "root": "jngen",
-                        "path": "doc",
-                        "pattern": "*.md",
-                    },
-                    "confirmation": "revise",
-                }
+                    "id": 1,
+                    "constraints": "small",
+                    "test_count": 1,
+                    "expected_complexity": "O(n)",
+                },
+                {
+                    "id": 1,
+                    "constraints": "large",
+                    "test_count": 1,
+                    "expected_complexity": "O(n)",
+                },
             ]
-            if calls == 1
-            else []
         )
-        return httpx.Response(
-            200,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "content": json.dumps(
-                                {
-                                    "confirmation": "revise",
-                                    "result": {
-                                        "generator_code": "int main(){}",
-                                        "validator_code": "int main(){}",
-                                    },
-                                    "tool_requests": tool_requests,
-                                    "issues": [],
-                                },
-                                ensure_ascii=False,
-                            )
-                        }
-                    }
-                ]
-            },
-        )
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-        model = OpenAICompatibleAgentModel(
-            Settings(model_api_key="test-key"),
-            client,
-        )
-        output = await model.run(TaskType.CODE_DRAFT, "generate", {}, {}, {}, [])
-
-    assert calls == 2
-    assert output.confirmation.value == "revise"
-    assert not hasattr(output, "tool_requests")
-
-
-@pytest.mark.asyncio
-async def test_remote_model_selects_jngen_documents_with_structured_json() -> None:
-    requests: list[dict] = []
-
-    def respond(request: httpx.Request) -> httpx.Response:
-        requests.append(json.loads(request.content))
-        return httpx.Response(
-            200,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "content": json.dumps(
-                                {
-                                    "selected_documents": [
-                                        {
-                                            "filename": "graph.md",
-                                            "reason": "题目需要生成有向图。",
-                                        }
-                                    ],
-                                    "selection_complete": False,
-                                },
-                                ensure_ascii=False,
-                            )
-                        }
-                    }
-                ]
-            },
-        )
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-        model = OpenAICompatibleAgentModel(
-            Settings(model_api_key="test-key"),
-            client,
-        )
-        selection = await model.select_jngen_documents(
-            {
-                "input": {"input_structure": {"template": "输入 n 个点 m 条边"}},
-                "subtasks": [{"id": 1, "constraints": "n <= 10"}],
-            },
-            ["array.md", "graph.md"],
-        )
-
-    assert selection.selected_documents[0].filename == "graph.md"
-    sent = json.loads(requests[0]["messages"][1]["content"])
-    assert sent["format_version"] == 1
-    assert sent["request"] == {
-        "task_type": "jngen_document_selection",
-        "phase": "select_documents_before_generation",
-        "round": 1,
-    }
-    assert sent["inputs"]["all_available_documents"] == [
-        {"filename": "array.md"},
-        {"filename": "graph.md"},
-    ]
-    selection_contract = sent["response_contract"]["properties"]["selected_documents"]
-    assert selection_contract["minItems"] == 1
-    assert selection_contract["items"]["properties"]["filename"]["enum"] == [
-        "array.md",
-        "graph.md",
-    ]
-    assert "selection_complete" in sent["response_contract"]["required"]
-
-
-@pytest.mark.asyncio
-async def test_remote_model_wraps_stage_four_result_array() -> None:
-    subtask = {
-        "id": 1,
-        "constraints": "1 <= n <= 10",
-        "test_count": 2,
-        "expected_complexity": "O(n)",
-        "special_cases": [],
-    }
-
-    def respond(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "content": (
-                                '{"confirmation":"revise","result":'
-                                f'{json.dumps([subtask], ensure_ascii=False)},'
-                                '"tool_requests":[],"issues":[]}'
-                            )
-                        }
-                    }
-                ]
-            },
-        )
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-        model = OpenAICompatibleAgentModel(
-            Settings(model_api_key="test-key"),
-            client,
-        )
-        output = await model.run(TaskType.SUBTASK_PLAN, "generate", {}, {}, {}, [])
-
-    assert output.result == {"subtasks": [subtask]}
-
-
-@pytest.mark.asyncio
-async def test_remote_model_retries_malformed_json_contract() -> None:
-    calls = 0
-
-    def respond(_request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
-        content = (
-            '{"confirmation":"revise","result":{"template":"第一行读取 n"},'
-            '"tool_requests":[],"issues":[]}'
-            if calls == 2
-            else '{"confirmation":"revise","result":{"template":"缺少结束括号"}'
-        )
-        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-        model = OpenAICompatibleAgentModel(
-            Settings(model_api_key="test-key"),
-            client,
-        )
-        output = await model.run(TaskType.INPUT_STRUCTURE, "generate", {}, {}, {}, [])
-
-    assert calls == 2
-    assert output.result["template"] == "第一行读取 n"
-
-
-@pytest.mark.asyncio
-async def test_remote_model_retries_when_task_result_is_missing_required_field() -> None:
-    calls = 0
-
-    def respond(_request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
-        result = (
-            {"generator_code": "int main(){}"}
-            if calls == 1
-            else {
-                "generator_code": "int main(){}",
-                "validator_code": "int main(){}",
-            }
-        )
-        return httpx.Response(
-            200,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "content": json.dumps(
-                                {
-                                    "confirmation": "revise",
-                                    "result": result,
-                                    "tool_requests": [],
-                                    "issues": [],
-                                }
-                            )
-                        }
-                    }
-                ]
-            },
-        )
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-        model = OpenAICompatibleAgentModel(
-            Settings(model_api_key="test-key"),
-            client,
-        )
-        output = await model.run(TaskType.CODE_DRAFT, "generate", {}, {}, {}, [])
-
-    assert calls == 2
-    assert output.result["validator_code"] == "int main(){}"

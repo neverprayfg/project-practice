@@ -1,363 +1,115 @@
-# Stage 5 LangGraph Orchestration: Executable Logic Specification
+# 阶段五 LangGraph 编排规范
 
-## 1. Purpose and Scope
-
-Stage 5 (`CODE_DRAFT`) produces a contest test-data generator, a testlib validator, and a per-test-point constraint coverage table. It is not a free-form code-writing chat. It is a bounded repair workflow in which the language model proposes code, while the backend owns retrieval, compilation, execution, validation, persistence, retry limits, and user approval.
-
-This document specifies the target orchestration after adopting the confirmed Stage 3 structure-tag design. It is intentionally implementation-neutral so that it can be reviewed or redesigned without first reading the Python source.
-
-The workflow assumes that:
-
-- The official solution has compiled successfully.
-- Stage 3 (input structure) and Stage 4 (subtask plan) have both been confirmed by the user.
-- Stage 3 has produced a valid, confirmed structure-tag list from the versioned tag catalog.
-- Stage 4 contains per-test-point runtime parameters for every declared test case.
-
-The final Stage 5 output is only eligible for user confirmation after deterministic validation has succeeded and the model has returned a passing review decision.
-
-## 2. Responsibility Boundary
-
-| Component | Owns | Must not own |
-| --- | --- | --- |
-| Language model | Code proposal, local semantic review, explanation of issues, field-level repair patch | Shell access, files, Docker, network, arbitrary tool calls, acceptance decision |
-| LangGraph runner | State transitions, bounded retry loop, candidate fingerprinting, document-refresh gate, timing | C++ compilation or test execution |
-| Deterministic verifier | Static policy checks, compilation, test generation, validator execution, official-solution execution, failure classification | Open-ended code reasoning or user confirmation |
-| User | Final approval of a completed candidate | Repair-loop control during a single run |
-
-The model is therefore advisory. A model `pass` cannot override a failed deterministic check, and a deterministic pass alone cannot bypass the model review or user confirmation.
-
-## 3. Main State
-
-The LangGraph state contains the following conceptual fields:
-
-| Field | Meaning |
-| --- | --- |
-| `run_id` | Unique run identifier, also used as the checkpoint thread identifier. |
-| `project_id` | Persistent project identifier. |
-| `task_type` | `CODE_DRAFT` for this stage. |
-| `context` | Confirmed input, input structure, confirmed Stage 3 tags, optional Stage 4 refinements, catalog version, resolved jngen documents, and optional recovery feedback. |
-| `candidate` | Current generator, validator, and constraint coverage candidate. |
-| `execution` | Latest deterministic verification result and bounded evidence. |
-| `issues` | Deduplicated unresolved review or verification issues. |
-| `attempts` | Number of repair iterations already consumed. |
-| `max_iterations` | Configured repair limit. |
-| `round_index` | Human-readable round number for timing and audit records. |
-| `candidate_changed` | Whether review produced a change that still needs deterministic verification. |
-| `complete` / `exhausted` | Terminal success and terminal retry-limit flags. |
-| `requires_user` / `user_confirmed` | Whether the graph should pause for human approval and whether that pause was resumed. |
-
-The graph is checkpointed in SQLite. A completed candidate can therefore pause at the confirmation boundary and later resume without rerunning generation or validation.
-
-## 4. High-Level State Machine
-
-```mermaid
-flowchart TD
-    A[Stage 5 request] --> B[Validate confirmed tags and resolve jngen documentation]
-    B --> C[Generate candidate]
-    C --> D[Deterministic verification]
-    D --> E[Model review]
-
-    E -->|complete| F{User confirmation required?}
-    F -->|yes| G[Interrupt and wait for user]
-    F -->|no| H[End: pass]
-    G -->|user confirms| H
-
-    E -->|candidate changed| D
-    E -->|not changed, retry budget remains| C
-    E -->|retry budget exhausted| I[End: revise / failed]
-```
-
-There are only three executable LangGraph nodes in the repair loop:
-
-1. `generate`
-2. `verify`
-3. `review`
-
-`wait_user` is an interrupt node rather than an automatic repair step.
-
-## 5. Tag-Driven jngen Documentation Preparation
-
-Before the graph enters `generate`, Stage 5 resolves a bounded set of jngen documents from the **confirmed Stage 3 tag list**. The model must treat the resolved document bodies as its only source of truth for jngen APIs.
-
-### 5.1 Normal path: deterministic tag resolution
-
-The normal path does not inspect raw Chinese or English wording, and it does not inspect the official solution source. It consumes only:
-
-- confirmed global Stage 3 structure tags;
-- optional, valid Stage 4 subtask refinements;
-- the versioned tag catalog.
-
-For each effective tag set, the resolver:
-
-1. validates that every tag ID exists in the catalog;
-2. expands parent and implied tags deterministically;
-3. rejects conflicts and `unsupported` / `manual_only` tags;
-4. unions the tag-mapped jngen documents and their dependencies;
-5. removes duplicate filenames while preserving catalog order;
-6. checks the combined document body against the configured context-character budget.
-
-The resolved set must be non-empty. The audit record stores the confirmed tags, any Stage 4 refinements, catalog version, resolved filenames, and the deterministic termination reason.
-
-Consequently, the same confirmed tag set must resolve to the same document set regardless of whether the problem statement is written in English or Chinese.
-
-### 5.2 Explicit exception path for tag uncertainty
-
-`needs_tag_review`, unknown tags, conflicting tags, and unsupported tags are visible Stage 3 / Stage 4 issues. They must not silently fall back to keyword matching.
-
-An explicitly configured recovery path may use bounded model document selection only when the audit record states a concrete fallback reason, such as `needs_tag_review` or an approved unsupported-tag recovery. The selector may choose only existing unread documents, has a fixed document and context budget, and records every selection round.
-
-This exception path is not the normal language-routing mechanism. Its output should be used to improve the catalog or the confirmed tags after review.
-
-### 5.3 Repair retrieval is explicitly gated
-
-The workflow does **not** re-run document retrieval after every failed compile or trial. A repair retrieval is allowed only when deterministic verification explicitly sets:
+## 状态机
 
 ```text
-retrieval_required = true
+START
+  -> contract_preflight
+  -> prepare_documents
+  -> generate_candidate 或 verify_candidate
+  -> [存在阻断缺陷] select_defect
+  -> [否则且尚未审查] semantic_audit
+  -> [全部通过] approve -> wait_user/END
+
+select_defect
+  -> repair_defect
+  -> recheck_history
+  -> evaluate_progress
+  -> select_defect / approve / END
 ```
 
-This signal means that the confirmed tags or their resolved documentation are insufficient for the reported failure. Ordinary parameter, testlib, compile, generation, validation, and official-solution failures go directly to targeted model review.
+`semantic_audit` 是唯一开放式语义审查。修复后只运行已知缺陷的 `targeted_recheck`，不得再次开放找问题。
 
-When repair retrieval is allowed, the verifier feedback is bounded and attached to `context.recovery_feedback`; the model can then select additional unread documents. The fallback reason and newly selected documents are audited.
+## 上游契约预检
 
-## 6. Generate Node
+任何模型调用前必须验证：
 
-The `generate` node sends the current context, candidate, previous issues, and prior execution feedback to the model with phase `generate`. The context includes the confirmed effective tag set, catalog version, and tag-resolved jngen documents; it does not ask the model to infer structure from raw wording.
+- 阶段三已有确认标签；
+- 标签存在、无冲突，且子任务标签所需参数齐全；
+- 每个子任务有连续覆盖全部测试点的运行时参数；
+- 参数名唯一且不使用保留名；
+- 特殊测试点数量不超过总数；
+- 子任务 ID、测试点 ID 和生成的约束 ID 唯一。
 
-Expected output for Stage 5 is a complete candidate containing:
+失败抛出 `UPSTREAM_CONTRACT_INVALID`，流水线把当前阶段设回 4，阶段五不进入生成或修复。
 
-- `generator_code`
-- `validator_code`
-- `constraint_coverage`
+## Proof Obligation 与实现映射
 
-Each coverage record must additionally carry the effective tag IDs for its `(subtask_id, case_id)`, so the declared construction and validation strategy can be audited against the structural assumptions used to resolve jngen documentation.
+预检把确认契约转换为通用 `ProofObligation`：
 
-The model is expected to use jngen for generation, testlib for validation, and runtime command-line parameters for each test point.
+- 全局输入结构标签；
+- 每个子任务的自由文本约束；
+- 每项特殊测试点要求；
+- 每个测试点的每个运行时参数。
 
-The node replaces the candidate only when the model returns a non-empty result. It clears prior execution data and resets completion flags. It does not decide whether the candidate is valid.
+候选必须原样携带这些义务，并为每个约束提交 `implementation_mapping`：源码文件、符号与行号、实际参数、文档文件/digest/API 符号、测试构造策略。后端逐约束产生标准错误码，检查缺失映射、伪造位置、未读取文档、digest 不一致、未记录 API、参数未映射和参数只读未使用。
 
-## 7. Deterministic Verification Node
+核心状态机不包含图、树等领域硬编码。结构标签只用于文档路由和契约生成；领域检查器若未来加入，只能作为验证器插件返回标准缺陷。
 
-The `verify` node is the primary correctness gate. It receives the candidate and adds a transient timing context, but does not expose timing implementation details to the model.
+## 稳定缺陷身份
 
-It returns:
+缺陷 ID 只由以下规范字段的哈希决定：
 
 ```text
-(normalized_candidate, execution_result)
+category + target_file + constraint_id + subtask + test_point + error_code
 ```
 
-The runner then stores a fingerprint of the exact verified candidate inside `execution_result`.
+日志、行号、样例正文和自然语言 message 只作为证据或展示，不参与路由。实现映射错误按真实约束 ID 与标准错误码分别建缺陷，不能聚合成模糊的全局错误。
 
-### 7.1 Static checks
+## 反例账本
 
-Verification stops immediately on the first failing layer.
+每个缺陷对应稳定反例记录，持久保存：
 
-1. Validate the candidate against the Stage 5 schema.
-2. Require a non-empty tag-resolved jngen documentation context, together with a valid confirmed tag list and catalog version.
-3. Check generator policy:
-   - includes jngen;
-   - initializes and parses generator arguments correctly;
-   - uses a selected jngen generation API;
-   - reads `seed`, `subtask`, `case`, and every Stage 4 runtime parameter through `getOpt`.
-4. Check validator policy:
-   - includes testlib;
-   - registers validation correctly;
-   - reads through testlib input APIs;
-   - performs exactly one end-of-file check;
-   - does not bypass testlib with `cin` or `scanf`.
-5. Load the confirmed Stage 4 plan and require per-test-point runtime parameters.
-6. Resolve the effective tag set for each test point: global Stage 3 tags plus any valid Stage 4 refinement.
-7. Check that every test-point profile contains the runtime parameters required by its effective supported tags.
-8. Compare the candidate coverage table with the plan. Every `(subtask_id, case_id)` must appear exactly once, list exactly that test point's parameter names, and reference its effective structural tags.
+- `open / closed / regressed` 状态；
+- 首次和最近出现的候选修订；
+- 子任务、测试点、种子与实际运行参数；
+- 接受、回滚、仍存在和回归历史；
+- 最后完整通过的候选修订。
 
-### 7.2 Compilation
+确定性复验重新执行所有静态/编译门和所有带种子的历史反例；历史语义缺陷逐个定向复验。被拒补丁产生的新反例保留为已关闭回归证据，账本当前状态恢复到接受候选。
 
-If static checks pass, the candidate is persisted and the following programs are compiled concurrently:
+## 有限修复与进展证明
 
-- official solution;
-- generator;
-- validator.
+阻断缺陷按验证等级和稳定 ID 排序。每次只选择一个缺陷；如果当前运行已尝试，或持久修复历史已存在，立即停止。
 
-Compiler diagnostics are parsed and preserved as structured evidence. Any failed compilation ends this verification pass.
-
-### 7.3 Trial construction
-
-For every Stage 4 subtask, every runtime-parameter profile, and every configured trial seed offset, the verifier creates one generation job.
-
-The seed is deterministic:
+补丁被接受当且仅当：
 
 ```text
-seed = subtask_id * 1,000,003 + case_id * 101 + seed_offset
+(open_blockers 减少 OR target_defect 关闭 OR validation_rank 前进)
+AND 没有重新出现任何修复前已关闭缺陷
+AND target_defect 已关闭
 ```
 
-Each job invokes the generator with:
+否则保存补丁范围与变更行区间，恢复上一接受候选，恢复账本当前状态并停止。代码内容不同本身永远不是进展。
 
-- `subtask`;
-- `case`;
-- `seed`;
-- serialized runtime parameters from that exact test-point profile.
+## 文档上下文
 
-Tag-specific low-cost invariants may be checked before execution. For example, a test point declared as a tree can require `m = n - 1`; a declared permutation can require the corresponding range and uniqueness conditions. These checks complement, rather than replace, generator and validator execution.
+首次生成读取由全局和子任务标签确定性路由的完整相关文档。文档索引记录文件名、标题、符号与 SHA-256 digest。
 
-### 7.4 Two-level execution validation
+repair 不再携带完整文档，只携带与目标缺陷、约束和候选实现证据匹配的最多 6 个片段。片段选择按 `candidate_revision + defect_id + document_digest_set` 持久缓存。语义审查和定向复验只接收文档元数据，不接收正文。
 
-Jobs run in two phases:
+## 缓存
 
-| Level | Job set | Purpose |
-| --- | --- | --- |
-| `smoke` | First generated job for every subtask | Fast rejection of broken code or invalid construction logic. |
-| `complete` | All remaining jobs | Full configured Stage 5 trial coverage. |
+- 候选修订 + 历史反例集合：完整确定性验证结果、已通过门和回放清单；
+- 源码角色 digest：Sandbox 跳过未变化 solution/generator/validator 的编译；
+- 标签集合与文档 digest：初始文档选择；
+- 候选修订 + 缺陷 ID：repair 文档片段。
 
-For each level:
+缓存命中不能绕过候选 Schema、修订关联或历史反例集合校验。
 
-1. Generate inputs in bounded batches.
-2. Record generation result, seed, case, runtime arguments, and a bounded preview of generated content.
-3. Stop on the first failed generation.
-4. Validate each generated input with the validator and run the official solution, also in batches.
-5. Stop on the first validator failure, missing solution result, or solution failure.
+## 决策链
 
-Only after both levels pass does the verifier persist the full trial-results list and return `execution.ok = true`.
+`agent4-decisions.jsonl` 每个事件至少记录：
 
-### 7.5 Failure result shape
+- run ID、candidate revision、目标缺陷 ID；
+- 模型调用类型与模型修复理由；
+- 修改文件、前后 digest、行数和变更行区间；
+- 验证前后缺陷集合、阻断数量和验证等级；
+- 是否取得进展；
+- observed、accepted、rolled_back 或 stopped 及原因。
 
-Failure results are structured and bounded. They include at least:
+API `GET /api/projects/{project_id}/stage5/decisions` 返回事件与反例账本；耗时由独立 timings API 返回。
 
-- `ok: false`
-- a human-readable message;
-- a failure category;
-- a validation level;
-- recent check evidence.
+## 用户确认
 
-Typical categories are:
-
-```text
-library_api | constraint_coverage | compile | generation |
-validation | solution | timeout | unknown
-```
-
-## 8. Review Node
-
-The review node combines deterministic evidence with a model decision. It is not allowed to accept a changed but unverified candidate.
-
-### 8.1 Input minimization
-
-For Stage 5 review, server-owned and potentially large fields are removed from the candidate sent to the model:
-
-- `trial_results`
-- `revision_id`
-- `input_revision`
-- `subtasks_revision`
-
-The model instead receives a bounded execution summary with relevant diagnostics, sample evidence, and the effective confirmed tags for the failed test point when available.
-
-### 8.2 Compact review protocol
-
-The response protocol differs by outcome:
-
-| Review outcome | Required model result |
-| --- | --- |
-| Candidate is correct | `confirmation = pass`, `result = null`, empty issues. |
-| Candidate needs repair | `confirmation = revise`, non-empty field patch containing only changed `generator_code`, `validator_code`, and/or `constraint_coverage`. |
-
-The backend merges a repair patch into the reduced current candidate before schema validation. If a legacy model returns a full candidate together with `pass`, the backend discards that result and treats the response as `result = null`; a passing review is a decision, not a source of a new candidate.
-
-### 8.3 Completion rule
-
-Let `V` be the fingerprint of the candidate that the verifier checked, and let `C` be the candidate currently in state.
-
-```text
-execution_ok = execution.ok AND (V == fingerprint(C))
-
-complete = execution_ok
-           AND review.confirmation == pass
-           AND issues is empty
-           AND candidate_changed is false
-```
-
-This fingerprint condition prevents the model from modifying a candidate after verification and then claiming success without another verification pass.
-
-### 8.4 Repair and retry accounting
-
-If the workflow is not complete:
-
-- If the repair budget remains, increment `attempts`.
-- If review changed the candidate, store the merged candidate and route directly to `verify`.
-- If review did not change the candidate, route back to `generate`.
-- If the budget is exhausted, discard any last unverified modification, mark the run exhausted, and end with unresolved issues.
-
-`round_index` advances after each non-terminal review. It is used for observability; it is not the acceptance authority.
-
-## 9. Routing Table
-
-| State after review | Next node | Reason |
-| --- | --- | --- |
-| `complete = true`, user confirmation required | `wait_user` | Candidate passed both deterministic and model checks; human approval remains. |
-| `complete = true`, no confirmation required | `END` | Automatic task completion. |
-| `exhausted = true` | `END` | Bounded retry policy reached. |
-| `candidate_changed = true` | `verify` | Any changed candidate must be deterministically rechecked. |
-| Otherwise | `generate` | The model must propose a materially different candidate. |
-
-## 10. User Confirmation Boundary
-
-For interactive Stage 5 runs, successful completion triggers a LangGraph interrupt. The API stores the `thread_id` against the project and exposes the candidate as AI-confirmed but not user-confirmed.
-
-When the user confirms:
-
-1. The API resumes the same LangGraph thread with `Command(resume=True)`.
-2. The interrupt node records `user_confirmed = true`.
-3. The project service marks the stage as passed and clears the stored stage thread.
-
-No additional generation, verification, or review is performed during confirmation.
-
-## 11. Observability and Audit Trail
-
-Stage 5 records timing events by `run_id` and, where applicable, `round_index`:
-
-```text
-retrieval
-model_generation
-compile
-trial_generation
-validation
-review
-workflow_total
-```
-
-The aggregate report deliberately keeps `workflow_total` separate from the six measured segments, so total elapsed time is not double-counted in segment shares.
-
-Additional audit records include:
-
-- confirmed global tags, Stage 4 refinements, and tag-catalog version;
-- deterministic tag-to-document resolution and any explicit fallback reason;
-- initial and repair document-selection decisions when an exception path is used;
-- selected filenames and retrieval termination reason;
-- structured compiler diagnostics;
-- trial seeds, runtime parameters, and bounded generated-input previews;
-- failure category and validation level.
-
-## 12. Core Invariants for Review
-
-A redesign should preserve these properties unless it intentionally replaces them with an equivalent stronger guarantee:
-
-1. **Model output is never the only correctness gate.** Passing requires deterministic verification.
-2. **Any code change invalidates prior verification.** Candidate fingerprints enforce this.
-3. **Runtime parameters are per test point, not merely per subtask.** They must be forwarded to the generator and represented in coverage.
-4. **The normal jngen context is tag-driven, bounded, and auditable.** The model cannot silently infer a different structure, invent a document, or use a non-evidenced API source.
-5. **Retry is bounded.** The workflow cannot loop indefinitely on the same failure.
-6. **Repair retrieval is evidence-gated.** It is not a default response to every failure, and tag uncertainty is never hidden behind keyword matching.
-7. **Passing review is compact and non-mutating.** It must not recreate a large candidate or introduce an unverified edit.
-8. **User confirmation is a separate durable state transition.** It cannot be inferred from a model response.
-
-## 13. Questions for an External Reviewer
-
-The following are deliberate review targets for Claude or another evaluator:
-
-1. Is a field-level repair patch sufficient, or should source-code diffs be used for even tighter change control?
-2. Is the retry budget semantically clear, especially the distinction between generation retries and review/verification cycles?
-3. Should some static failures be auto-repaired by backend-generated skeletons instead of being sent back to the model?
-4. Is the tag catalog sufficiently focused on data generation, or does it include solution-algorithm concepts that should be excluded?
-5. Are global Stage 3 tags plus optional Stage 4 refinements enough to represent mixed and subtask-specific structures?
-6. Is `retrieval_required` too conservative or too permissive as the only repair-retrieval gate?
-7. Should semantic test adequacy be checked more explicitly beyond compile, generation, validator acceptance, and official-solution execution?
-8. Which evidence should remain visible to the model, and which should be summarized further to reduce latency without hiding root causes?
-9. Are the current stop-on-first-failure rules optimal for repair quality, or should the verifier collect several independent failures in one pass?
+只有确定性验证、一次只读语义审查和所有阻断历史反例均通过后，`approve` 才设置完成。需要用户确认时进入仅包含 `interrupt()` 的 `wait_user` 节点；恢复不会重复生成、验证或写日志副作用。

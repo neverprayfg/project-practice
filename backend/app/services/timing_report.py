@@ -9,7 +9,10 @@ MEASURED_SEGMENTS = (
     "compile",
     "trial_generation",
     "validation",
-    "review",
+    "semantic_audit",
+    "targeted_repair",
+    "targeted_recheck",
+    "verification_cache",
 )
 
 
@@ -47,12 +50,8 @@ def summarize_agent4_timings(events: list[dict[str, Any]]) -> list[dict[str, Any
             segment: {
                 "duration_ms": round(segment_totals[segment], 3),
                 "calls": segment_calls[segment],
-                "share_of_measured_percent": _percent(
-                    segment_totals[segment], measured_ms
-                ),
-                "share_of_workflow_percent": _percent(
-                    segment_totals[segment], workflow_total_ms
-                ),
+                "share_of_measured_percent": _percent(segment_totals[segment], measured_ms),
+                "share_of_workflow_percent": _percent(segment_totals[segment], workflow_total_ms),
             }
             for segment in MEASURED_SEGMENTS
         }
@@ -65,8 +64,7 @@ def summarize_agent4_timings(events: list[dict[str, Any]]) -> list[dict[str, Any
                     "round": round_index,
                     "measured_ms": round(round_measured_ms, 3),
                     "segments": {
-                        segment: round(values[segment], 3)
-                        for segment in MEASURED_SEGMENTS
+                        segment: round(values[segment], 3) for segment in MEASURED_SEGMENTS
                     },
                 }
             )

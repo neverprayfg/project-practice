@@ -7,8 +7,8 @@ from fastapi.responses import FileResponse
 
 from app.errors import AppError
 from app.models import (
-    BuildRequest,
     DraftUpdate,
+    GenerateRequest,
     ModelConfigurationUpdate,
     PreviewRequest,
     ProjectCreate,
@@ -26,6 +26,7 @@ router = APIRouter()
 async def health(request: Request) -> dict:
     settings = request.app.state.settings
     model_config = request.app.state.model_configuration.public_view()
+    pipeline = request.app.state.pipeline
     return {
         "status": "ok",
         "environment": settings.app_env,
@@ -33,6 +34,7 @@ async def health(request: Request) -> dict:
         "model_name": model_config["model_name"],
         "model_api_configured": model_config["api_key_configured"],
         "sandbox": type(request.app.state.sandbox).__name__,
+        "active_tasks": pipeline.has_active_tasks(),
     }
 
 
@@ -47,9 +49,7 @@ async def get_structure_tags(request: Request) -> dict:
 
 
 @router.put("/api/settings/model")
-async def update_model_configuration(
-    payload: ModelConfigurationUpdate, request: Request
-) -> dict:
+async def update_model_configuration(payload: ModelConfigurationUpdate, request: Request) -> dict:
     pipeline = request.app.state.pipeline
     if pipeline.has_active_tasks():
         raise AppError(
@@ -62,14 +62,12 @@ async def update_model_configuration(
         service.update(payload)
         model = service.build_model()
         request.app.state.model = model
-        request.app.state.agent_runner.model = model
+        await request.app.state.agent_graphs.replace_model(model)
         return service.public_view()
 
 
 @router.post("/api/settings/model/test")
-async def test_model_configuration(
-    payload: ModelConfigurationUpdate, request: Request
-) -> dict:
+async def test_model_configuration(payload: ModelConfigurationUpdate, request: Request) -> dict:
     service = request.app.state.model_configuration
     async with service.lock:
         return await service.test_connection(payload)
@@ -97,9 +95,7 @@ async def get_project(project_id: str, request: Request) -> dict:
 
 
 @router.get("/api/projects/{project_id}/stage5/timings")
-async def get_stage5_timings(
-    project_id: str, request: Request, run_id: str | None = None
-) -> dict:
+async def get_stage5_timings(project_id: str, request: Request, run_id: str | None = None) -> dict:
     request.app.state.projects.get(project_id)
     events = request.app.state.storage.load_agent4_timings(project_id)
     if run_id is not None:
@@ -107,6 +103,22 @@ async def get_stage5_timings(
     return {
         "events": events,
         "runs": summarize_agent4_timings(events),
+    }
+
+
+@router.get("/api/projects/{project_id}/stage5/decisions")
+async def get_stage5_decisions(
+    project_id: str, request: Request, run_id: str | None = None
+) -> dict:
+    request.app.state.projects.get(project_id)
+    storage = request.app.state.storage
+    events = storage.load_agent4_decisions(project_id)
+    if run_id is not None:
+        events = [event for event in events if event.get("run_id") == run_id]
+    return {
+        "events": events,
+        "counterexample_ledger": storage.load_agent4_ledger(project_id),
+        "last_valid_candidate": storage.load_agent4_last_valid_candidate(project_id),
     }
 
 
@@ -190,29 +202,8 @@ async def preview(project_id: str, payload: PreviewRequest, request: Request) ->
     )
 
 
-@router.post("/api/projects/{project_id}/build")
-async def build_dataset(project_id: str, payload: BuildRequest, request: Request) -> dict:
-    pipeline = request.app.state.pipeline
-    lock = pipeline.project_lock(project_id)
-    if lock.locked():
-        raise AppError(
-            "PROJECT_BUSY", "project already has a running task", stage=6, status_code=409
-        )
-    async with lock:
-        generated = await request.app.state.datasets.generate_inputs(
-            project_id,
-            payload.base_seed,
-            payload.selected_subtask_ids,
-        )
-        validated = await request.app.state.datasets.validate_and_solve(
-            project_id,
-            payload.selected_subtask_ids,
-        )
-        return {**generated, **validated}
-
-
 @router.post("/api/projects/{project_id}/generate")
-async def generate_dataset(project_id: str, payload: BuildRequest, request: Request) -> dict:
+async def generate_dataset(project_id: str, payload: GenerateRequest, request: Request) -> dict:
     pipeline = request.app.state.pipeline
     lock = pipeline.project_lock(project_id)
     if lock.locked():
@@ -240,7 +231,12 @@ async def validate_dataset(project_id: str, payload: ValidateRequest, request: R
 
 @router.get("/api/projects/{project_id}/export", response_class=FileResponse)
 async def export_dataset(project_id: str, request: Request) -> FileResponse:
-    archive = await asyncio.to_thread(request.app.state.datasets.export, project_id)
+    pipeline = request.app.state.pipeline
+    lock = pipeline.project_lock(project_id)
+    if lock.locked():
+        raise AppError("PROJECT_BUSY", "项目已有任务正在运行。", stage=7, status_code=409)
+    async with lock:
+        archive = await asyncio.to_thread(request.app.state.datasets.export, project_id)
     return FileResponse(
         archive,
         media_type="application/zip",

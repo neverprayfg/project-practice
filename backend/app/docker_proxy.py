@@ -3,7 +3,9 @@ from __future__ import annotations
 import http.client
 import os
 import re
+import signal
 import socket
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -98,7 +100,26 @@ class DockerProxyHandler(BaseHTTPRequestHandler):
 def main() -> None:
     host = os.environ.get("DOCKER_PROXY_HOST", "0.0.0.0")
     port = int(os.environ.get("DOCKER_PROXY_PORT", "2375"))
-    ThreadingHTTPServer((host, port), DockerProxyHandler).serve_forever()
+    server = ThreadingHTTPServer((host, port), DockerProxyHandler)
+    stop_requested = threading.Event()
+    server_thread = threading.Thread(
+        target=server.serve_forever,
+        name="docker-proxy-http",
+    )
+
+    def request_stop(_signum: int, _frame: object) -> None:
+        stop_requested.set()
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    server_thread.start()
+    try:
+        while server_thread.is_alive() and not stop_requested.wait(0.5):
+            pass
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join()
 
 
 if __name__ == "__main__":

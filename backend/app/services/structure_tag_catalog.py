@@ -52,9 +52,7 @@ class StructureTagCatalog:
             issues.append(f"存在未知结构标签：{', '.join(unknown)}。")
             return issues
         non_supported = [
-            tag_id
-            for tag_id in tag_ids
-            if self.entries[tag_id]["status"] != "supported"
+            tag_id for tag_id in tag_ids if self.entries[tag_id]["status"] != "supported"
         ]
         if non_supported:
             issues.append(
@@ -82,9 +80,7 @@ class StructureTagCatalog:
     def validate_structure_tags(self, structure_tags: list[Any]) -> list[str]:
         normalized = [
             {
-                "tag_id": str(
-                    item.get("tag_id") if isinstance(item, dict) else item.tag_id
-                ),
+                "tag_id": str(item.get("tag_id") if isinstance(item, dict) else item.tag_id),
                 "applies_to": str(
                     item.get("applies_to") if isinstance(item, dict) else item.applies_to
                 ).strip(),
@@ -104,9 +100,7 @@ class StructureTagCatalog:
             return list(dict.fromkeys(issues))
         for scope in {item["applies_to"].casefold() for item in normalized}:
             scoped = [
-                item["tag_id"]
-                for item in normalized
-                if item["applies_to"].casefold() == scope
+                item["tag_id"] for item in normalized if item["applies_to"].casefold() == scope
             ]
             expanded = self.expand(scoped)
             conflicts = sorted(
@@ -153,11 +147,15 @@ class StructureTagCatalog:
         *,
         validate_conflicts: bool = True,
     ) -> dict[str, Any]:
-        issues = self.validate_tag_ids(tag_ids) if validate_conflicts else [
-            issue
-            for issue in self.validate_tag_ids(tag_ids)
-            if not issue.startswith("结构标签冲突")
-        ]
+        issues = (
+            self.validate_tag_ids(tag_ids)
+            if validate_conflicts
+            else [
+                issue
+                for issue in self.validate_tag_ids(tag_ids)
+                if not issue.startswith("结构标签冲突")
+            ]
+        )
         if issues:
             raise AppError(
                 "STRUCTURE_TAG_REVIEW_REQUIRED",
@@ -180,8 +178,7 @@ class StructureTagCatalog:
             )
         )
         selected_characters = sum(
-            len((self.root / filename).read_text(encoding="utf-8"))
-            for filename in filenames
+            len((self.root / filename).read_text(encoding="utf-8")) for filename in filenames
         )
         if selected_characters > maximum_context_characters:
             raise AppError(
@@ -195,7 +192,7 @@ class StructureTagCatalog:
                 },
             )
         return {
-            "route_method": "confirmed_structure_tags",
+            "route_method": "confirmed_effective_structure_tags",
             "catalog_version": self.version,
             "selected_tag_ids": list(tag_ids),
             "expanded_tag_ids": sorted(expanded),
@@ -221,9 +218,7 @@ class StructureTagCatalog:
         if len(ids) != len(tags) or len(ids) != len(set(ids)):
             raise AppError("TAG_CATALOG_INVALID", "结构标签 ID 必须唯一。", stage=3)
         entries = {str(item["id"]): item for item in tags}
-        available_documents = {
-            path.name for path in self.root.glob("*.md") if path.is_file()
-        }
+        available_documents = {path.name for path in self.root.glob("*.md") if path.is_file()}
         required_keys = {
             "id",
             "display_name",
@@ -246,9 +241,7 @@ class StructureTagCatalog:
                 *item["conflicts_with"],
             ]
             if any(reference not in entries for reference in references):
-                raise AppError(
-                    "TAG_CATALOG_INVALID", f"标签 {tag_id} 引用未知标签。", stage=3
-                )
+                raise AppError("TAG_CATALOG_INVALID", f"标签 {tag_id} 引用未知标签。", stage=3)
             if item["status"] not in {"supported", "manual_only", "unsupported"}:
                 raise AppError("TAG_CATALOG_INVALID", f"标签 {tag_id} 状态无效。", stage=3)
             if item["status"] == "supported" and not item["jngen_documents"]:
