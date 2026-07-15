@@ -8,6 +8,13 @@ from fastapi.testclient import TestClient
 
 INPUT_DRAFT = {
     "template": "第一行读取整数 n，表示后续整数序列的长度。",
+    "structure_tags": [
+        {
+            "tag_id": "primitive.integer",
+            "applies_to": "整数 n 及序列元素",
+            "evidence": "输入模板明确它们都是整数。",
+        }
+    ],
     "issues": [],
 }
 
@@ -70,6 +77,16 @@ def save_run_confirm(client: TestClient, project_id: str, stage: int, draft: dic
     assert confirmed.status_code == 200, confirmed.text
 
 
+def test_structure_tag_catalog_is_exposed(app_bundle) -> None:
+    client, _sandbox = app_bundle
+
+    response = client.get("/api/structure-tags")
+
+    assert response.status_code == 200
+    assert response.json()["version"] == 1
+    assert any(item["id"] == "tree" for item in response.json()["tags"])
+
+
 def test_complete_mvp_flow_exports_only_required_files(
     app_bundle: tuple[TestClient, FakeSandbox],
 ) -> None:
@@ -89,6 +106,24 @@ def test_complete_mvp_flow_exports_only_required_files(
     save_run_confirm(client, project_id, 3, INPUT_DRAFT)
     save_run_confirm(client, project_id, 4, PLAN_DRAFT)
     save_run_confirm(client, project_id, 5, CODE_DRAFT)
+
+    timings = client.get(f"/api/projects/{project_id}/stage5/timings")
+    assert timings.status_code == 200, timings.text
+    timing_payload = timings.json()
+    assert {
+        "retrieval",
+        "model_generation",
+        "compile",
+        "trial_generation",
+        "validation",
+        "review",
+        "workflow_total",
+    }.issubset({event["segment"] for event in timing_payload["events"]})
+    assert len(timing_payload["runs"]) == 1
+    timing_run = timing_payload["runs"][0]
+    assert timing_run["workflow_total_ms"] >= timing_run["measured_segments_ms"]
+    assert timing_run["rounds"][0]["round"] == 1
+    assert timing_run["segments"]["compile"]["calls"] == 1
 
     preview = client.post(
         f"/api/projects/{project_id}/preview",
@@ -258,6 +293,7 @@ def test_generate_selected_subtask_then_validate_as_separate_stages(
     assert manifest["base_seed"] == 17
     assert manifest["selected_subtasks"] == [2]
     assert len(manifest["files"]) == 3
+    assert all(item["runtime_arguments"] for item in manifest["files"])
     assert all(item["validation"]["ok"] for item in manifest["files"])
 
 
@@ -455,6 +491,7 @@ def test_validator_failure_returns_project_to_stage_five(
     response = client.post(f"/api/projects/{project_id}/build", json={"base_seed": 1})
     assert response.status_code == 400
     assert response.json()["stage"] == 5
+    assert response.json()["details"]["failure_category"] == "validation"
     assert response.json()["details"]["feedback"]["operation"] == "validate"
     project = client.get(f"/api/projects/{project_id}").json()["project"]
     assert project["current_stage"] == 5

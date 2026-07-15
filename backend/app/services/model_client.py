@@ -15,13 +15,11 @@ from app.models import (
     Confirmation,
     GlobalInput,
     InputStructureDraft,
-    JngenDocumentChoice,
     JngenDocumentSelection,
     SubtaskPlanDraft,
     TaskType,
     WorkflowOutput,
 )
-from app.services.jngen_policy import jngen_usage_issues
 
 _TESTLIB_CONTEXT_ROOT = Path(__file__).resolve().parent.parent / "testlib_doc_context"
 TESTLIB_SYSTEM_GUIDANCE = "\n\n".join(
@@ -101,8 +99,23 @@ TASK_RESULT_CONTRACTS: dict[TaskType, dict[str, Any]] = {
     TaskType.INPUT_STRUCTURE: {
         "type": "object",
         "additionalProperties": False,
-        "required": ["template"],
-        "properties": {"template": _NON_EMPTY_STRING},
+        "required": ["template", "structure_tags"],
+        "properties": {
+            "template": _NON_EMPTY_STRING,
+            "structure_tags": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["tag_id", "applies_to", "evidence"],
+                    "properties": {
+                        "tag_id": _NON_EMPTY_STRING,
+                        "applies_to": _NON_EMPTY_STRING,
+                        "evidence": _NON_EMPTY_STRING,
+                    },
+                },
+            },
+        },
     },
     TaskType.SUBTASK_PLAN: {
         "type": "object",
@@ -121,6 +134,8 @@ TASK_RESULT_CONTRACTS: dict[TaskType, dict[str, Any]] = {
                         "test_count",
                         "expected_complexity",
                         "special_cases",
+                        "runtime_parameters",
+                        "subtask_tags",
                     ],
                     "properties": {
                         "id": {"type": "integer", "minimum": 1},
@@ -139,6 +154,52 @@ TASK_RESULT_CONTRACTS: dict[TaskType, dict[str, Any]] = {
                                 },
                             },
                         },
+                        "runtime_parameters": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["case_id", "parameters"],
+                                "properties": {
+                                    "case_id": {"type": "integer", "minimum": 1},
+                                    "parameters": {
+                                        "type": "array",
+                                        "minItems": 1,
+                                        "maxItems": 24,
+                                        "items": {
+                                            "type": "object",
+                                            "additionalProperties": False,
+                                            "required": ["name", "value", "category"],
+                                            "properties": {
+                                                "name": {
+                                                    "type": "string",
+                                                    "pattern": "^[a-z][a-z0-9_]{0,31}$",
+                                                },
+                                                "value": {
+                                                    "anyOf": [
+                                                        {"type": "boolean"},
+                                                        {"type": "integer"},
+                                                        {"type": "number"},
+                                                        {
+                                                            "type": "string",
+                                                            "pattern": "^[A-Za-z0-9_.:-]{1,64}$",
+                                                        },
+                                                    ]
+                                                },
+                                                "category": {
+                                                    "enum": ["size", "limit", "structure"]
+                                                },
+                                            },
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                        "subtask_tags": {
+                            "type": "array",
+                            "uniqueItems": True,
+                            "items": _NON_EMPTY_STRING,
+                        },
                     },
                 },
             }
@@ -147,10 +208,44 @@ TASK_RESULT_CONTRACTS: dict[TaskType, dict[str, Any]] = {
     TaskType.CODE_DRAFT: {
         "type": "object",
         "additionalProperties": False,
-        "required": ["generator_code", "validator_code"],
+        "required": ["generator_code", "validator_code", "constraint_coverage"],
         "properties": {
             "generator_code": _NON_EMPTY_STRING,
             "validator_code": _NON_EMPTY_STRING,
+            "constraint_coverage": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "subtask_id",
+                        "case_id",
+                        "parameter_names",
+                        "structure_tags",
+                        "generator_strategy",
+                        "validator_strategy",
+                        "boundary_or_special",
+                    ],
+                    "properties": {
+                        "subtask_id": {"type": "integer", "minimum": 1},
+                        "case_id": {"type": "integer", "minimum": 1},
+                        "parameter_names": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": _NON_EMPTY_STRING,
+                        },
+                        "structure_tags": {
+                            "type": "array",
+                            "minItems": 1,
+                            "uniqueItems": True,
+                            "items": _NON_EMPTY_STRING,
+                        },
+                        "generator_strategy": _NON_EMPTY_STRING,
+                        "validator_strategy": _NON_EMPTY_STRING,
+                        "boundary_or_special": _NON_EMPTY_STRING,
+                    },
+                },
+            },
             "revision_id": {"type": ["string", "null"]},
             "input_revision": {
                 "type": ["integer", "null"],
@@ -176,11 +271,22 @@ TASK_GUIDANCE = {
     TaskType.INPUT_STRUCTURE: (
         "你是 Agent2。综合 INPUT 中的题面和标程读取逻辑，输出 result.template，一段按实际"
         "读取顺序编写的中文输入结构描述。使用一致变量名，覆盖类型、重复、分组、数量和依赖。"
+        "同时从 context.structure_tag_catalog.tags 中选择最具体标签，正常路径只用"
+        "supported 标签；不得创造标签。applies_to 要指向具体输入部分，"
+        "evidence 要引用已推断的输入结构。混合结构必须输出多个标签。"
+        "存在歧义时输出空标签数组并在 issues 中输出 needs_tag_review，不得猜测。"
+        "只有 manual_only/unsupported 标签时保留真实目录 ID 并输出 needs_tag_review，"
+        "不得改用不相关的 supported 标签。"
     ),
     TaskType.SUBTASK_PLAN: (
         "你是 Agent3。首次规划时自动生成 5 个适合当前题目的子任务；用户已有列表时审核并"
         "修订该列表。每项包含 id、自由文本 constraints、正整数 test_count、"
-        "expected_complexity 和 special_cases。接受自然语言、不等式、区间、键值与分行约束。"
+        "expected_complexity、special_cases 和 runtime_parameters。接受自然语言、不等式、区间、"
+        "键值与分行约束。runtime_parameters 必须为每个 case_id=1..test_count 提供受控命令行"
+        "标量参数；范围拆成如 n_min/n_max，规模写成 n、m 等，结构类别使用无空格英文标识。"
+        "参数名只能用小写字母、数字和下划线，且不能使用 seed/subtask/case。"
+        "subtask_tags 只能从 context.structure_tag_catalog 中选取，仅表示该子任务"
+        "相对阶段三全局标签新增的结构属性，不得删除全局标签。"
         "result 必须是对象 {\"subtasks\": [...]}，不得直接把子任务数组作为 result。"
     ),
     TaskType.CODE_DRAFT: (
@@ -188,7 +294,8 @@ TASK_GUIDANCE = {
         "你必须综合题面、输入结构和子任务。context.jngen_documentation"
         ".selected_documents 是在生成前经多轮结构化选择和阅读得到的 jngen 文档，必须以其正文为准，"
         "不得再请求任何工具。generator 必须包含 jngen.h、实际使用已选文档中的 jngen "
-        "接口，并接受 -seed 与 -subtask；"
+        "接口，并使用 getOpt 读取 -seed、-subtask、-case 以及每个测试点的全部"
+        "runtime_parameters；传入的限制必须真正决定生成范围和规模，不得仅读取后丢弃。"
         "validator 使用 testlib 严格匹配输入结构。根据编译、试运行、校验和标程日志持续修复。"
         "selected_documents 是 jngen API 的唯一事实来源。自身经验、训练记忆和名称相似性都不能"
         "作为接口存在或签名正确的依据。只有当文档正文明确给出符号与兼容调用方式时才能使用；"
@@ -197,6 +304,9 @@ TASK_GUIDANCE = {
         "在 review 阶段必须逐项审计每个 SUBTASK 的 constraints、test_count 和 special_cases："
         "要求必须由生成算法的构造逻辑保证，不能依赖随机碰巧满足，也不能擅自缩小或改写约束。"
         "必须检查所有边界取值下随机区间和计数关系均合法，输出声明的数量必须与实际记录数一致。"
+        "同时输出 constraint_coverage，逐个记录每个 subtask_id/case_id、全部 parameter_names、"
+        "该测试点的全局与子任务 structure_tags、"
+        "生成策略、校验策略和边界或特殊情况，且必须与 SUBTASKS.runtime_parameters 一致。"
         "execution.checks 中的 generate.content 是实际样例证据，但单个样例不能替代对生成器源码的"
         "逻辑证明。任何仅用于满足接口检查、其结果不影响最终输出的 jngen 调用都属于实质错误，"
         "必须删除并改为让文档支持的接口真正参与数据构造。"
@@ -231,14 +341,22 @@ class OpenAICompatibleAgentModel:
         self._client = client
 
     @staticmethod
-    def _workflow_response_contract(task_type: TaskType) -> dict[str, Any]:
+    def _workflow_response_contract(task_type: TaskType, phase: str) -> dict[str, Any]:
+        result_contract = OpenAICompatibleAgentModel._model_result_contract(task_type)
+        if phase == "review" and task_type == TaskType.CODE_DRAFT:
+            result_contract = {
+                "anyOf": [
+                    OpenAICompatibleAgentModel._code_review_patch_contract(),
+                    {"type": "null"},
+                ]
+            }
         return {
             "type": "object",
             "additionalProperties": False,
             "required": ["confirmation", "result", "issues"],
             "properties": {
                 "confirmation": {"enum": ["pass", "revise", "error"]},
-                "result": TASK_RESULT_CONTRACTS[task_type],
+                "result": result_contract,
                 "issues": {"type": "array", "items": {"type": "string"}},
             },
         }
@@ -464,6 +582,7 @@ class OpenAICompatibleAgentModel:
         system = self._system_prompt(task_type, phase)
         model_context = dict(context)
         model_context.pop("library_guidance", None)
+        model_candidate = self._candidate_for_model(task_type, phase, candidate)
         model_input = {
             "format_version": 1,
             "request": {
@@ -472,11 +591,11 @@ class OpenAICompatibleAgentModel:
             },
             "inputs": {
                 "context": model_context,
-                "candidate": candidate,
+                "candidate": model_candidate,
                 "execution": execution,
                 "previous_issues": issues,
             },
-            "response_contract": self._workflow_response_contract(task_type),
+            "response_contract": self._workflow_response_contract(task_type, phase),
         }
         payload = {
             "model": self.settings.model_name,
@@ -519,8 +638,41 @@ class OpenAICompatibleAgentModel:
                     content = response.json()["choices"][0]["message"]["content"]
                     value = self._parse_json(content)
                     value = self._normalize_contract(task_type, value)
+                    if (
+                        task_type == TaskType.CODE_DRAFT
+                        and phase == "review"
+                        and value.get("confirmation") == Confirmation.PASS.value
+                    ):
+                        # A passing review is a decision, not a new candidate.
+                        # Discard legacy providers' echoed result without a retry.
+                        value["result"] = None
+                    elif (
+                        task_type == TaskType.CODE_DRAFT
+                        and phase == "review"
+                        and value.get("confirmation") == Confirmation.REVISE.value
+                    ):
+                        patch = value.get("result")
+                        allowed = {
+                            "generator_code",
+                            "validator_code",
+                            "constraint_coverage",
+                        }
+                        if (
+                            not isinstance(patch, dict)
+                            or not patch
+                            or set(patch) - allowed
+                        ):
+                            raise ValueError(
+                                "a revised code review must return a non-empty field patch"
+                            )
+                        value["result"] = {**model_candidate, **patch}
                     value["issues"] = self._normalize_issues(value.get("issues"))
-                    self._validate_task_result(task_type, value.get("result"))
+                    self._validate_task_result(
+                        task_type,
+                        phase,
+                        value.get("confirmation"),
+                        value.get("result"),
+                    )
                     return WorkflowOutput.model_validate(value)
                 except (KeyError, TypeError, ValueError, ValidationError) as exc:
                     last_contract_error = exc
@@ -552,26 +704,39 @@ class OpenAICompatibleAgentModel:
 
     @staticmethod
     def _system_prompt(task_type: TaskType, phase: str) -> str:
-        phase_rule = (
-            "生成或修订候选结果。"
-            if phase == "generate"
-            else (
+        if phase == "generate":
+            phase_rule = "生成或修订候选结果。"
+        elif task_type == TaskType.CODE_DRAFT:
+            phase_rule = (
                 "独立检查候选、执行结果与完成条件；发现实质问题时可直接修复候选。"
-                "若确定性检查已经通过且没有实质问题，必须原样返回 candidate 并确认通过，"
-                "不得改写措辞、补充默认字段或调整格式。"
+                "若确定性检查已经通过且没有实质问题，必须返回 "
+                "confirmation=pass、result=null 和空 issues，不得回传或改写 candidate。"
+                "只有确实修改候选时才返回 result，且 result 是字段级补丁："
+                "只包含发生变化的 generator_code、validator_code 或 constraint_coverage，"
+                "未修改字段必须省略。"
             )
-        )
+        else:
+            phase_rule = (
+                "独立检查候选、执行结果与完成条件；发现实质问题时可直接修复候选。"
+                "若确定性检查已经通过且没有实质问题，必须原样返回 candidate "
+                "并确认通过。"
+            )
         tool_rule = (
             "你没有 Shell、文件、网络、Docker 或工具调用权限，"
             "不得输出 tool_requests 字段。"
+        )
+        result_rule = (
+            "generate 的 result 必须是符合当前任务 Schema 的完整候选"
+            "对象，review 仅在 pass 时允许 result=null；"
+            if task_type == TaskType.CODE_DRAFT
+            else "result 必须是符合当前任务 Schema 的完整候选对象；"
         )
         prompt = (
             f"{TASK_GUIDANCE[task_type]} {phase_rule} "
             f"{tool_rule} "
             "严格按用户消息中的 response_contract 返回单个 JSON 对象，且仅包含 "
             "confirmation、result、issues 三个顶层字段。"
-            "confirmation 为 pass/revise/error，result 必须是符合当前任务 Schema "
-            "的完整候选对象，issues 为中文字符串数组。"
+            f"confirmation 为 pass/revise/error；{result_rule}issues 为中文字符串数组。"
             "仅当任务确实完成、执行检查"
             "通过且 issues 为空时返回 pass；不得因达到重试次数而伪造通过。JSON 字符串中的"
             "换行、引号和反斜杠必须正确转义，不得输出 Markdown 代码块。"
@@ -632,7 +797,23 @@ class OpenAICompatibleAgentModel:
         ]
 
     @staticmethod
-    def _validate_task_result(task_type: TaskType, value: Any) -> None:
+    def _validate_task_result(
+        task_type: TaskType,
+        phase: str,
+        confirmation: Any,
+        value: Any,
+    ) -> None:
+        compact_pass = (
+            task_type == TaskType.CODE_DRAFT
+            and phase == "review"
+            and confirmation == Confirmation.PASS.value
+        )
+        if compact_pass and value is not None:
+            raise ValueError("a passing code review must return a null result")
+        if value is None:
+            if compact_pass:
+                return
+            raise ValueError("null workflow result is only valid for a passing review")
         if not isinstance(value, dict):
             raise ValueError("workflow result must be an object")
         if task_type == TaskType.INPUT_NORMALIZATION:
@@ -644,115 +825,46 @@ class OpenAICompatibleAgentModel:
         elif task_type == TaskType.CODE_DRAFT:
             CodeDraft.model_validate(value)
 
-
-class MockAgentModel:
-    """Deterministic model used only by tests and explicit mock mode."""
-
-    async def select_jngen_documents(
-        self,
-        context: dict[str, Any],
-        available_filenames: list[str],
-    ) -> JngenDocumentSelection:
-        previously_selected = {
-            str(item["filename"])
-            for item in context.get("jngen_documentation", {}).get(
-                "selected_documents", []
-            )
-            if isinstance(item, dict) and item.get("filename")
-        }
-        preferred = ["getting_started.md", "getopt.md", "array.md"]
-        selected = [
-            filename
-            for filename in preferred
-            if filename in available_filenames and filename not in previously_selected
-        ][:2]
-        if not selected:
-            selected = [
-                filename
-                for filename in available_filenames
-                if filename not in previously_selected
-            ][:2]
-        return JngenDocumentSelection(
-            selected_documents=[
-                JngenDocumentChoice(filename=filename, reason="模拟模式固定选择。")
-                for filename in selected
-            ],
-            selection_complete=bool(previously_selected) or not selected,
-        )
-
-    async def run(
-        self,
+    @staticmethod
+    def _candidate_for_model(
         task_type: TaskType,
         phase: str,
-        context: dict[str, Any],
         candidate: dict[str, Any],
-        execution: dict[str, Any],
-        issues: list[str],
-    ) -> WorkflowOutput:
-        del issues
-        if phase == "review":
-            if execution.get("ok"):
-                return WorkflowOutput(confirmation=Confirmation.PASS, result=candidate)
-            return WorkflowOutput(
-                confirmation=Confirmation.REVISE,
-                result=candidate,
-                issues=[str(execution.get("message") or "确定性检查未通过。")],
-            )
-        if task_type == TaskType.CODE_DRAFT and (
-            not candidate or jngen_usage_issues(candidate.get("generator_code", ""))
-        ):
-            candidate = self._mock_jngen_result()
-        result = candidate or self._default_result(task_type, context)
-        return WorkflowOutput(confirmation=Confirmation.REVISE, result=result)
+    ) -> dict[str, Any]:
+        prepared = dict(candidate)
+        if task_type == TaskType.CODE_DRAFT and phase == "review":
+            for key in (
+                "trial_results",
+                "revision_id",
+                "input_revision",
+                "subtasks_revision",
+            ):
+                prepared.pop(key, None)
+        return prepared
 
     @staticmethod
-    def _mock_jngen_result() -> dict[str, Any]:
+    def _model_result_contract(task_type: TaskType) -> dict[str, Any]:
+        contract = TASK_RESULT_CONTRACTS[task_type]
+        if task_type != TaskType.CODE_DRAFT:
+            return contract
+        model_fields = {"generator_code", "validator_code", "constraint_coverage"}
         return {
-            "generator_code": (
-                '#include "jngen.h"\n'
-                "int main(int argc,char** argv){registerGen(argc,argv);parseArgs(argc,argv);"
-                "auto sample=Array::random(1,0,0);(void)sample;return 0;}"
-            ),
-            "validator_code": (
-                '#include "testlib.h"\n'
-                "int main(int argc,char** argv){registerValidation(argc,argv);"
-                "inf.readEof();return 0;}"
-            ),
-            "issues": [],
+            **contract,
+            "properties": {
+                key: value
+                for key, value in contract["properties"].items()
+                if key in model_fields
+            },
         }
 
     @staticmethod
-    def _default_result(task_type: TaskType, context: dict[str, Any]) -> dict[str, Any]:
-        if task_type == TaskType.INPUT_NORMALIZATION:
-            return dict(context["input"])
-        if task_type == TaskType.INPUT_STRUCTURE:
-            return {
-                "template": "按题目与标程的读取顺序读取输入；请审核变量、类型和数量关系。",
-                "issues": [],
-            }
-        if task_type == TaskType.SUBTASK_PLAN:
-            return {
-                "subtasks": [
-                    {
-                        "id": index,
-                        "constraints": f"第 {index} 个规模梯度，按 INPUT 中变量描述。",
-                        "test_count": 1,
-                        "expected_complexity": "O(n)",
-                        "special_cases": [],
-                    }
-                    for index in range(1, 6)
-                ],
-                "issues": [],
-            }
+    def _code_review_patch_contract() -> dict[str, Any]:
+        full_contract = OpenAICompatibleAgentModel._model_result_contract(
+            TaskType.CODE_DRAFT
+        )
         return {
-            "generator_code": (
-                '#include "testlib.h"\n'
-                "int main(int argc,char** argv){registerGen(argc,argv,1);return 0;}"
-            ),
-            "validator_code": (
-                '#include "testlib.h"\n'
-                "int main(int argc,char** argv){registerValidation(argc,argv);"
-                "inf.readEof();return 0;}"
-            ),
-            "issues": [],
+            "type": "object",
+            "additionalProperties": False,
+            "minProperties": 1,
+            "properties": full_contract["properties"],
         }

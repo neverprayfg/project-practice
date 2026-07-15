@@ -1331,66 +1331,6 @@ svg {
   color: var(--teal);
 }
 
-.mode-fieldset {
-  min-width: 0;
-  margin: 0;
-  padding: 0;
-  border: 0;
-}
-
-.mode-fieldset legend {
-  margin-bottom: 7px;
-  color: var(--ink-soft);
-  font-size: 13px;
-  font-weight: 700;
-}
-
-.segmented-control {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 4px;
-  padding: 4px;
-  border: 1px solid var(--line);
-  border-radius: 7px;
-  background: var(--surface-muted);
-}
-
-.segmented-control label {
-  min-width: 0;
-  cursor: pointer;
-}
-
-.segmented-control input {
-  position: absolute;
-  opacity: 0;
-  pointer-events: none;
-}
-
-.segmented-control span {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 7px;
-  min-height: 38px;
-  border: 1px solid transparent;
-  border-radius: 5px;
-  color: var(--muted);
-  font-size: 13px;
-  font-weight: 700;
-}
-
-.segmented-control input:checked + span {
-  border-color: var(--line-strong);
-  color: var(--teal-dark);
-  background: var(--surface);
-  box-shadow: 0 2px 7px rgba(25, 40, 52, 0.08);
-}
-
-.segmented-control input:focus-visible + span {
-  outline: 3px solid rgba(40, 94, 149, 0.18);
-  outline-offset: 1px;
-}
-
 .model-url-field {
   grid-column: span 1;
 }
@@ -1422,10 +1362,6 @@ svg {
 .secret-toggle:hover {
   color: var(--ink);
   background: var(--surface-muted);
-}
-
-.model-remote-fields.is-disabled {
-  opacity: 0.5;
 }
 
 .spinner {

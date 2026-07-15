@@ -7,10 +7,10 @@ The backend implements the workflow in `tmp/agentic_workflow_specification.md` w
 ```bash
 uv sync --dev
 cp ../.env.example ../.env
-MODEL_MODE=mock uv run uvicorn app.main:app --reload
+uv run uvicorn app.main:app --reload
 ```
 
-Remote mode uses `MODEL_BASE_URL`, `MODEL_API_KEY`, and `MODEL_NAME` with an OpenAI-compatible chat-completions API.
+The backend starts without an API key. Model-backed generation and review return `MODEL_NOT_CONFIGURED` until an OpenAI-compatible model connection is configured in the UI or environment.
 
 ## API flow
 
@@ -22,4 +22,4 @@ Remote mode uses `MODEL_BASE_URL`, `MODEL_API_KEY`, and `MODEL_NAME` with an Ope
 6. Validate and solve with `POST /api/projects/{id}/validate`.
 7. Export generator, validator, and paired data with `GET /api/projects/{id}/export`.
 
-Agent output never invokes tools or Docker directly. Before stage 5 generation, the backend performs a bounded multi-round selection from `app/jngen_doc_context/`: every round receives all filenames, later rounds also receive previously read contents, and only unread filenames are valid choices. The selector may finish early; otherwise the backend ends selection at its configured budget before Agent4 receives the selected document contents. Compilation and execution remain deterministic backend operations.
+Agent output never invokes tools or Docker directly. Stage 3 selects input-structure tags from the versioned `app/jngen_doc_context/tag_catalog.json` catalog and asks the user to confirm them together with the input template. Stage 5 deterministically resolves jngen documents from those confirmed tags. Old projects without confirmed tags must return to stage 3; `AGENT_ALLOW_LEGACY_KEYWORD_ROUTING=true` temporarily enables the legacy keyword/model-selection recovery path during migration. Compilation and execution remain deterministic backend operations.

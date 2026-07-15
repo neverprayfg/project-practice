@@ -21,11 +21,11 @@ $BaseUrl = if ([string]::IsNullOrWhiteSpace($env:MODEL_BASE_URL)) {
 } else {
     $env:MODEL_BASE_URL
 }
-$SecureApiKey = Read-Host "模型 API Key" -AsSecureString
+$SecureApiKey = Read-Host "模型 API Key（可留空，之后在前端配置）" -AsSecureString
 $Pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureApiKey)
 $ApiKey = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($Pointer)
 [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($Pointer)
-if ([string]::IsNullOrWhiteSpace($ApiKey)) { throw "API Key 不能为空。" }
+$ModelConfigured = -not [string]::IsNullOrWhiteSpace($ApiKey)
 
 try {
     Write-Host "`n[1/5] 初始化固定版本依赖"
@@ -45,7 +45,6 @@ try {
 
     Write-Host "`n[3/5] 写入 LangGraph 后端模型配置"
     $EnvLines = @(
-        "MODEL_MODE=remote"
         "MODEL_BASE_URL=$BaseUrl"
         "MODEL_API_KEY=$ApiKey"
         "MODEL_NAME=$Model"
@@ -69,9 +68,9 @@ try {
         Assert-LastExit "后端镜像构建失败。"
         tar -cf $RunnerContext docker/runner/runner.cpp docker/runner.Dockerfile testlib/testlib.h jngen/jngen.h
         Assert-LastExit "runner 构建上下文创建失败。"
-        & cmd.exe /d /c "docker build --pull=false --progress=plain --target compiler -t contest-dataset-runner-compiler:0.2.0 -f docker/runner.Dockerfile - < `"$RunnerContext`""
+        & cmd.exe /d /c "docker build --pull=false --progress=plain --target compiler -t contest-dataset-runner-compiler:0.3.0 -f docker/runner.Dockerfile - < `"$RunnerContext`""
         Assert-LastExit "runner 编译镜像构建失败。"
-        & cmd.exe /d /c "docker build --pull=false --progress=plain --target executor -t contest-dataset-runner-executor:0.2.0 -f docker/runner.Dockerfile - < `"$RunnerContext`""
+        & cmd.exe /d /c "docker build --pull=false --progress=plain --target executor -t contest-dataset-runner-executor:0.3.0 -f docker/runner.Dockerfile - < `"$RunnerContext`""
         Assert-LastExit "runner 执行镜像构建失败。"
     }
     finally {
@@ -96,6 +95,9 @@ try {
     Write-Host "`n部署完成。"
     Write-Host "应用工作台：http://localhost:8000"
     Write-Host "API 文档：http://localhost:8000/docs"
+    if (-not $ModelConfigured) {
+        Write-Host "提示：当前未配置模型，普通页面可正常使用，AI 操作需配置模型后运行。"
+    }
 }
 finally {
     $ApiKey = $null

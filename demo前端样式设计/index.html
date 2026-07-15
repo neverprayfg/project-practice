@@ -87,15 +87,7 @@
         <div class="settings-dialog-body">
           <div class="model-config-status" id="modelConfigStatus" aria-live="polite"></div>
 
-          <fieldset class="mode-fieldset">
-            <legend>运行模式</legend>
-            <div class="segmented-control" id="modelModeControl">
-              <label><input type="radio" name="modelMode" value="remote" checked><span><i data-lucide="cloud"></i>真实模型</span></label>
-              <label><input type="radio" name="modelMode" value="mock"><span><i data-lucide="flask-conical"></i>Mock 测试</span></label>
-            </div>
-          </fieldset>
-
-          <div class="form-grid model-remote-fields">
+          <div class="form-grid">
             <label class="field model-url-field">
               <span class="required">API Base URL</span>
               <input class="text-input" id="modelBaseUrl" type="url" required spellcheck="false" placeholder="https://api.deepseek.com/v1">
@@ -106,7 +98,7 @@
             </label>
           </div>
 
-          <label class="field model-remote-fields">
+          <label class="field">
             <span>API Key</span>
             <div class="secret-input">
               <input class="text-input" id="modelApiKey" type="password" autocomplete="new-password" spellcheck="false" placeholder="输入新的 API Key">
@@ -125,7 +117,7 @@
               <input class="number-input" id="agentMaxIterations" type="number" min="1" max="12" step="1" required>
             </label>
             <label class="field">
-              <span class="required">每子任务试验种子数</span>
+              <span class="required">每测试点试验种子数</span>
               <input class="number-input" id="trialSeedsPerSubtask" type="number" min="1" max="5" step="1" required>
             </label>
           </div>

@@ -102,7 +102,6 @@ def readonly_gateway(tmp_path: Path) -> tuple[AgentToolGateway, ProjectStorage, 
         storage_root=storage.root,
         testlib_root=testlib_root,
         jngen_root=jngen_root,
-        model_mode="mock",
     )
     gateway = AgentToolGateway(settings, storage, FakeSandbox(storage.root))
     return gateway, storage, record.project_id

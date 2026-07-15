@@ -4,6 +4,7 @@ set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 API_KEY=""
+MODEL_CONFIGURED=0
 trap 'stty echo 2>/dev/null || true; unset API_KEY' EXIT
 
 fail() {
@@ -24,12 +25,12 @@ printf '模型名称 [deepseek-chat]：'
 IFS= read -r MODEL
 MODEL="${MODEL:-deepseek-chat}"
 BASE_URL="${MODEL_BASE_URL:-https://api.deepseek.com/v1}"
-printf '模型 API Key（输入不会显示）：'
+printf '模型 API Key（可留空，之后在前端配置；输入不会显示）：'
 stty -echo
 IFS= read -r API_KEY
 stty echo
 printf '\n'
-[ -n "$API_KEY" ] || fail "API Key 不能为空"
+[ -n "$API_KEY" ] && MODEL_CONFIGURED=1
 
 printf '\n[1/5] 初始化固定版本依赖\n'
 run git submodule sync --recursive
@@ -46,7 +47,6 @@ done < docker/images.lock
 printf '\n[3/5] 写入 LangGraph 后端模型配置\n'
 umask 077
 {
-  printf 'MODEL_MODE=remote\n'
   printf 'MODEL_BASE_URL=%s\n' "$BASE_URL"
   printf 'MODEL_API_KEY=%s\n' "$API_KEY"
   printf 'MODEL_NAME=%s\n' "$MODEL"
@@ -72,7 +72,7 @@ tar -cf - \
   jngen/jngen.h \
 | docker build --pull=false --progress=plain \
       --target compiler \
-      -t contest-dataset-runner-compiler:0.2.0 -f docker/runner.Dockerfile - \
+      -t contest-dataset-runner-compiler:0.3.0 -f docker/runner.Dockerfile - \
   || fail "runner 编译镜像构建失败"
 tar -cf - \
   docker/runner/runner.cpp \
@@ -81,7 +81,7 @@ tar -cf - \
   jngen/jngen.h \
 | docker build --pull=false --progress=plain \
       --target executor \
-      -t contest-dataset-runner-executor:0.2.0 -f docker/runner.Dockerfile - \
+      -t contest-dataset-runner-executor:0.3.0 -f docker/runner.Dockerfile - \
   || fail "runner 执行镜像构建失败"
 
 printf '\n[5/5] 启动应用并等待就绪\n'
@@ -99,3 +99,6 @@ done
 printf '\n部署完成。\n'
 printf '应用工作台：http://localhost:8000\n'
 printf 'API 文档：http://localhost:8000/docs\n'
+if [ "$MODEL_CONFIGURED" = "0" ]; then
+  printf '提示：当前未配置模型，普通页面可正常使用，AI 操作需配置模型后运行。\n'
+fi

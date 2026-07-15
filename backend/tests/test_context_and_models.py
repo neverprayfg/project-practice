@@ -10,17 +10,24 @@ from pydantic import ValidationError
 from app.config import Settings
 from app.models import (
     CodeDraft,
+    Confirmation,
     InputStructureDraft,
     ProjectCreate,
+    RuntimeParameter,
     SpecialCase,
     Subtask,
     TaskType,
     ToolRequest,
 )
+from app.models import (
+    TestPointRuntimeParameters as RuntimeParameterProfile,
+)
 from app.services.context_provider import AgentContextProvider
+from app.services.jngen_document_context import JngenDocumentContext
 from app.services.jngen_policy import jngen_usage_issues
-from app.services.model_client import MockAgentModel, OpenAICompatibleAgentModel
+from app.services.model_client import OpenAICompatibleAgentModel
 from app.services.project_service import ProjectService
+from app.services.structure_tag_catalog import StructureTagCatalog
 from app.storage import ProjectStorage
 
 
@@ -33,6 +40,53 @@ def test_special_case_count_cannot_exceed_subtask_total() -> None:
             expected_complexity="O(n)",
             special_cases=[SpecialCase(count=2, description="boundaries")],
         )
+
+
+def test_runtime_parameters_must_cover_each_test_point_in_order() -> None:
+    with pytest.raises(ValidationError):
+        Subtask(
+            id=1,
+            constraints="1 <= n <= 100",
+            test_count=2,
+            expected_complexity="O(n)",
+            runtime_parameters=[
+                RuntimeParameterProfile(
+                    case_id=2,
+                    parameters=[
+                        RuntimeParameter(name="n_max", value=100, category="size")
+                    ],
+                )
+            ],
+        )
+
+
+def test_mixed_structure_route_loads_every_matching_topic() -> None:
+    root = Path(__file__).parents[1] / "app/jngen_doc_context"
+    docs = JngenDocumentContext(root, StructureTagCatalog(root))
+
+    route = docs.route_documents(
+        {
+            "confirmed_structure_tags": [
+                {
+                    "tag_id": "collection.array",
+                    "applies_to": "values",
+                    "evidence": "n integers",
+                },
+                {
+                    "tag_id": "tree",
+                    "applies_to": "edges",
+                    "evidence": "n-1 edges",
+                },
+            ]
+        },
+        100_000,
+    )
+
+    assert route is not None
+    assert route["selected_tag_ids"] == ["collection.array", "tree"]
+    assert {"array.md", "tree.md", "generic_graph.md"}.issubset(
+        route["selected_filenames"]
+    )
 
 
 def test_input_structure_accepts_unstructured_template_text() -> None:
@@ -134,7 +188,7 @@ async def test_every_agent_request_uses_structured_envelope_and_result_schema(
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
         model = OpenAICompatibleAgentModel(
-            Settings(model_mode="remote", model_api_key="test-key"),
+            Settings(model_api_key="test-key"),
             client,
         )
         output = await model.run(
@@ -168,9 +222,121 @@ async def test_every_agent_request_uses_structured_envelope_and_result_schema(
     assert contract["properties"]["result"]["type"] == "object"
     if task_type == TaskType.CODE_DRAFT:
         code_properties = contract["properties"]["result"]["properties"]
-        assert "trial_results" in code_properties
-        assert "revision_id" in code_properties
+        assert "trial_results" not in code_properties
+        assert "revision_id" not in code_properties
     assert output.result == result
+
+
+@pytest.mark.asyncio
+async def test_passing_code_review_uses_null_result_and_strips_server_fields() -> None:
+    captured: list[dict] = []
+    candidate = {
+        **_valid_model_result(TaskType.CODE_DRAFT),
+        "constraint_coverage": [],
+        "revision_id": "server-owned",
+        "input_revision": 2,
+        "subtasks_revision": 3,
+        "trial_results": [{"operation": "compile", "large": "payload"}],
+    }
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "confirmation": "pass",
+                                    "result": candidate,
+                                    "issues": [],
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        model = OpenAICompatibleAgentModel(Settings(model_api_key="test-key"), client)
+        output = await model.run(
+            TaskType.CODE_DRAFT,
+            "review",
+            {"input": {}},
+            candidate,
+            {"ok": True},
+            [],
+        )
+
+    sent = json.loads(captured[0]["messages"][1]["content"])
+    assert set(sent["inputs"]["candidate"]) == {
+        "generator_code",
+        "validator_code",
+        "constraint_coverage",
+    }
+    result_contract = sent["response_contract"]["properties"]["result"]
+    assert result_contract["anyOf"][1] == {"type": "null"}
+    assert output.confirmation == Confirmation.PASS
+    assert output.result is None
+
+
+@pytest.mark.asyncio
+async def test_revised_code_review_merges_a_field_patch() -> None:
+    captured: list[dict] = []
+    candidate = {
+        **_valid_model_result(TaskType.CODE_DRAFT),
+        "constraint_coverage": [],
+    }
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "confirmation": "revise",
+                                    "result": {
+                                        "validator_code": (
+                                            '#include "testlib.h"\n'
+                                            "int main(){return 0;}"
+                                        )
+                                    },
+                                    "issues": ["已修复校验器。"],
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        model = OpenAICompatibleAgentModel(Settings(model_api_key="test-key"), client)
+        output = await model.run(
+            TaskType.CODE_DRAFT,
+            "review",
+            {"input": {}},
+            candidate,
+            {"ok": False},
+            [],
+        )
+
+    sent = json.loads(captured[0]["messages"][1]["content"])
+    patch_contract = sent["response_contract"]["properties"]["result"]["anyOf"][0]
+    assert patch_contract["minProperties"] == 1
+    assert "required" not in patch_contract
+    assert output.result is not None
+    assert output.result["generator_code"] == candidate["generator_code"]
+    assert output.result["validator_code"].endswith("int main(){return 0;}")
+    assert output.result["constraint_coverage"] == []
 
 
 def test_tool_request_accepts_openai_style_tool_and_params_aliases() -> None:
@@ -209,6 +375,7 @@ def test_legacy_input_fields_are_converted_to_template_text() -> None:
 
     assert draft.model_dump() == {
         "template": "输入结构：\n1. nums（integer sequence）：输入值。",
+        "structure_tags": [],
         "issues": [],
     }
 
@@ -429,7 +596,7 @@ async def test_remote_model_retries_when_tool_request_is_returned() -> None:
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
         model = OpenAICompatibleAgentModel(
-            Settings(model_mode="remote", model_api_key="test-key"),
+            Settings(model_api_key="test-key"),
             client,
         )
         output = await model.run(TaskType.CODE_DRAFT, "generate", {}, {}, {}, [])
@@ -437,12 +604,6 @@ async def test_remote_model_retries_when_tool_request_is_returned() -> None:
     assert calls == 2
     assert output.confirmation.value == "revise"
     assert not hasattr(output, "tool_requests")
-
-
-def test_mock_validator_obeys_testlib_end_of_file_contract() -> None:
-    result = MockAgentModel._default_result(TaskType.CODE_DRAFT, {})
-
-    assert "inf.readEof()" in result["validator_code"]
 
 
 @pytest.mark.asyncio
@@ -477,7 +638,7 @@ async def test_remote_model_selects_jngen_documents_with_structured_json() -> No
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
         model = OpenAICompatibleAgentModel(
-            Settings(model_mode="remote", model_api_key="test-key"),
+            Settings(model_api_key="test-key"),
             client,
         )
         selection = await model.select_jngen_documents(
@@ -539,7 +700,7 @@ async def test_remote_model_wraps_stage_four_result_array() -> None:
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
         model = OpenAICompatibleAgentModel(
-            Settings(model_mode="remote", model_api_key="test-key"),
+            Settings(model_api_key="test-key"),
             client,
         )
         output = await model.run(TaskType.SUBTASK_PLAN, "generate", {}, {}, {}, [])
@@ -564,7 +725,7 @@ async def test_remote_model_retries_malformed_json_contract() -> None:
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
         model = OpenAICompatibleAgentModel(
-            Settings(model_mode="remote", model_api_key="test-key"),
+            Settings(model_api_key="test-key"),
             client,
         )
         output = await model.run(TaskType.INPUT_STRUCTURE, "generate", {}, {}, {}, [])
@@ -610,7 +771,7 @@ async def test_remote_model_retries_when_task_result_is_missing_required_field()
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
         model = OpenAICompatibleAgentModel(
-            Settings(model_mode="remote", model_api_key="test-key"),
+            Settings(model_api_key="test-key"),
             client,
         )
         output = await model.run(TaskType.CODE_DRAFT, "generate", {}, {}, {}, [])

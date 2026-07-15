@@ -17,6 +17,7 @@ from app.models import (
     UserConfirmation,
     ValidateRequest,
 )
+from app.services.timing_report import summarize_agent4_timings
 
 router = APIRouter()
 
@@ -29,7 +30,6 @@ async def health(request: Request) -> dict:
         "status": "ok",
         "environment": settings.app_env,
         "workflow": "langgraph",
-        "model_mode": settings.model_mode,
         "model_name": model_config["model_name"],
         "model_api_configured": model_config["api_key_configured"],
         "sandbox": type(request.app.state.sandbox).__name__,
@@ -39,6 +39,11 @@ async def health(request: Request) -> dict:
 @router.get("/api/settings/model")
 async def get_model_configuration(request: Request) -> dict:
     return request.app.state.model_configuration.public_view()
+
+
+@router.get("/api/structure-tags")
+async def get_structure_tags(request: Request) -> dict:
+    return request.app.state.tag_catalog.public_view()
 
 
 @router.put("/api/settings/model")
@@ -87,6 +92,21 @@ async def get_project(project_id: str, request: Request) -> dict:
         "input": storage.load_input(project_id).model_dump(mode="json"),
         "subtasks": (drafts["4"] or {}).get("subtasks", []),
         "drafts": drafts,
+        "structure_tag_catalog": request.app.state.tag_catalog.public_view(),
+    }
+
+
+@router.get("/api/projects/{project_id}/stage5/timings")
+async def get_stage5_timings(
+    project_id: str, request: Request, run_id: str | None = None
+) -> dict:
+    request.app.state.projects.get(project_id)
+    events = request.app.state.storage.load_agent4_timings(project_id)
+    if run_id is not None:
+        events = [event for event in events if event.get("run_id") == run_id]
+    return {
+        "events": events,
+        "runs": summarize_agent4_timings(events),
     }
 
 
@@ -165,7 +185,9 @@ async def preview(project_id: str, payload: PreviewRequest, request: Request) ->
         raise AppError(
             "PROJECT_BUSY", "project already has a running task", stage=5, status_code=409
         )
-    return await request.app.state.pipeline.preview(project_id, payload.subtask_id, payload.seed)
+    return await request.app.state.pipeline.preview(
+        project_id, payload.subtask_id, payload.case_id, payload.seed
+    )
 
 
 @router.post("/api/projects/{project_id}/build")

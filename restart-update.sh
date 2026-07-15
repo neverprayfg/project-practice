@@ -26,7 +26,7 @@ tar -cf - \
   jngen/jngen.h \
 | docker build --pull=false --progress=plain \
       --target compiler \
-      -t contest-dataset-runner-compiler:0.2.0 -f docker/runner.Dockerfile -
+      -t contest-dataset-runner-compiler:0.3.0 -f docker/runner.Dockerfile -
 tar -cf - \
   docker/runner/runner.cpp \
   docker/runner.Dockerfile \
@@ -34,7 +34,7 @@ tar -cf - \
   jngen/jngen.h \
 | docker build --pull=false --progress=plain \
       --target executor \
-      -t contest-dataset-runner-executor:0.2.0 -f docker/runner.Dockerfile -
+      -t contest-dataset-runner-executor:0.3.0 -f docker/runner.Dockerfile -
 
 printf '[3/4] 重建应用容器\n'
 docker compose up -d --no-build --force-recreate docker-api workspace-init backend

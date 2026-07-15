@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from contextlib import AbstractAsyncContextManager
+from time import perf_counter
 from typing import Any, TypedDict
 from uuid import uuid4
 
@@ -12,7 +13,13 @@ from langgraph.types import Command, interrupt
 
 from app.config import Settings
 from app.errors import AppError
-from app.models import Confirmation, TaskType, WorkflowOutput
+from app.models import (
+    Confirmation,
+    JngenDocumentChoice,
+    JngenDocumentSelection,
+    TaskType,
+    WorkflowOutput,
+)
 from app.services.candidate_verifier import AgentCandidateVerifier
 from app.services.jngen_document_context import JngenDocumentContext
 from app.services.model_client import AgentModel
@@ -34,6 +41,7 @@ class AgentLoopState(TypedDict, total=False):
     exhausted: bool
     user_confirmed: bool
     candidate_changed: bool
+    round_index: int
 
 
 class LangGraphAgentRunner:
@@ -103,47 +111,181 @@ class LangGraphAgentRunner:
         thread_id = (
             f"{project_id}:{task_type.value}:r{workflow_revision}:{uuid4().hex}"
         )
-        if task_type == TaskType.CODE_DRAFT:
-            try:
-                context = await self._with_selected_jngen_documents(
-                    context,
-                    project_id=project_id,
-                    run_id=thread_id,
-                    purpose="initial",
-                )
-            except AppError as exc:
-                self.storage.append_agent4_document_selection(
+        workflow_started = perf_counter()
+        workflow_status = "ok"
+        try:
+            if task_type == TaskType.CODE_DRAFT:
+                retrieval_started = perf_counter()
+                retrieval_status = "ok"
+                try:
+                    routed = self.jngen_documents.route_documents(
+                        context,
+                        self.settings.agent_jngen_document_context_chars,
+                    )
+                    if routed is not None:
+                        context = self._with_routed_jngen_documents(
+                            context,
+                            routed,
+                            project_id=project_id,
+                            run_id=thread_id,
+                        )
+                    elif self.settings.agent_allow_legacy_keyword_routing:
+                        legacy_route = self.jngen_documents.legacy_route_documents(
+                            context
+                        )
+                        if legacy_route is not None:
+                            context = self._with_routed_jngen_documents(
+                                context,
+                                legacy_route,
+                                project_id=project_id,
+                                run_id=thread_id,
+                            )
+                        else:
+                            context = await self._with_selected_jngen_documents(
+                                context,
+                                project_id=project_id,
+                                run_id=thread_id,
+                                purpose="legacy_recovery",
+                            )
+                    else:
+                        raise AppError(
+                            "STRUCTURE_TAG_REVIEW_REQUIRED",
+                            "阶段三尚无已确认的结构标签，请返回阶段三复核。",
+                            stage=3,
+                            status_code=409,
+                        )
+                except AppError as exc:
+                    retrieval_status = "error"
+                    self.storage.append_agent4_document_selection(
+                        project_id,
+                        {
+                            "run_id": thread_id,
+                            "event": "selection_failed",
+                            "purpose": "initial",
+                            "error": exc.payload(),
+                        },
+                    )
+                    raise
+                finally:
+                    self._record_timing(
+                        project_id,
+                        thread_id,
+                        1,
+                        "retrieval",
+                        retrieval_started,
+                        status=retrieval_status,
+                        metadata={"purpose": "initial"},
+                    )
+            config = self._config(thread_id)
+            state = await self._graph.ainvoke(
+                {
+                    "run_id": thread_id,
+                    "project_id": project_id,
+                    "task_type": task_type.value,
+                    "context": context,
+                    "candidate": candidate or {},
+                    "execution": {},
+                    "issues": initial_issues or [],
+                    "attempts": 0,
+                    "max_iterations": self.settings.agent_max_iterations,
+                    "requires_user": requires_user,
+                    "complete": False,
+                    "exhausted": False,
+                    "user_confirmed": False,
+                    "candidate_changed": False,
+                    "round_index": 1,
+                },
+                config,
+            )
+            waiting_user = bool(state.get("__interrupt__"))
+            return thread_id, self._to_output(state), waiting_user
+        except Exception:
+            workflow_status = "error"
+            raise
+        finally:
+            if task_type == TaskType.CODE_DRAFT:
+                self._record_timing(
                     project_id,
-                    {
-                        "run_id": thread_id,
-                        "event": "selection_failed",
-                        "purpose": "initial",
-                        "error": exc.payload(),
-                    },
+                    thread_id,
+                    None,
+                    "workflow_total",
+                    workflow_started,
+                    status=workflow_status,
                 )
-                raise
-        config = self._config(thread_id)
-        state = await self._graph.ainvoke(
-            {
-                "run_id": thread_id,
-                "project_id": project_id,
-                "task_type": task_type.value,
-                "context": context,
-                "candidate": candidate or {},
-                "execution": {},
-                "issues": initial_issues or [],
-                "attempts": 0,
-                "max_iterations": self.settings.agent_max_iterations,
-                "requires_user": requires_user,
-                "complete": False,
-                "exhausted": False,
-                "user_confirmed": False,
-                "candidate_changed": False,
-            },
-            config,
+
+    def _with_routed_jngen_documents(
+        self,
+        context: dict[str, Any],
+        route: dict[str, Any],
+        *,
+        project_id: str,
+        run_id: str,
+    ) -> dict[str, Any]:
+        filenames = list(route["selected_filenames"])
+        route_method = str(route.get("route_method") or "confirmed_structure_tags")
+        selection = JngenDocumentSelection(
+            selected_documents=[
+                JngenDocumentChoice(
+                    filename=filename,
+                    reason=(
+                        "由已确认结构标签和版本化目录解析。"
+                        if route_method == "confirmed_structure_tags"
+                        else "由临时兼容的关键词路由选中。"
+                    ),
+                )
+                for filename in filenames
+            ],
+            selection_complete=True,
         )
-        waiting_user = bool(state.get("__interrupt__"))
-        return thread_id, self._to_output(state), waiting_user
+        prepared = dict(context)
+        documentation = self.jngen_documents.format_selected_documents(
+            self.jngen_documents.available_filenames(), selection
+        )
+        selected_characters = sum(
+            len(str(document.get("content") or ""))
+            for document in documentation["selected_documents"]
+        )
+        if selected_characters > self.settings.agent_jngen_document_context_chars:
+            raise AppError(
+                "JNGEN_DOCUMENT_CONTEXT_TOO_LARGE",
+                "混合结构所需的全部 jngen 文档超过上下文上限。",
+                stage=5,
+                details={
+                    "selected_tag_ids": route.get("selected_tag_ids", []),
+                    "selected_characters": selected_characters,
+                    "maximum_context_characters": (
+                        self.settings.agent_jngen_document_context_chars
+                    ),
+                },
+            )
+        prepared["jngen_documentation"] = {
+            **documentation,
+            "selection_method": route_method,
+            "catalog_version": route.get("catalog_version"),
+            "selected_tag_ids": route.get("selected_tag_ids", []),
+            "expanded_tag_ids": route.get("expanded_tag_ids", []),
+            "index_version": route.get("index_version"),
+            "matched_topics": route.get("matched_topics", []),
+            "selection_rounds": [],
+            "selection_termination": "route",
+        }
+        self.storage.append_agent4_document_selection(
+            project_id,
+            {
+                "run_id": run_id,
+                "event": "selection_finished",
+                "purpose": "initial",
+                "termination": "route",
+                "route_method": route_method,
+                "catalog_version": route.get("catalog_version"),
+                "selected_tag_ids": route.get("selected_tag_ids", []),
+                "expanded_tag_ids": route.get("expanded_tag_ids", []),
+                "index_version": route.get("index_version"),
+                "matched_topics": route.get("matched_topics", []),
+                "selected_filenames": filenames,
+            },
+        )
+        return prepared
 
     async def resume_confirmation(self, thread_id: str) -> dict[str, Any]:
         await self.start()
@@ -153,14 +295,30 @@ class LangGraphAgentRunner:
         return state
 
     async def _generate(self, state: AgentLoopState) -> dict[str, Any]:
-        output = await self.model.run(
-            TaskType(state["task_type"]),
-            "generate",
-            state["context"],
-            state.get("candidate", {}),
-            state.get("execution", {}),
-            state.get("issues", []),
-        )
+        started = perf_counter()
+        status = "ok"
+        try:
+            output = await self.model.run(
+                TaskType(state["task_type"]),
+                "generate",
+                state["context"],
+                state.get("candidate", {}),
+                state.get("execution", {}),
+                state.get("issues", []),
+            )
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            if TaskType(state["task_type"]) == TaskType.CODE_DRAFT:
+                self._record_timing(
+                    state["project_id"],
+                    state["run_id"],
+                    state.get("round_index", 1),
+                    "model_generation",
+                    started,
+                    status=status,
+                )
         issues = list(output.issues)
         return {
             "candidate": output.result or state.get("candidate", {}),
@@ -172,11 +330,17 @@ class LangGraphAgentRunner:
         }
 
     async def _verify(self, state: AgentLoopState) -> dict[str, Any]:
+        context = dict(state["context"])
+        if TaskType(state["task_type"]) == TaskType.CODE_DRAFT:
+            context["_agent4_timing"] = {
+                "run_id": state["run_id"],
+                "round": state.get("round_index", 1),
+            }
         candidate, execution = await self.verifier.verify(
             state["project_id"],
             TaskType(state["task_type"]),
             state.get("candidate", {}),
-            state["context"],
+            context,
         )
         execution = dict(execution)
         execution["verified_candidate_fingerprint"] = self._candidate_fingerprint(candidate)
@@ -187,21 +351,54 @@ class LangGraphAgentRunner:
         if (
             TaskType(state["task_type"]) == TaskType.CODE_DRAFT
             and not state.get("execution", {}).get("ok")
+            and self._should_refresh_jngen_documents(state.get("execution", {}))
         ):
-            context = await self._refresh_jngen_documents(
+            retrieval_started = perf_counter()
+            retrieval_status = "ok"
+            try:
+                context = await self._refresh_jngen_documents(
+                    context,
+                    state.get("execution", {}),
+                    project_id=state["project_id"],
+                    run_id=state["run_id"],
+                )
+            except Exception:
+                retrieval_status = "error"
+                raise
+            finally:
+                self._record_timing(
+                    state["project_id"],
+                    state["run_id"],
+                    state.get("round_index", 1),
+                    "retrieval",
+                    retrieval_started,
+                    status=retrieval_status,
+                    metadata={"purpose": "repair"},
+                )
+        review_started = perf_counter()
+        review_status = "ok"
+        try:
+            output = await self.model.run(
+                TaskType(state["task_type"]),
+                "review",
                 context,
-                state.get("execution", {}),
-                project_id=state["project_id"],
-                run_id=state["run_id"],
+                state.get("candidate", {}),
+                self._execution_feedback_for_model(state.get("execution", {})),
+                state.get("issues", []),
             )
-        output = await self.model.run(
-            TaskType(state["task_type"]),
-            "review",
-            context,
-            state.get("candidate", {}),
-            self._execution_feedback_for_model(state.get("execution", {})),
-            state.get("issues", []),
-        )
+        except Exception:
+            review_status = "error"
+            raise
+        finally:
+            if TaskType(state["task_type"]) == TaskType.CODE_DRAFT:
+                self._record_timing(
+                    state["project_id"],
+                    state["run_id"],
+                    state.get("round_index", 1),
+                    "review",
+                    review_started,
+                    status=review_status,
+                )
         attempts = state.get("attempts", 0)
         verified_fingerprint = state.get("execution", {}).get(
             "verified_candidate_fingerprint"
@@ -242,6 +439,11 @@ class LangGraphAgentRunner:
             "exhausted": exhausted,
             "candidate_changed": candidate_changed and not exhausted,
             "context": context,
+            "round_index": (
+                state.get("round_index", 1) + 1
+                if not complete and not exhausted
+                else state.get("round_index", 1)
+            ),
         }
 
     @staticmethod
@@ -353,7 +555,9 @@ class LangGraphAgentRunner:
                         "所选 jngen 文档正文超过 Agent4 上下文上限。",
                         stage=5,
                         details={
-                            "maximum_context_characters": self.settings.agent_jngen_document_context_chars,
+                            "maximum_context_characters": (
+                                self.settings.agent_jngen_document_context_chars
+                            ),
                             "selected_characters": selected_characters,
                         },
                     )
@@ -453,6 +657,8 @@ class LangGraphAgentRunner:
         feedback = {
             "ok": bool(execution.get("ok")),
             "message": str(execution.get("message") or ""),
+            "failure_category": execution.get("failure_category"),
+            "retrieval_required": bool(execution.get("retrieval_required")),
             "checks": [],
         }
         for check in list(execution.get("checks", []))[-8:]:
@@ -466,6 +672,11 @@ class LangGraphAgentRunner:
                 }
             feedback["checks"].append(bounded)
         return feedback
+
+    @staticmethod
+    def _should_refresh_jngen_documents(execution: dict[str, Any]) -> bool:
+        """Retrieve again only when deterministic verification found a doc gap."""
+        return bool(execution.get("retrieval_required"))
 
     @staticmethod
     def _execution_feedback_for_model(execution: dict[str, Any]) -> dict[str, Any]:
@@ -527,6 +738,29 @@ class LangGraphAgentRunner:
             separators=(",", ":"),
         ).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
+
+    def _record_timing(
+        self,
+        project_id: str,
+        run_id: str,
+        round_index: int | None,
+        segment: str,
+        started: float,
+        *,
+        status: str = "ok",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        entry: dict[str, Any] = {
+            "run_id": run_id,
+            "segment": segment,
+            "duration_ms": round((perf_counter() - started) * 1000, 3),
+            "status": status,
+        }
+        if round_index is not None:
+            entry["round"] = round_index
+        if metadata:
+            entry["metadata"] = metadata
+        self.storage.append_agent4_timing(project_id, entry)
 
     @staticmethod
     def _wait_user(state: AgentLoopState) -> dict[str, Any]:

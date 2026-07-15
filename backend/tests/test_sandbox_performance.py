@@ -10,7 +10,7 @@ import pytest
 
 from app.config import Settings
 from app.models import SandboxResult
-from app.services.sandbox import DockerSandbox
+from app.services.sandbox import DockerSandbox, GenerationJob
 
 
 def bare_sandbox(settings: Settings) -> DockerSandbox:
@@ -23,7 +23,7 @@ def bare_sandbox(settings: Settings) -> DockerSandbox:
 
 
 def test_runner_container_keeps_all_security_limits(tmp_path: Path) -> None:
-    settings = Settings(storage_root=tmp_path, model_mode="mock")
+    settings = Settings(storage_root=tmp_path)
     sandbox = bare_sandbox(settings)
     captured: dict = {}
 
@@ -70,7 +70,6 @@ def test_runner_container_keeps_all_security_limits(tmp_path: Path) -> None:
 def test_docker_request_timeout_outlives_largest_two_step_batch(tmp_path: Path) -> None:
     settings = Settings(
         storage_root=tmp_path,
-        model_mode="mock",
         runner_timeout_seconds=30,
         runner_batch_size=16,
     )
@@ -84,7 +83,7 @@ async def test_sync_runner_is_offloaded_and_limited_to_configured_concurrency(
     tmp_path: Path,
 ) -> None:
     sandbox = bare_sandbox(
-        Settings(storage_root=tmp_path, runner_concurrency=2, model_mode="mock")
+        Settings(storage_root=tmp_path, runner_concurrency=2)
     )
     active = 0
     maximum = 0
@@ -121,7 +120,7 @@ async def test_sync_runner_is_offloaded_and_limited_to_configured_concurrency(
 async def test_compile_cache_detects_source_changes_and_binary_tampering(
     tmp_path: Path,
 ) -> None:
-    settings = Settings(storage_root=tmp_path, model_mode="mock")
+    settings = Settings(storage_root=tmp_path)
     sandbox = bare_sandbox(settings)
     project_id = "a" * 32
     source = tmp_path / project_id / "generated" / "generator.cpp"
@@ -149,3 +148,41 @@ async def test_compile_cache_detects_source_changes_and_binary_tampering(
     assert first.ok and third.ok and fourth.ok
     assert second.stdout == "compile cache hit"
     assert compile_calls == 3
+
+
+@pytest.mark.asyncio
+async def test_generation_batch_serializes_case_and_whitelisted_runtime_arguments(
+    tmp_path: Path,
+) -> None:
+    sandbox = bare_sandbox(Settings(storage_root=tmp_path))
+    captured: list[str] = []
+
+    async def run_payload(command: list[str], _image: str) -> dict:
+        captured.extend(command)
+        return {
+            "results": [
+                {
+                    "output_file": "preview/abcdef123456.in",
+                    "result": {"ok": True, "exit_code": 0},
+                }
+            ]
+        }
+
+    sandbox._run_payload = run_payload  # type: ignore[method-assign]
+
+    await sandbox.generate_batch(
+        "a" * 32,
+        [
+            GenerationJob(
+                2,
+                17,
+                "preview/abcdef123456.in",
+                case_id=3,
+                runtime_arguments={"n_max": "100", "profile": "path"},
+            )
+        ],
+    )
+
+    assert captured[-1] == (
+        "2|3|17|preview/abcdef123456.in|n_max=100;profile=path"
+    )
