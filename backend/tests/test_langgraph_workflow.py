@@ -10,7 +10,7 @@ from conftest import DeterministicTestModel
 from app.config import Settings
 from app.errors import AppError
 from app.models import (
-    CodeDraft,
+    AGENT4_VERIFIER_REVISION,
     CodeRepairPatch,
     Confirmation,
     Counterexample,
@@ -20,22 +20,13 @@ from app.models import (
     ProjectCreate,
     ReportedDefect,
     SemanticAudit,
+    SubtaskPlanDraft,
     TargetedDefectCheck,
 )
-from app.services.agent_graphs import (
-    AgentGraphCoordinator,
-    _merge_implementation_mappings,
-)
-from app.services.candidate_verifier import AGENT4_VERIFIER_REVISION
-from app.services.counterexample_ledger import CounterexampleLedgerService
+from app.services.agent4_document_context import Agent4DocumentContext
+from app.services.agent_graphs import AgentGraphCoordinator
 from app.services.defects import stable_defect_id
-from app.services.jngen_document_context import JngenDocumentContext
 from app.services.project_service import ProjectService
-from app.services.proof_obligations import (
-    _parameter_affects_code,
-    implementation_mapping_issues,
-    resolve_implementation_mapping,
-)
 from app.services.structure_tag_catalog import StructureTagCatalog
 from app.storage import ProjectStorage
 
@@ -43,6 +34,14 @@ from app.storage import ProjectStorage
 def _context() -> dict[str, Any]:
     return {
         "workflow_revision": 1,
+        "input": {
+            "input_structure": {
+                "template": "第一行读取整数 n。",
+                "status": "confirmed",
+                "revision": 1,
+            },
+            "problem": {"samples": [{"input": "1\n", "output": ""}]},
+        },
         "confirmed_structure_tags": [
             {
                 "tag_id": "primitive.integer",
@@ -63,7 +62,7 @@ def _context() -> dict[str, Any]:
                         "parameters": [{"name": "n", "value": 10, "category": "size"}],
                     }
                 ],
-                "subtask_tags": [],
+                "additional_structure_tag_ids": [],
             }
         ],
     }
@@ -109,7 +108,6 @@ class SemanticRepairModel(DeterministicTestModel):
         )
         self.target_id = stable_defect_id(identity)
         self.report = ReportedDefect(
-            origin="candidate",
             identity=identity,
             message="生成逻辑没有保证子任务约束。",
             evidence={"symbol": "main"},
@@ -146,17 +144,55 @@ class SemanticRepairModel(DeterministicTestModel):
         target_defect: Any,
         execution: dict[str, Any],
     ) -> TargetedDefectCheck:
-        del context, candidate, execution
+        del context, execution
         self.recheck_calls.append(target_defect.defect_id)
         still_present = (
             not self.closes_target if target_defect.defect_id == self.target_id else False
         )
         if self.regress_known == target_defect.defect_id:
             still_present = True
+        evidence = None
+        if still_present:
+            source_field = {
+                "generator.cpp": "generator_code",
+                "validator.cpp": "validator_code",
+            }[target_defect.identity.target_file]
+            source = candidate[source_field]
+            evidence = {
+                "target_file": target_defect.identity.target_file,
+                "code_snippet": source[: min(len(source), 200)],
+                "rationale": "测试模型为仍存在的缺陷提供当前候选源码证据。",
+            }
         return TargetedDefectCheck(
             defect_id=target_defect.defect_id,
             still_present=still_present,
             message="仍存在" if still_present else "已关闭",
+            evidence=evidence,
+        )
+
+
+class StaleEvidenceRepairModel(SemanticRepairModel):
+    def __init__(self) -> None:
+        super().__init__(closes_target=False)
+
+    async def agent4_recheck(
+        self,
+        context: dict[str, Any],
+        candidate: dict[str, Any],
+        target_defect: Any,
+        execution: dict[str, Any],
+    ) -> TargetedDefectCheck:
+        del context, candidate, execution
+        self.recheck_calls.append(target_defect.defect_id)
+        return TargetedDefectCheck(
+            defect_id=target_defect.defect_id,
+            still_present=True,
+            message="错误地复用了修复前证据。",
+            evidence={
+                "target_file": target_defect.identity.target_file,
+                "code_snippet": "stale source excerpt that is absent",
+                "rationale": "这段证据不属于当前候选。",
+            },
         )
 
 
@@ -176,7 +212,6 @@ class UpstreamAuditModel(DeterministicTestModel):
         return SemanticAudit(
             defects=[
                 ReportedDefect(
-                    origin="upstream_contract",
                     identity=DefectIdentity(
                         category="UPSTREAM_CONTRACT_CONTRADICTION",
                         target_file="stage4_contract",
@@ -199,7 +234,7 @@ class FailGenerationOnceModel(DeterministicTestModel):
     def __init__(self) -> None:
         self.calls = 0
 
-    async def agent4_generate(
+    async def agent4_generate_generator(
         self, context: dict[str, Any], candidate: dict[str, Any]
     ) -> Any:
         self.calls += 1
@@ -209,7 +244,47 @@ class FailGenerationOnceModel(DeterministicTestModel):
                 "模型响应契约无效。",
                 details={"failure_kind": "schema_validation"},
             )
-        return await super().agent4_generate(context, candidate)
+        return await super().agent4_generate_generator(context, candidate)
+
+
+class Stage4CorrectionModel(DeterministicTestModel):
+    def __init__(self) -> None:
+        self.revision_issues: list[str] = []
+        self.revision_calls = 0
+
+    @staticmethod
+    def _plan(invalid: bool) -> dict[str, Any]:
+        return {
+            "subtasks": [
+                {
+                    "id": 1,
+                    "test_count": 1,
+                    "expected_complexity": "O(1)",
+                    "runtime_parameters": []
+                    if invalid
+                    else [
+                        {
+                            "case_id": 1,
+                            "parameters": [
+                                {"name": "n", "value": 1, "category": "size"}
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+
+    async def agent3_plan(self, context: dict[str, Any], candidate: dict[str, Any]) -> Any:
+        del context, candidate
+        return SubtaskPlanDraft.model_validate(self._plan(True))
+
+    async def agent3_revise(
+        self, context: dict[str, Any], candidate: dict[str, Any]
+    ) -> Any:
+        del candidate
+        self.revision_calls += 1
+        self.revision_issues = list(context["validation_issues"])
+        return SubtaskPlanDraft.model_validate(self._plan(False))
 
 
 async def _coordinator(
@@ -222,18 +297,52 @@ async def _coordinator(
     record = projects.create(
         ProjectCreate(problem_description="read n", solution_code="int main(){}", difficulty="easy")
     )
-    docs_root = Path(__file__).parents[1] / "app" / "jngen_doc_context"
-    catalog = StructureTagCatalog(docs_root)
+    app_root = Path(__file__).parents[1] / "app"
     coordinator = AgentGraphCoordinator(
         Settings(app_env="test", storage_root=storage.root),
         storage,
         model,
         verifier,
-        JngenDocumentContext(docs_root, catalog),
-        catalog,
+        Agent4DocumentContext(
+            app_root / "generator_context", app_root / "validator_context"
+        ),
     )
     await coordinator.start()
     return coordinator, storage, record.project_id
+
+
+@pytest.mark.asyncio
+async def test_agent3_performs_one_targeted_contract_revision(tmp_path: Path) -> None:
+    model = Stage4CorrectionModel()
+    coordinator, _storage, project_id = await _coordinator(
+        tmp_path, model, PassVerifier()
+    )
+    try:
+        _thread_id, output, waiting_user = await coordinator.run_agent3(
+            project_id,
+            {
+                "workflow_revision": 1,
+                "subtasks": [],
+                "confirmed_structure_tags": [
+                    {
+                        "tag_id": "primitive.integer",
+                        "applies_to": "n",
+                        "evidence": "输入包含整数 n。",
+                    }
+                ],
+                "structure_tag_catalog": StructureTagCatalog().model_view(),
+            },
+            {},
+            requires_user=True,
+        )
+    finally:
+        await coordinator.close()
+
+    assert waiting_user is True
+    assert output.confirmation == Confirmation.PASS
+    assert model.revision_calls == 1
+    assert any("缺少逐测试点运行时参数" in issue for issue in model.revision_issues)
+    assert len(output.result["subtasks"]) == 1
 
 
 @pytest.mark.asyncio
@@ -278,29 +387,30 @@ async def test_each_agent_has_an_independent_state_graph(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_stage_four_contract_preflight_stops_before_model_call(tmp_path: Path) -> None:
-    model = SemanticRepairModel(closes_target=True)
+async def test_agent4_does_not_expand_stage_four_into_a_contract_preflight(
+    tmp_path: Path,
+) -> None:
+    model = DeterministicTestModel()
     verifier = PassVerifier()
     coordinator, _storage, project_id = await _coordinator(tmp_path, model, verifier)
     invalid = _context()
     invalid["subtasks"][0]["runtime_parameters"] = []
     try:
-        with pytest.raises(AppError) as raised:
-            await coordinator.run_agent4(project_id, invalid, {}, requires_user=False)
+        _thread_id, output, _waiting = await coordinator.run_agent4(
+            project_id, invalid, {}, requires_user=False
+        )
     finally:
         await coordinator.close()
 
-    assert raised.value.code == "UPSTREAM_CONTRACT_INVALID"
-    assert raised.value.stage == 4
-    assert verifier.calls == 0
-    assert model.audit_calls == 0
+    assert output.confirmation == Confirmation.PASS
+    assert verifier.calls == 1
 
 
 @pytest.mark.asyncio
-async def test_stage_four_runtime_parameters_must_satisfy_arithmetic_constraints(
+async def test_agent4_ignores_stage_four_arithmetic_contracts(
     tmp_path: Path,
 ) -> None:
-    model = SemanticRepairModel(closes_target=True)
+    model = DeterministicTestModel()
     verifier = PassVerifier()
     coordinator, _storage, project_id = await _coordinator(tmp_path, model, verifier)
     invalid = _context()
@@ -309,35 +419,31 @@ async def test_stage_four_runtime_parameters_must_satisfy_arithmetic_constraints
         {"name": "m", "value": 90, "category": "size"}
     )
     try:
-        with pytest.raises(AppError) as raised:
-            await coordinator.run_agent4(project_id, invalid, {}, requires_user=False)
+        _thread_id, output, _waiting = await coordinator.run_agent4(
+            project_id, invalid, {}, requires_user=False
+        )
     finally:
         await coordinator.close()
 
-    assert raised.value.code == "UPSTREAM_CONTRACT_INVALID"
-    assert raised.value.stage == 4
-    assert "m = n*(n-1)/2" in str(raised.value.details)
-    assert verifier.calls == 0
-    assert model.audit_calls == 0
+    assert output.confirmation == Confirmation.PASS
+    assert verifier.calls == 1
 
 
 @pytest.mark.asyncio
-async def test_semantic_audit_returns_upstream_defect_without_repair(
+async def test_semantic_audit_cannot_return_project_to_an_upstream_stage(
     tmp_path: Path,
 ) -> None:
     model = UpstreamAuditModel()
     verifier = PassVerifier()
     coordinator, _storage, project_id = await _coordinator(tmp_path, model, verifier)
     try:
-        with pytest.raises(AppError) as raised:
-            await coordinator.run_agent4(
-                project_id, _context(), {}, requires_user=False
-            )
+        _thread_id, output, _waiting = await coordinator.run_agent4(
+            project_id, _context(), {}, requires_user=False
+        )
     finally:
         await coordinator.close()
 
-    assert raised.value.code == "UPSTREAM_CONTRACT_INVALID"
-    assert raised.value.stage == 4
+    assert output.confirmation == Confirmation.REVISE
     assert model.audit_calls == 1
     assert model.repair_calls == 0
 
@@ -412,6 +518,34 @@ async def test_targeted_recheck_closes_defect_without_second_open_audit(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_ungrounded_semantic_recheck_cannot_roll_back_current_candidate(
+    tmp_path: Path,
+) -> None:
+    model = StaleEvidenceRepairModel()
+    coordinator, storage, project_id = await _coordinator(tmp_path, model, PassVerifier())
+    try:
+        _thread, output, waiting = await coordinator.run_agent4(
+            project_id, _context(), {}, requires_user=False
+        )
+    finally:
+        await coordinator.close()
+
+    assert output.confirmation == Confirmation.PASS
+    assert waiting is False
+    assert storage.load_agent4_ledger(project_id)["counterexamples"][0]["status"] == "closed"
+    decisions = [
+        json.loads(line)
+        for line in (
+            storage.project_dir(project_id) / "logs" / "agent4-decisions.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+    ]
+    recheck = next(item for item in decisions if item["model_call_type"] == "targeted_recheck")
+    assert recheck["after"]["reported_still_present"] is True
+    assert recheck["after"]["accepted_still_present"] is False
+    assert recheck["after"]["evidence_grounded"] is False
+
+
+@pytest.mark.asyncio
 async def test_reintroduced_closed_defect_rolls_back_otherwise_successful_patch(
     tmp_path: Path,
 ) -> None:
@@ -435,6 +569,7 @@ async def test_reintroduced_closed_defect_rolls_back_otherwise_successful_patch(
     storage.save_agent4_ledger(
         project_id,
         CounterexampleLedger(
+            verifier_revision=AGENT4_VERIFIER_REVISION,
             counterexamples=[
                 Counterexample(
                     counterexample_id="case_" + "1" * 20,
@@ -498,94 +633,10 @@ def test_stable_defect_id_ignores_message_logs_and_line_numbers() -> None:
     )
 
 
-def test_mapping_rejects_parameter_that_is_only_read(tmp_path: Path) -> None:
-    docs_root = Path(__file__).parents[1] / "app" / "jngen_doc_context"
-    catalog = StructureTagCatalog(docs_root)
-    documents = JngenDocumentContext(docs_root, catalog).load_documents(["random.md"])
-    document = documents["selected_documents"][0]
-    obligation = {
-        "constraint_id": "subtask:1:case:1:parameter:n",
-        "scope": "subtask:1:case:1",
-        "severity": "blocker",
-        "verification_method": "static",
-        "requirement": "n 必须影响构造。",
-    }
-    submission = DeterministicTestModel._code_draft(
-        {
-            "subtasks": [],
-            "proof_obligations": [obligation],
-            "jngen_documentation": documents,
-        }
-    )
-    draft = CodeDraft(
-        generator_code=submission.generator_code,
-        validator_code=submission.validator_code,
-        proof_obligations=[obligation],
-        implementation_mapping=resolve_implementation_mapping(
-            submission.implementation_mapping,
-            documents["selected_documents"],
-        ),
-    )
-    draft.generator_code = draft.generator_code.replace(
-        "auto sample=Array::random(1,0,0);",
-        '(void)getOpt("n");\nauto sample=Array::random(1,0,0);',
-    )
-    draft.implementation_mapping[0].used_parameters = ["n"]
-    issues = implementation_mapping_issues(draft, {"random.md": document})
-
-    assert any("没有可验证的实际用途" in issue for issue in issues)
-
-
-def test_parameter_effect_accepts_assignment_after_declaration() -> None:
-    code = """
-int main() {
-    int n;
-    n = getOpt("n", 5);
-    auto graph = Graph::random(n, 7);
-}
-"""
-
-    assert _parameter_affects_code(code, "n") is True
-    assert _parameter_affects_code('(void)getOpt("n");', "n") is False
-
-
-def test_ledger_from_old_verifier_is_invalidated(tmp_path: Path) -> None:
-    storage = ProjectStorage(tmp_path)
-    project_id = "a" * 32
-    storage.save_agent4_ledger(
-        project_id,
-        {
-            "counterexamples": [{"stale": "old-verifier-result"}],
-            "last_valid_candidate_revision": "stale",
-        },
-    )
-    storage.save_agent4_last_valid_candidate(project_id, {"revision_id": "stale"})
-
-    ledger = CounterexampleLedgerService(storage).load(project_id)
-
-    assert ledger.verifier_revision == AGENT4_VERIFIER_REVISION
-    assert ledger.counterexamples == []
-    assert ledger.last_valid_candidate_revision is None
-    assert storage.load_agent4_ledger(project_id)["verifier_revision"] == (
-        AGENT4_VERIFIER_REVISION
-    )
-    assert storage.load_agent4_last_valid_candidate(project_id) is None
-
-
-def test_incremental_mapping_patch_retains_untouched_constraints() -> None:
-    current = [
-        {"constraint_id": "constraint:a", "test_strategy": "old-a"},
-        {"constraint_id": "constraint:b", "test_strategy": "old-b"},
-        {"constraint_id": "constraint:obsolete", "test_strategy": "remove"},
-    ]
-    merged = _merge_implementation_mappings(
-        current,
-        [{"constraint_id": "constraint:a", "test_strategy": "new-a"}],
-        ["constraint:obsolete"],
-        ["constraint:a", "constraint:b"],
+def test_agent4_has_no_proof_mapping_gate() -> None:
+    source = (Path(__file__).parents[1] / "app" / "services" / "candidate_verifier.py").read_text(
+        encoding="utf-8"
     )
 
-    assert merged == [
-        {"constraint_id": "constraint:a", "test_strategy": "new-a"},
-        {"constraint_id": "constraint:b", "test_strategy": "old-b"},
-    ]
+    assert "implementation_mapping" not in source
+    assert "proof_obligation" not in source

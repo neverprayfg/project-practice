@@ -43,11 +43,6 @@ async def get_model_configuration(request: Request) -> dict:
     return request.app.state.model_configuration.public_view()
 
 
-@router.get("/api/structure-tags")
-async def get_structure_tags(request: Request) -> dict:
-    return request.app.state.tag_catalog.public_view()
-
-
 @router.put("/api/settings/model")
 async def update_model_configuration(payload: ModelConfigurationUpdate, request: Request) -> dict:
     pipeline = request.app.state.pipeline
@@ -80,6 +75,16 @@ async def create_project(payload: ProjectCreate, request: Request) -> dict:
     return request.app.state.projects.get(record.project_id).model_dump(mode="json")
 
 
+@router.get("/api/projects")
+async def list_projects(request: Request) -> dict:
+    return {
+        "projects": [
+            record.model_dump(mode="json")
+            for record in request.app.state.projects.list()
+        ]
+    }
+
+
 @router.get("/api/projects/{project_id}")
 async def get_project(project_id: str, request: Request) -> dict:
     storage = request.app.state.storage
@@ -90,8 +95,28 @@ async def get_project(project_id: str, request: Request) -> dict:
         "input": storage.load_input(project_id).model_dump(mode="json"),
         "subtasks": (drafts["4"] or {}).get("subtasks", []),
         "drafts": drafts,
-        "structure_tag_catalog": request.app.state.tag_catalog.public_view(),
     }
+
+
+@router.delete("/api/projects/{project_id}")
+async def delete_project(project_id: str, request: Request) -> dict:
+    projects = request.app.state.projects
+    projects.get(project_id)
+    pipeline = request.app.state.pipeline
+    lock = pipeline.project_lock(project_id)
+    if lock.locked():
+        raise AppError(
+            "PROJECT_BUSY",
+            "项目正在执行任务，暂时不能删除。",
+            status_code=409,
+        )
+    async with lock:
+        await request.app.state.agent_graphs.delete_project_checkpoints(project_id)
+        deleted = projects.delete(project_id)
+        export_root = request.app.state.settings.export_root
+        if export_root is not None:
+            (export_root / f"{project_id}-dataset.zip").unlink(missing_ok=True)
+    return {"deleted_project_id": deleted.project_id}
 
 
 @router.get("/api/projects/{project_id}/stage5/timings")
@@ -160,7 +185,7 @@ async def update_draft(project_id: str, stage: int, payload: DraftUpdate, reques
 
 @router.post("/api/projects/{project_id}/stages/{stage}/run")
 async def run_stage(
-    project_id: str, stage: int, payload: StageRunRequest, request: Request
+    project_id: str, stage: int, _payload: StageRunRequest, request: Request
 ) -> dict:
     lock = request.app.state.pipeline.project_lock(project_id)
     if lock.locked():
@@ -170,7 +195,7 @@ async def run_stage(
             stage=stage,
             status_code=409,
         )
-    return await request.app.state.pipeline.run_stage(project_id, stage, payload.task_type)
+    return await request.app.state.pipeline.run_stage(project_id, stage)
 
 
 @router.post("/api/projects/{project_id}/stages/{stage}/confirm")

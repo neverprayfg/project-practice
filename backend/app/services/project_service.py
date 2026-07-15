@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -8,6 +9,8 @@ from pydantic import ValidationError
 
 from app.errors import AppError
 from app.models import (
+    AGENT4_GRAPH_ID,
+    AGENT4_VERIFIER_REVISION,
     CodeDraft,
     CounterexampleLedger,
     GlobalInput,
@@ -21,7 +24,6 @@ from app.models import (
     StageStatus,
     SubtaskPlanDraft,
 )
-from app.services.structure_tag_catalog import StructureTagCatalog
 from app.storage import ProjectStorage
 
 
@@ -29,10 +31,8 @@ class ProjectService:
     def __init__(
         self,
         storage: ProjectStorage,
-        tag_catalog: StructureTagCatalog | None = None,
     ) -> None:
         self.storage = storage
-        self.tag_catalog = tag_catalog or StructureTagCatalog()
 
     def create(self, payload: ProjectCreate) -> ProjectRecord:
         record = ProjectRecord(
@@ -52,6 +52,15 @@ class ProjectService:
 
     def get(self, project_id: str) -> ProjectRecord:
         return self.storage.load_record(project_id)
+
+    def list(self) -> list[ProjectRecord]:
+        records = [self.get(project_id) for project_id in self.storage.project_ids()]
+        return sorted(records, key=lambda record: record.updated_at, reverse=True)
+
+    def delete(self, project_id: str) -> ProjectRecord:
+        record = self.get(project_id)
+        self.storage.delete_project(project_id)
+        return record
 
     def recover_interrupted_checks(self) -> list[str]:
         """Release checking states left behind by a process restart or crash."""
@@ -83,6 +92,84 @@ class ProjectService:
             self.storage.save_record(record)
             recovered.append(project_id)
         return recovered
+
+    def invalidate_obsolete_agent4_state(self) -> list[str]:
+        """Discard state from older Agent4 graphs instead of interpreting it."""
+
+        migrated: list[str] = []
+        architecture = {
+            "graph_id": AGENT4_GRAPH_ID,
+            "verifier_revision": AGENT4_VERIFIER_REVISION,
+        }
+        for project_id in self.storage.project_ids():
+            project_dir = self.storage.project_dir(project_id)
+            marker_path = project_dir / "state" / "agent4-architecture.json"
+            try:
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                marker = None
+            if marker == architecture:
+                continue
+
+            record = self.get(project_id)
+            structure_path = project_dir / "state" / "input_structure.json"
+            if structure_path.is_file():
+                try:
+                    raw_structure = json.loads(structure_path.read_text(encoding="utf-8"))
+                    current_structure = InputStructureDraft.model_validate(
+                        {
+                            "template": raw_structure.get("template"),
+                            "issues": raw_structure.get("issues", []),
+                        }
+                    )
+                    self.storage.write_json(
+                        structure_path,
+                        current_structure.model_dump(mode="json"),
+                    )
+                except (ValidationError, json.JSONDecodeError, OSError, AttributeError):
+                    structure_path.unlink(missing_ok=True)
+            plan_path = project_dir / "state" / "subtask_plan.json"
+            plan_is_current = False
+            if plan_path.is_file():
+                try:
+                    SubtaskPlanDraft.model_validate_json(plan_path.read_text(encoding="utf-8"))
+                    plan_is_current = True
+                except (ValidationError, OSError):
+                    plan_path.unlink(missing_ok=True)
+
+            self.storage.invalidate_downstream_artifacts(project_id, Stage.SUBTASK_PLAN)
+            self._invalidate_downstream(record, Stage.SUBTASK_PLAN)
+            record.stage_threads.pop(int(Stage.SUBTASK_PLAN), None)
+            record.failed_stage_threads.pop(int(Stage.SUBTASK_PLAN), None)
+            if not plan_is_current and int(record.current_stage) >= int(Stage.SUBTASK_PLAN):
+                stage4 = record.stages[int(Stage.SUBTASK_PLAN)]
+                stage4.status = StageStatus.DRAFT
+                stage4.ai_confirmed = False
+                stage4.user_confirmed = False
+                stage4.issues = ["阶段四计划不符合当前配置格式，请重新运行 AI 检查。"]
+                stage4.updated_at = datetime.now(UTC)
+                record.current_stage = Stage.SUBTASK_PLAN
+                record.subtasks_revision += 1
+            elif (
+                plan_is_current
+                and record.stages[int(Stage.SUBTASK_PLAN)].status == StageStatus.PASSED
+                and int(record.current_stage) >= int(Stage.CODE_DRAFT)
+            ):
+                record.current_stage = Stage.CODE_DRAFT
+
+            record.workflow_revision += 1
+            record.code_input_revision = None
+            record.code_subtasks_revision = None
+            record.generated_subtasks = []
+            record.generation_complete = False
+            record.build_complete = False
+            record.export_ready = False
+            record.last_error = None
+            record.updated_at = datetime.now(UTC)
+            self.storage.save_record(record)
+            self.storage.write_json(marker_path, architecture)
+            migrated.append(project_id)
+        return migrated
 
     def update_solution(self, project_id: str, payload: SolutionUpdate) -> ProjectRecord:
         record = self.get(project_id)
@@ -182,13 +269,12 @@ class ProjectService:
     @staticmethod
     def _draft_content(stage: int, draft: dict[str, Any]) -> dict[str, Any]:
         fields = {
-            Stage.INPUT_STRUCTURE: ("template", "structure_tags"),
+            Stage.INPUT_STRUCTURE: ("template",),
             Stage.SUBTASK_PLAN: ("subtasks",),
             Stage.CODE_DRAFT: (
+                "format_contract_id",
                 "generator_code",
                 "validator_code",
-                "proof_obligations",
-                "implementation_mapping",
             ),
         }[Stage(stage)]
         return {field: draft.get(field) for field in fields}
@@ -280,7 +366,6 @@ class ProjectService:
         elif stage == Stage.CODE_DRAFT:
             record.code_input_revision = record.input_revision
             record.code_subtasks_revision = record.subtasks_revision
-            self.storage.clear_agent4_feedback(project_id)
         record.updated_at = datetime.now(UTC)
         self.storage.save_record(record)
         return record
@@ -405,15 +490,6 @@ class ProjectService:
         try:
             if stage == Stage.INPUT_STRUCTURE:
                 model = InputStructureDraft.model_validate(draft)
-                if model.structure_tags:
-                    tag_issues = self.tag_catalog.validate_structure_tags(model.structure_tags)
-                    if tag_issues and not allow_tag_review:
-                        raise AppError(
-                            "INVALID_STRUCTURE_TAGS",
-                            "阶段三结构标签需要复核。",
-                            stage=stage,
-                            details={"issues": tag_issues},
-                        )
                 return model.model_dump(mode="json")
             if stage == Stage.SUBTASK_PLAN:
                 model = SubtaskPlanDraft.model_validate(draft)
@@ -425,22 +501,6 @@ class ProjectService:
                         stage=stage,
                         status_code=409,
                     )
-                global_tag_ids = [
-                    str(item["tag_id"])
-                    for item in structure.get("structure_tags", [])
-                    if isinstance(item, dict) and item.get("tag_id")
-                ]
-                for subtask in model.subtasks:
-                    tag_issues = self.tag_catalog.validate_tag_ids(
-                        [*global_tag_ids, *subtask.subtask_tags]
-                    )
-                    if tag_issues and not allow_tag_review:
-                        raise AppError(
-                            "INVALID_SUBTASK_TAGS",
-                            f"子任务 {subtask.id} 的结构标签需要复核。",
-                            stage=stage,
-                            details={"issues": tag_issues},
-                        )
                 return model.model_dump(mode="json")
             if stage == Stage.CODE_DRAFT:
                 return CodeDraft.model_validate(draft).model_dump(mode="json")

@@ -13,23 +13,28 @@ from uuid import uuid4
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
+from pydantic import ValidationError
 
 from app.config import Settings
 from app.errors import AppError
 from app.models import (
+    AGENT4_GRAPH_ID,
+    AGENT4_VERIFIER_REVISION,
     AgentDecisionEvent,
     CodeDraft,
     Confirmation,
     CounterexampleLedger,
     Defect,
+    GlobalInput,
     SemanticAudit,
+    TargetedDefectCheck,
     WorkflowOutput,
 )
+from app.services.agent4_document_context import Agent4DocumentContext
 from app.services.agent_validators import Agent1Validator, Agent2Validator, Agent3Validator
-from app.services.candidate_verifier import (
-    AGENT4_VERIFIER_REVISION,
-    Agent4CandidateVerifier,
-)
+from app.services.candidate_verifier import Agent4CandidateVerifier
+from app.services.code_candidate import candidate_revision
+from app.services.code_format_contract import build_input_format_contract
 from app.services.counterexample_ledger import CounterexampleLedgerService
 from app.services.defects import (
     VALIDATION_LEVELS,
@@ -38,14 +43,7 @@ from app.services.defects import (
     stable_defect_id,
     verification_summary,
 )
-from app.services.jngen_document_context import JngenDocumentContext
 from app.services.model_client import AgentModel
-from app.services.proof_obligations import (
-    Agent4ContractPreflight,
-    candidate_revision,
-    resolve_implementation_mapping,
-)
-from app.services.structure_tag_catalog import StructureTagCatalog
 from app.storage import ProjectStorage
 
 
@@ -72,6 +70,7 @@ class Agent3State(TypedDict, total=False):
     context: dict[str, Any]
     candidate: dict[str, Any]
     issues: list[str]
+    revision_attempted: bool
     complete: bool
     requires_user: bool
     user_confirmed: bool
@@ -88,7 +87,6 @@ class Agent4State(TypedDict, total=False):
     execution: dict[str, Any]
     defects: list[dict[str, Any]]
     issues: list[str]
-    proof_obligations: list[dict[str, Any]]
     ledger: dict[str, Any]
     target_defect: dict[str, Any]
     attempted_defect_ids: list[str]
@@ -132,7 +130,18 @@ class Agent1Graph:
 
     async def _normalize(self, state: Agent1State) -> dict[str, Any]:
         result = await self.model.agent1_normalize(state["context"], state.get("candidate", {}))
-        return {"candidate": result.model_dump(mode="json")}
+        authoritative = GlobalInput.model_validate(
+            state.get("candidate") or state["context"]["input"]
+        )
+        normalized_problem = authoritative.problem.model_copy(
+            update={
+                "input_description": result.input_description,
+                "output_description": result.output_description,
+                "samples": result.samples,
+            }
+        )
+        candidate = authoritative.model_copy(update={"problem": normalized_problem})
+        return {"candidate": candidate.model_dump(mode="json")}
 
     def _validate(self, state: Agent1State) -> dict[str, Any]:
         candidate, issues = self.validator.verify(state["candidate"], state["context"])
@@ -214,14 +223,16 @@ class Agent3Graph:
         builder = StateGraph(Agent3State)
         builder.add_node("plan_subtasks", self._plan)
         builder.add_node("validate_contract", self._validate)
+        builder.add_node("revise_contract", self._revise)
         builder.add_node("wait_user", self._wait_user)
         builder.add_edge(START, "plan_subtasks")
         builder.add_edge("plan_subtasks", "validate_contract")
         builder.add_conditional_edges(
             "validate_contract",
             self._route_after_validation,
-            {"wait_user": "wait_user", "end": END},
+            {"wait_user": "wait_user", "revise": "revise_contract", "end": END},
         )
+        builder.add_edge("revise_contract", "validate_contract")
         builder.add_edge("wait_user", END)
         self.graph = builder.compile(checkpointer=saver)
 
@@ -240,6 +251,7 @@ class Agent3Graph:
                 "context": context,
                 "candidate": candidate,
                 "issues": [],
+                "revision_attempted": False,
                 "requires_user": requires_user,
                 "complete": False,
                 "user_confirmed": False,
@@ -254,16 +266,34 @@ class Agent3Graph:
             raise AppError("CONFIRMATION_FAILED", "Agent3 未记录用户确认。", status_code=409)
 
     async def _plan(self, state: Agent3State) -> dict[str, Any]:
+        existing = state.get("candidate") or {}
+        if existing:
+            return {"candidate": existing}
         result = await self.model.agent3_plan(state["context"], state.get("candidate", {}))
-        return {"candidate": result.model_dump(mode="json", exclude={"issues"})}
+        first = result.subtasks[0].model_copy(update={"id": 1})
+        initial = result.model_copy(update={"subtasks": [first]})
+        return {"candidate": initial.model_dump(mode="json", exclude={"issues"})}
 
     def _validate(self, state: Agent3State) -> dict[str, Any]:
         candidate, issues = self.validator.verify(state["candidate"], state["context"])
         return {"candidate": candidate, "issues": issues, "complete": not issues}
 
+    async def _revise(self, state: Agent3State) -> dict[str, Any]:
+        revision_context = {
+            **state["context"],
+            "validation_issues": list(state.get("issues", [])),
+        }
+        result = await self.model.agent3_revise(revision_context, state["candidate"])
+        return {
+            "candidate": result.model_dump(mode="json", exclude={"issues"}),
+            "revision_attempted": True,
+        }
+
     @staticmethod
     def _route_after_validation(state: Agent3State) -> str:
-        return "wait_user" if state.get("complete") and state.get("requires_user") else "end"
+        if state.get("complete"):
+            return "wait_user" if state.get("requires_user") else "end"
+        return "end" if state.get("revision_attempted") else "revise"
 
     @staticmethod
     def _wait_user(state: Agent3State) -> dict[str, Any]:
@@ -278,8 +308,7 @@ class Agent4Graph:
         storage: ProjectStorage,
         model: AgentModel,
         verifier: Agent4CandidateVerifier,
-        documents: JngenDocumentContext,
-        preflight: Agent4ContractPreflight,
+        documents: Agent4DocumentContext,
         ledger_service: CounterexampleLedgerService,
         saver: AsyncSqliteSaver,
     ) -> None:
@@ -288,10 +317,8 @@ class Agent4Graph:
         self.model = model
         self.verifier = verifier
         self.documents = documents
-        self.preflight = preflight
         self.ledger_service = ledger_service
         builder = StateGraph(Agent4State)
-        builder.add_node("contract_preflight", self._contract_preflight)
         builder.add_node("prepare_documents", self._prepare_documents)
         builder.add_node("generate_candidate", self._generate_candidate)
         builder.add_node("verify_candidate", self._verify_candidate)
@@ -302,8 +329,7 @@ class Agent4Graph:
         builder.add_node("evaluate_progress", self._evaluate_progress)
         builder.add_node("approve", self._approve)
         builder.add_node("wait_user", self._wait_user)
-        builder.add_edge(START, "contract_preflight")
-        builder.add_edge("contract_preflight", "prepare_documents")
+        builder.add_edge(START, "prepare_documents")
         builder.add_conditional_edges(
             "prepare_documents",
             self._route_after_prepare,
@@ -358,12 +384,30 @@ class Agent4Graph:
         requires_user: bool,
         thread_id: str | None = None,
     ) -> tuple[str, WorkflowOutput, bool]:
-        thread_id = thread_id or _thread_id(project_id, "agent4", context)
+        if candidate:
+            try:
+                candidate = CodeDraft.model_validate(candidate).model_dump(mode="json")
+            except ValidationError as exc:
+                raise AppError(
+                    "AGENT4_STATE_INCOMPATIBLE",
+                    "已有阶段五候选不符合当前严格契约；旧候选不会被重新解释或兼容。",
+                    stage=5,
+                    status_code=409,
+                ) from exc
+        thread_id = thread_id or _thread_id(project_id, AGENT4_GRAPH_ID, context)
+        if not _is_current_agent4_thread(thread_id):
+            raise AppError(
+                "AGENT4_CHECKPOINT_INCOMPATIBLE",
+                "旧阶段五 checkpoint 不会被当前 Agent4 图恢复或兼容。",
+                stage=5,
+                status_code=409,
+                details={"thread_id": thread_id, "required_graph": AGENT4_GRAPH_ID},
+            )
         initial_revision = candidate_revision(candidate) if candidate else "uninitialized"
-        ledger = self.ledger_service.load(project_id)
         started = perf_counter()
         status = "ok"
         try:
+            ledger = self.ledger_service.load(project_id)
             state = await self.graph.ainvoke(
                 {
                     "run_id": thread_id,
@@ -376,7 +420,6 @@ class Agent4Graph:
                     "execution": {},
                     "defects": [],
                     "issues": [],
-                    "proof_obligations": [],
                     "ledger": ledger.model_dump(mode="json"),
                     "attempted_defect_ids": [],
                     "semantic_audit_done": False,
@@ -415,6 +458,14 @@ class Agent4Graph:
         return thread_id, self._output(state), bool(state.get("__interrupt__"))
 
     async def retry(self, thread_id: str) -> tuple[str, WorkflowOutput, bool]:
+        if not _is_current_agent4_thread(thread_id):
+            raise AppError(
+                "AGENT4_CHECKPOINT_INCOMPATIBLE",
+                "旧阶段五 checkpoint 不会被当前 Agent4 图恢复或兼容。",
+                stage=5,
+                status_code=409,
+                details={"thread_id": thread_id, "required_graph": AGENT4_GRAPH_ID},
+            )
         started = perf_counter()
         status = "ok"
         try:
@@ -458,123 +509,145 @@ class Agent4Graph:
         return output
 
     async def resume(self, thread_id: str) -> None:
+        if not _is_current_agent4_thread(thread_id):
+            raise AppError(
+                "AGENT4_CHECKPOINT_INCOMPATIBLE",
+                "旧阶段五 checkpoint 不会被当前 Agent4 图恢复或兼容。",
+                stage=5,
+                status_code=409,
+                details={"thread_id": thread_id, "required_graph": AGENT4_GRAPH_ID},
+            )
         state = await self.graph.ainvoke(Command(resume=True), _config(thread_id))
         if not state.get("user_confirmed"):
             raise AppError("CONFIRMATION_FAILED", "Agent4 未记录用户确认。", status_code=409)
 
-    def _contract_preflight(self, state: Agent4State) -> dict[str, Any]:
-        obligations, issues = self.preflight.inspect(state["context"])
-        if issues:
-            self._decision(
-                state,
-                state["candidate_revision"],
-                decision="stopped",
-                reason="阶段三/四契约预检失败，阶段五未进入生成或修复循环。",
-                after={"issues": issues},
-            )
-            raise AppError(
-                "UPSTREAM_CONTRACT_INVALID",
-                "阶段三/四契约存在矛盾或缺失，阶段五未启动。",
-                stage=4,
-                status_code=409,
-                details={"issues": issues},
-            )
-        context = dict(state["context"])
-        context["proof_obligations"] = [item.model_dump(mode="json") for item in obligations]
-        return {
-            "context": context,
-            "proof_obligations": [item.model_dump(mode="json") for item in obligations],
-        }
-
     def _prepare_documents(self, state: Agent4State) -> dict[str, Any]:
         started = perf_counter()
-        route = self.documents.route_documents(
-            state["context"], self.settings.agent_jngen_document_context_chars
-        )
-        if route is None:
-            raise AppError(
-                "STRUCTURE_TAG_REVIEW_REQUIRED",
-                "阶段三尚无已确认结构标签，请返回阶段三复核。",
-                stage=3,
-                status_code=409,
-            )
-        documentation = self.documents.load_documents(list(route["selected_filenames"]))
-        documentation.update(
-            {
-                "catalog_version": route.get("catalog_version"),
-                "global_tag_ids": route.get("global_tag_ids", []),
-                "subtask_tag_ids": route.get("subtask_tag_ids", []),
-                "selected_tag_ids": route.get("selected_tag_ids", []),
-                "expanded_tag_ids": route.get("expanded_tag_ids", []),
-            }
-        )
+        documentation = self.documents.load_all_documents()
+        format_contract = build_input_format_contract(state["context"])
         context = dict(state["context"])
-        context.pop("structure_tag_catalog", None)
-        context["jngen_documentation"] = documentation
+        context["agent4_library_context_bundle"] = documentation
+        context["input_format_contract"] = format_contract.model_dump(mode="json")
         context["_agent4_timing"] = {"run_id": state["run_id"], "round": 1}
-        cache = self.storage.load_agent4_cache(state["project_id"])
-        cache.setdefault("documents", {})[ledger_digest(list(route["selected_filenames"]))] = {
-            "selected_filenames": route["selected_filenames"],
-            "digests": {
-                item["filename"]: item["digest"] for item in documentation["selected_documents"]
-            },
-        }
-        self.storage.save_agent4_cache(state["project_id"], cache)
-        self.storage.append_agent4_document_selection(
-            state["project_id"],
-            {
-                "run_id": state["run_id"],
-                "event": "initial_indexed_selection",
-                "selected_filenames": route["selected_filenames"],
-                "document_digests": {
-                    item["filename"]: item["digest"] for item in documentation["selected_documents"]
-                },
+        self._timing(
+            state,
+            "retrieval",
+            started,
+            metadata={
+                "purpose": "complete_document_load",
+                "document_count": documentation["document_count"],
+                "total_characters": documentation["total_characters"],
             },
         )
-        self._timing(state, "retrieval", started, metadata={"purpose": "initial"})
         return {"context": context}
 
     async def _generate_candidate(self, state: Agent4State) -> dict[str, Any]:
         started = perf_counter()
-        try:
-            generated = await self.model.agent4_generate(
-                state["context"], state.get("candidate", {})
-            )
-        except AppError as exc:
-            self._decision(
-                state,
-                state["candidate_revision"],
-                model_call_type="generation",
-                decision="stopped",
-                reason="初始生成的模型响应未通过协议校验，未形成候选版本。",
-                after={"model_error": exc.payload()},
-            )
-            self._timing(state, "model_generation", started, status="error")
-            raise
-        except Exception:
-            self._timing(state, "model_generation", started, status="error")
-            raise
-        self._timing(state, "model_generation", started)
-        candidate = {
-            "generator_code": generated.generator_code,
-            "validator_code": generated.validator_code,
-            "proof_obligations": state["proof_obligations"],
-            "implementation_mapping": [
-                item.model_dump(mode="json")
-                for item in resolve_implementation_mapping(
-                    generated.implementation_mapping,
-                    state["context"]["jngen_documentation"]["selected_documents"],
+        results = await asyncio.gather(
+            self.model.agent4_generate_generator(
+                _context_for_code_role(state["context"], "generator"),
+                state.get("candidate", {}),
+            ),
+            self.model.agent4_generate_validator(
+                _context_for_code_role(state["context"], "validator"),
+                state.get("candidate", {}),
+            ),
+            return_exceptions=True,
+        )
+        roles = ("generator", "validator")
+        failures = [
+            (role, result)
+            for role, result in zip(roles, results, strict=True)
+            if isinstance(result, Exception)
+        ]
+        if failures:
+            for role, error in failures:
+                self._decision(
+                    state,
+                    state["candidate_revision"],
+                    model_call_type=f"{role}_generation",
+                    decision="stopped",
+                    reason=f"{role} 初始生成响应未通过协议校验，未形成联合候选。",
+                    after={
+                        "model_error": error.payload()
+                        if isinstance(error, AppError)
+                        else {"error_type": type(error).__name__}
+                    },
                 )
-            ],
+            self._timing(
+                state,
+                "model_generation",
+                started,
+                status="error",
+                metadata={"parallel_calls": 2, "failed_roles": [item[0] for item in failures]},
+            )
+            raise failures[0][1]
+
+        generated_generator, generated_validator = results
+        expected_contract_id = state["context"]["input_format_contract"]["format_contract_id"]
+        returned_contract_ids = {
+            "generator": generated_generator.format_contract_id,
+            "validator": generated_validator.format_contract_id,
+        }
+        mismatched_roles = [
+            role
+            for role, contract_id in returned_contract_ids.items()
+            if contract_id != expected_contract_id
+        ]
+        if mismatched_roles:
+            for role in mismatched_roles:
+                self._decision(
+                    state,
+                    state["candidate_revision"],
+                    model_call_type=f"{role}_generation",
+                    decision="stopped",
+                    reason=f"{role} 未遵守后端冻结的输入格式契约。",
+                    after={
+                        "expected_format_contract_id": expected_contract_id,
+                        "returned_format_contract_id": returned_contract_ids[role],
+                    },
+                )
+            self._timing(
+                state,
+                "model_generation",
+                started,
+                status="error",
+                metadata={"parallel_calls": 2, "format_mismatch_roles": mismatched_roles},
+            )
+            raise AppError(
+                "FORMAT_CONTRACT_MISMATCH",
+                "generator 或 validator 未遵守冻结的输入格式契约。",
+                stage=5,
+                details={
+                    "expected_format_contract_id": expected_contract_id,
+                    "returned_format_contract_ids": returned_contract_ids,
+                },
+            )
+
+        candidate = {
+            "format_contract_id": expected_contract_id,
+            "generator_code": generated_generator.generator_code,
+            "validator_code": generated_validator.validator_code,
         }
         revision = candidate_revision(candidate)
-        self._decision(
+        for role, modified_file in (
+            ("generator", "generator.cpp"),
+            ("validator", "validator.cpp"),
+        ):
+            self._decision(
+                state,
+                revision,
+                model_call_type=f"{role}_generation",
+                decision="observed",
+                reason=f"并行生成 {modified_file} 并合入联合候选，尚待确定性验证。",
+                modified_files=[modified_file],
+                after={"format_contract_id": expected_contract_id},
+            )
+        self._timing(
             state,
-            revision,
-            model_call_type="generation",
-            decision="observed",
-            reason="生成首个候选，尚待确定性验证。",
-            modified_files=["generator.cpp", "validator.cpp", "implementation_mapping"],
+            "model_generation",
+            started,
+            metadata={"parallel_calls": 2, "roles": list(roles)},
         )
         return {"candidate": candidate, "candidate_revision": revision}
 
@@ -602,15 +675,11 @@ class Agent4Graph:
             after={
                 **verification_summary(defects, level),
                 "covered_historical_defect_ids": sorted(covered_ids),
-                "history_replay_complete": execution.get(
-                    "history_replay_complete", False
-                ),
+                "history_replay_complete": execution.get("history_replay_complete", False),
             },
             decision="observed",
             reason=(
-                "候选确定性验证通过。"
-                if execution.get("ok")
-                else "候选确定性验证发现阻断缺陷。"
+                "候选确定性验证通过。" if execution.get("ok") else "候选确定性验证发现阻断缺陷。"
             ),
         )
         return {
@@ -631,7 +700,7 @@ class Agent4Graph:
             if item.defect.validation_level == "semantic"
         ]
         audit_context = {
-            **state["context"],
+            **_context_for_review(state["context"], ("generator", "validator")),
             "known_semantic_defects": known_semantic,
         }
         try:
@@ -653,32 +722,6 @@ class Agent4Graph:
             self._timing(state, "semantic_audit", started, status="error")
             raise
         self._timing(state, "semantic_audit", started)
-        upstream_reports = [
-            report
-            for report in audit.defects
-            if report.origin == "upstream_contract" and report.severity == "blocker"
-        ]
-        if upstream_reports:
-            issues = [report.message for report in upstream_reports]
-            self._decision(
-                state,
-                state["candidate_revision"],
-                model_call_type="semantic_audit",
-                decision="stopped",
-                reason="只读语义审查发现上游契约矛盾，未进入代码修复节点。",
-                after={
-                    "upstream_contract_defects": [
-                        report.model_dump(mode="json") for report in upstream_reports
-                    ]
-                },
-            )
-            raise AppError(
-                "UPSTREAM_CONTRACT_INVALID",
-                "阶段三/四契约存在语义矛盾，阶段五未修改代码。",
-                stage=4,
-                status_code=409,
-                details={"issues": issues},
-            )
         semantic_defects = self._normalize_audit(audit)
         deterministic = [
             Defect.model_validate(item)
@@ -732,17 +775,25 @@ class Agent4Graph:
             )
             return {"stopped": True, "stop_reason": reason}
         target = blockers[0]
+        if target.identity.target_file not in {
+            "generator.cpp",
+            "validator.cpp",
+        }:
+            reason = (
+                f"缺陷 {target.defect_id} 的目标 {target.identity.target_file} 不属于 Agent4 "
+                "可修改范围，已停止且未调用修复模型。"
+            )
+            self._decision(
+                state,
+                state["candidate_revision"],
+                target_defect_id=target.defect_id,
+                decision="stopped",
+                reason=reason,
+            )
+            return {"stopped": True, "stop_reason": reason}
         attempted = state.get("attempted_defect_ids", [])
         ledger = CounterexampleLedger.model_validate(state["ledger"])
-        persisted_attempt = next(
-            (
-                item
-                for item in ledger.counterexamples
-                if item.defect.defect_id == target.defect_id and item.repair_history
-            ),
-            None,
-        )
-        if target.defect_id in attempted or persisted_attempt is not None:
+        if target.defect_id in attempted:
             reason = f"缺陷 {target.defect_id} 修复一次后仍存在，已停止。"
             self._decision(
                 state,
@@ -768,52 +819,12 @@ class Agent4Graph:
     async def _repair_defect(self, state: Agent4State) -> dict[str, Any]:
         started = perf_counter()
         target = Defect.model_validate(state["target_defect"])
-        documentation = state["context"]["jngen_documentation"]
-        document_digests = [
-            f"{item.get('filename')}:{item.get('digest')}"
-            for item in documentation.get("selected_documents", [])
-            if isinstance(item, dict)
-        ]
-        fragment_key = (
-            f"{state['candidate_revision']}:{target.defect_id}:"
-            f"{ledger_digest(document_digests)}"
-        )
-        cache = self.storage.load_agent4_cache(state["project_id"])
-        fragments = cache.setdefault("document_fragments", {}).get(fragment_key)
-        fragment_cache_hit = isinstance(fragments, dict)
-        if not fragment_cache_hit:
-            fragments = self.documents.repair_fragments(
-                documentation,
-                target.model_dump(mode="json"),
-                min(12000, self.settings.agent_jngen_document_context_chars),
-                state["candidate"],
-            )
-            cache["document_fragments"][fragment_key] = fragments
-            self.storage.save_agent4_cache(state["project_id"], cache)
-        repair_context = {
-            key: value for key, value in state["context"].items() if key != "jngen_documentation"
-        }
-        repair_context["repair_documentation"] = fragments
-        self.storage.append_agent4_document_selection(
-            state["project_id"],
-            {
-                "run_id": state["run_id"],
-                "event": "targeted_repair_fragments",
-                "target_defect_id": target.defect_id,
-                "candidate_revision": state["candidate_revision"],
-                "cache_hit": fragment_cache_hit,
-                "fragments": [
-                    {
-                        "filename": item["filename"],
-                        "digest": item["digest"],
-                        "heading": item["heading"],
-                    }
-                    for item in fragments["selected_fragments"]
-                ],
-            },
-        )
         try:
-            patch = await self.model.agent4_repair(repair_context, state["candidate"], target)
+            patch = await self.model.agent4_repair(
+                _context_for_defect(state["context"], target),
+                state["candidate"],
+                target,
+            )
         except AppError as exc:
             self._decision(
                 state,
@@ -849,6 +860,63 @@ class Agent4Graph:
                 "修复模型返回了不同的目标缺陷 ID。",
                 stage=5,
             )
+        expected_code_field = {
+            "generator.cpp": "generator_code",
+            "validator.cpp": "validator_code",
+        }.get(target.identity.target_file)
+        returned_code_fields = {
+            field
+            for field in ("generator_code", "validator_code")
+            if getattr(patch, field) is not None
+        }
+        if expected_code_field and returned_code_fields - {expected_code_field}:
+            self._decision(
+                state,
+                state["candidate_revision"],
+                target_defect_id=target.defect_id,
+                model_call_type="repair",
+                decision="stopped",
+                reason="定向修复返回了目标角色之外的源码。",
+                after={"returned_code_fields": sorted(returned_code_fields)},
+            )
+            raise AppError(
+                "REPAIR_SCOPE_MISMATCH",
+                "定向修复只能返回目标缺陷所属角色的源码。",
+                stage=5,
+            )
+        required_code_field = _required_source_patch_field(target)
+        if required_code_field and getattr(patch, required_code_field) is None:
+            reason = (
+                f"缺陷 {target.defect_id} 属于源码行为缺陷，但补丁没有返回 "
+                f"{required_code_field}，已停止。"
+            )
+            ledger = self.ledger_service.record_repair(
+                state["project_id"],
+                CounterexampleLedger.model_validate(state["ledger"]),
+                target.defect_id,
+                state["candidate_revision"],
+                [],
+                "still_open",
+                reason,
+            )
+            self._decision(
+                state,
+                state["candidate_revision"],
+                target_defect_id=target.defect_id,
+                model_call_type="repair",
+                decision="stopped",
+                reason=reason,
+                after={
+                    "required_patch_field": required_code_field,
+                    "model_rationale": patch.rationale,
+                },
+            )
+            return {
+                "stopped": True,
+                "stop_reason": reason,
+                "patch_scope": [],
+                "ledger": ledger.model_dump(mode="json"),
+            }
         proposed = dict(state["candidate"])
         patch_scope: list[str] = []
         for field, scope_name in (
@@ -859,33 +927,6 @@ class Agent4Graph:
             if value is not None:
                 proposed[field] = value
                 patch_scope.append(scope_name)
-        if (
-            patch.implementation_mapping_upserts
-            or patch.implementation_mapping_remove_ids
-        ):
-            mappings = {
-                str(item["constraint_id"]): dict(item)
-                for item in proposed.get("implementation_mapping", [])
-                if isinstance(item, dict) and item.get("constraint_id")
-            }
-            for constraint_id in patch.implementation_mapping_remove_ids:
-                mappings.pop(constraint_id, None)
-            resolved = resolve_implementation_mapping(
-                patch.implementation_mapping_upserts,
-                state["context"]["jngen_documentation"]["selected_documents"],
-            )
-            obligation_order = [
-                str(item["constraint_id"])
-                for item in proposed.get("proof_obligations", [])
-                if isinstance(item, dict) and item.get("constraint_id")
-            ]
-            proposed["implementation_mapping"] = _merge_implementation_mappings(
-                list(mappings.values()),
-                [item.model_dump(mode="json") for item in resolved],
-                patch.implementation_mapping_remove_ids,
-                obligation_order,
-            )
-            patch_scope.append("implementation_mapping")
         revision = candidate_revision(proposed)
         patch_summary = _patch_summary(state["candidate"], proposed, patch_scope)
         if revision == state["candidate_revision"]:
@@ -949,7 +990,13 @@ class Agent4Graph:
             checks = await asyncio.gather(
                 *(
                     self.model.agent4_recheck(
-                        state["context"], candidate, defect, execution
+                        {
+                            **_context_for_defect(state["context"], defect),
+                            "candidate_revision": state["candidate_revision"],
+                        },
+                        candidate,
+                        defect,
+                        execution,
                     )
                     for defect in known_semantic
                 )
@@ -981,18 +1028,42 @@ class Agent4Graph:
                     "定向复验返回了不同的缺陷 ID。",
                     stage=5,
                 )
-            if check.still_present:
+            evidence_grounded = _semantic_recheck_evidence_is_grounded(check, defect, candidate)
+            accepted_still_present = bool(check.still_present and evidence_grounded)
+            if accepted_still_present:
+                assert check.evidence is not None
                 semantic_open.append(
-                    defect.model_copy(update={"message": check.message, "evidence": check.evidence})
+                    defect.model_copy(
+                        update={
+                            "message": check.message,
+                            "evidence": {
+                                **check.evidence.model_dump(mode="json"),
+                                "origin": "candidate",
+                                "grounded_in_candidate_revision": state["candidate_revision"],
+                            },
+                        }
+                    )
                 )
             self._decision(
                 state,
                 state["candidate_revision"],
                 target_defect_id=defect.defect_id,
                 model_call_type="targeted_recheck",
-                after={"still_present": check.still_present},
+                after={
+                    "reported_still_present": check.still_present,
+                    "accepted_still_present": accepted_still_present,
+                    "evidence_grounded": evidence_grounded,
+                    "message": check.message,
+                    "evidence": check.evidence.model_dump(mode="json")
+                    if check.evidence is not None
+                    else None,
+                },
                 decision="observed",
-                reason="历史语义反例定向复验完成。",
+                reason=(
+                    "历史语义反例定向复验完成。"
+                    if not check.still_present or evidence_grounded
+                    else "复验声称缺陷仍存在，但证据不属于当前候选源码，未作为阻断缺陷接受。"
+                ),
             )
         self._timing(
             state,
@@ -1031,14 +1102,14 @@ class Agent4Graph:
         after = verification_summary(defects, state["validation_level"])
         before = state["baseline_summary"]
         after_ids = set(after["defect_ids"])
-        introduced_blockers = sorted(set(after["blocker_ids"]) - set(before["blocker_ids"]))
+        newly_observed_blockers = sorted(set(after["blocker_ids"]) - set(before["blocker_ids"]))
         regression = bool(set(state.get("closed_defect_ids_before", [])) & after_ids)
         target_closed = target.defect_id not in after_ids
         progress = (
             after["open_blockers"] < before["open_blockers"]
             or target_closed
             or after["validation_rank"] > before["validation_rank"]
-        ) and not regression and not introduced_blockers
+        ) and not regression
         ledger = CounterexampleLedger.model_validate(state["ledger"])
         if not target_closed:
             progress = False
@@ -1046,9 +1117,6 @@ class Agent4Graph:
         elif regression:
             progress = False
             reason = "补丁重新引入了已关闭缺陷，候选已回滚并停止。"
-        elif introduced_blockers:
-            progress = False
-            reason = "补丁引入了新的阻断缺陷，候选已回滚并停止。"
         elif not progress:
             reason = "阻断缺陷、目标缺陷和验证等级均未改善，候选已回滚并停止。"
         else:
@@ -1074,7 +1142,7 @@ class Agent4Graph:
                 before=before,
                 after={
                     **after,
-                    "introduced_blocker_ids": introduced_blockers,
+                    "newly_observed_blocker_ids": newly_observed_blockers,
                     "patch": state.get("patch_summary", {}),
                 },
                 progress=False,
@@ -1107,7 +1175,7 @@ class Agent4Graph:
             before=before,
             after={
                 **after,
-                "introduced_blocker_ids": introduced_blockers,
+                "newly_observed_blocker_ids": newly_observed_blockers,
                 "patch": state.get("patch_summary", {}),
             },
             progress=True,
@@ -1187,10 +1255,10 @@ class Agent4Graph:
             for item in ledger.counterexamples
             if item.reproduction.get("seed") is not None
         ]
-        documentation = context.get("jngen_documentation", {})
+        documentation = context.get("agent4_library_context_bundle", {})
         document_fingerprints = [
             f"{item.get('filename')}:{item.get('digest')}"
-            for item in documentation.get("selected_documents", [])
+            for item in documentation.get("documents", [])
             if isinstance(item, dict)
         ]
         role_digests = _role_digests(candidate, project_id, self.storage)
@@ -1206,10 +1274,7 @@ class Agent4Graph:
                 AGENT4_VERIFIER_REVISION,
             ]
         )
-        key = (
-            f"{revision}:{environment_fingerprint}:"
-            f"{ledger_digest(replay_fingerprints)}"
-        )
+        key = f"{revision}:{environment_fingerprint}:{ledger_digest(replay_fingerprints)}"
         cache = self.storage.load_agent4_cache(project_id)
         cached = cache.setdefault("candidates", {}).get(key)
         if isinstance(cached, dict):
@@ -1234,9 +1299,7 @@ class Agent4Graph:
         cache["candidates"][key] = {
             "candidate": verified,
             "execution": execution,
-            "replayed_counterexamples": execution.get(
-                "replayed_counterexample_ids", []
-            ),
+            "replayed_counterexamples": execution.get("replayed_counterexample_ids", []),
             "gates": [
                 check.get("operation")
                 for check in execution.get("checks", [])
@@ -1261,11 +1324,11 @@ class Agent4Graph:
         """
 
         replayed_ids = set(execution.get("replayed_counterexample_ids", []))
-        fully_evaluated_operations = set(
-            execution.get("fully_evaluated_operations", [])
-        )
-        current_level = "complete" if execution.get("ok") else str(
-            execution.get("validation_level") or "static"
+        fully_evaluated_operations = set(execution.get("fully_evaluated_operations", []))
+        current_level = (
+            "complete"
+            if execution.get("ok")
+            else str(execution.get("validation_level") or "static")
         )
         current_rank = VALIDATION_LEVELS.get(current_level, 0)
         covered: set[str] = set()
@@ -1276,10 +1339,7 @@ class Agent4Graph:
                 covered.add(item.defect.defect_id)
                 continue
             check = item.defect.evidence.get("check", {})
-            if (
-                isinstance(check, dict)
-                and check.get("operation") in fully_evaluated_operations
-            ):
+            if isinstance(check, dict) and check.get("operation") in fully_evaluated_operations:
                 covered.add(item.defect.defect_id)
                 continue
             if VALIDATION_LEVELS[item.defect.validation_level] < current_rank:
@@ -1317,7 +1377,7 @@ class Agent4Graph:
                     severity=report.severity,
                     validation_level="semantic",
                     message=report.message,
-                    evidence={**report.evidence, "origin": report.origin},
+                    evidence=report.evidence,
                 )
             )
         return list({item.defect_id: item for item in defects}.values())
@@ -1354,15 +1414,16 @@ class Agent4Graph:
     def _route_after_prepare(state: Agent4State) -> str:
         candidate = state.get("candidate", {})
         required = {
+            "format_contract_id",
             "generator_code",
             "validator_code",
-            "proof_obligations",
-            "implementation_mapping",
         }
         if not required.issubset(candidate):
             return "generate"
-        expected = state.get("proof_obligations", [])
-        return "verify" if candidate.get("proof_obligations") == expected else "generate"
+        contract_id = (
+            state.get("context", {}).get("input_format_contract", {}).get("format_contract_id")
+        )
+        return "verify" if candidate.get("format_contract_id") == contract_id else "generate"
 
     @staticmethod
     def _route_after_verify(state: Agent4State) -> str:
@@ -1412,15 +1473,13 @@ class AgentGraphCoordinator:
         storage: ProjectStorage,
         model: AgentModel,
         verifier: Agent4CandidateVerifier,
-        documents: JngenDocumentContext,
-        tag_catalog: StructureTagCatalog,
+        documents: Agent4DocumentContext,
     ) -> None:
         self.settings = settings
         self.storage = storage
         self.model = model
         self.verifier = verifier
         self.documents = documents
-        self.tag_catalog = tag_catalog
         self._saver_context: AbstractAsyncContextManager[AsyncSqliteSaver] | None = None
         self._saver: AsyncSqliteSaver | None = None
         self.agent1: Agent1Graph | None = None
@@ -1435,15 +1494,14 @@ class AgentGraphCoordinator:
         self._saver_context = AsyncSqliteSaver.from_conn_string(str(path))
         self._saver = await self._saver_context.__aenter__()
         self.agent1 = Agent1Graph(self.model, Agent1Validator(), self._saver)
-        self.agent2 = Agent2Graph(self.model, Agent2Validator(self.tag_catalog), self._saver)
-        self.agent3 = Agent3Graph(self.model, Agent3Validator(self.tag_catalog), self._saver)
+        self.agent2 = Agent2Graph(self.model, Agent2Validator(), self._saver)
+        self.agent3 = Agent3Graph(self.model, Agent3Validator(), self._saver)
         self.agent4 = Agent4Graph(
             self.settings,
             self.storage,
             self.model,
             self.verifier,
             self.documents,
-            Agent4ContractPreflight(self.tag_catalog),
             CounterexampleLedgerService(self.storage),
             self._saver,
         )
@@ -1468,6 +1526,19 @@ class AgentGraphCoordinator:
                 agent.model = model
         if previous is not model:
             await _close_model(previous)
+
+    async def delete_project_checkpoints(self, project_id: str) -> None:
+        """Remove every LangGraph thread that belongs to a deleted project."""
+        await self.start()
+        assert self._saver is not None
+        prefix = f"{project_id}:"
+        thread_ids: set[str] = set()
+        async for checkpoint in self._saver.alist(None):
+            thread_id = str(checkpoint.config.get("configurable", {}).get("thread_id", ""))
+            if thread_id.startswith(prefix):
+                thread_ids.add(thread_id)
+        for thread_id in thread_ids:
+            await self._saver.adelete_thread(thread_id)
 
     async def run_agent1(
         self, project_id: str, context: dict[str, Any], candidate: dict[str, Any]
@@ -1521,9 +1592,17 @@ class AgentGraphCoordinator:
 
     @staticmethod
     def new_agent4_thread_id(project_id: str, context: dict[str, Any]) -> str:
-        return _thread_id(project_id, "agent4", context)
+        return _thread_id(project_id, AGENT4_GRAPH_ID, context)
 
     async def retry_agent4(self, thread_id: str) -> tuple[str, WorkflowOutput, bool]:
+        if not _is_current_agent4_thread(thread_id):
+            raise AppError(
+                "AGENT4_CHECKPOINT_INCOMPATIBLE",
+                "旧阶段五 checkpoint 不会被当前 Agent4 图恢复或兼容。",
+                stage=5,
+                status_code=409,
+                details={"thread_id": thread_id, "required_graph": AGENT4_GRAPH_ID},
+            )
         await self.start()
         assert self.agent4 is not None
         return await self.agent4.retry(thread_id)
@@ -1539,7 +1618,7 @@ class AgentGraphCoordinator:
             assert self.agent3 is not None
             await self.agent3.resume(thread_id)
             return
-        if agent_name == "agent4":
+        if agent_name == AGENT4_GRAPH_ID:
             assert self.agent4 is not None
             await self.agent4.resume(thread_id)
             return
@@ -1553,6 +1632,11 @@ def _thread_id(project_id: str, agent: str, context: dict[str, Any]) -> str:
 
 def _config(thread_id: str) -> dict[str, Any]:
     return {"configurable": {"thread_id": thread_id}}
+
+
+def _is_current_agent4_thread(thread_id: str) -> bool:
+    parts = thread_id.split(":", 2)
+    return len(parts) == 3 and parts[1] == AGENT4_GRAPH_ID
 
 
 async def _close_model(model: AgentModel) -> None:
@@ -1572,6 +1656,73 @@ def _basic_output(state: dict[str, Any]) -> WorkflowOutput:
     )
 
 
+def _context_for_code_role(context: dict[str, Any], role: str) -> dict[str, Any]:
+    prepared = dict(context)
+    role_context = Agent4DocumentContext.for_role(
+        context.get("agent4_library_context_bundle", {}), role
+    )
+    prepared.pop("agent4_library_context_bundle", None)
+    prepared["library_context"] = role_context["library_context"]
+    prepared["library_document_manifest"] = role_context["document_manifest"]
+    return prepared
+
+
+def _context_for_review(context: dict[str, Any], roles: tuple[str, ...]) -> dict[str, Any]:
+    prepared = dict(context)
+    documentation = prepared.pop("agent4_library_context_bundle", {})
+    role_contexts = {role: Agent4DocumentContext.for_role(documentation, role) for role in roles}
+    prepared["library_contexts"] = {
+        role: role_context["library_context"] for role, role_context in role_contexts.items()
+    }
+    prepared["library_document_manifests"] = {
+        role: role_context["document_manifest"] for role, role_context in role_contexts.items()
+    }
+    return prepared
+
+
+def _context_for_defect(context: dict[str, Any], defect: Defect) -> dict[str, Any]:
+    role = {
+        "generator.cpp": "generator",
+        "validator.cpp": "validator",
+    }.get(defect.identity.target_file)
+    prepared = _context_for_review(
+        context,
+        (role,) if role is not None else ("generator", "validator"),
+    )
+    prepared["required_patch_field"] = _required_source_patch_field(defect)
+    return prepared
+
+
+def _required_source_patch_field(defect: Defect) -> str | None:
+    return {
+        "generator.cpp": "generator_code",
+        "validator.cpp": "validator_code",
+    }.get(defect.identity.target_file)
+
+
+def _semantic_recheck_evidence_is_grounded(
+    check: TargetedDefectCheck,
+    defect: Defect,
+    candidate: dict[str, Any],
+) -> bool | None:
+    """Accept persistence claims only when they quote the current owned source."""
+
+    if not check.still_present:
+        return None
+    evidence = check.evidence
+    if evidence is None or evidence.target_file != defect.identity.target_file:
+        return False
+    source_field = {
+        "generator.cpp": "generator_code",
+        "validator.cpp": "validator_code",
+    }.get(evidence.target_file)
+    if source_field is None:
+        return False
+    source = str(candidate.get(source_field, "")).replace("\r\n", "\n").replace("\r", "\n")
+    snippet = evidence.code_snippet.replace("\r\n", "\n").replace("\r", "\n").strip()
+    return bool(snippet and snippet in source)
+
+
 def _role_digests(
     candidate: dict[str, Any], project_id: str, storage: ProjectStorage
 ) -> dict[str, str]:
@@ -1586,30 +1737,6 @@ def _role_digests(
             str(candidate.get("validator_code", "")).encode("utf-8")
         ).hexdigest(),
     }
-
-
-def _merge_implementation_mappings(
-    current: list[dict[str, Any]],
-    upserts: list[dict[str, Any]],
-    remove_ids: list[str],
-    obligation_order: list[str],
-) -> list[dict[str, Any]]:
-    mappings = {
-        str(item["constraint_id"]): dict(item)
-        for item in current
-        if isinstance(item, dict) and item.get("constraint_id")
-    }
-    for constraint_id in remove_ids:
-        mappings.pop(constraint_id, None)
-    for item in upserts:
-        constraint_id = str(item.get("constraint_id") or "")
-        if constraint_id:
-            mappings[constraint_id] = dict(item)
-    ordered_ids = [
-        *[item for item in obligation_order if item in mappings],
-        *sorted(set(mappings) - set(obligation_order)),
-    ]
-    return [mappings[constraint_id] for constraint_id in ordered_ids]
 
 
 def _patch_summary(
@@ -1630,22 +1757,6 @@ def _patch_summary(
             "before_lines": len(old.splitlines()),
             "after_lines": len(new.splitlines()),
             "changed_ranges": _changed_line_ranges(old, new),
-        }
-    if "implementation_mapping" in modified_files:
-        old_ids = {
-            str(item.get("constraint_id"))
-            for item in before.get("implementation_mapping", [])
-            if isinstance(item, dict)
-        }
-        new_ids = {
-            str(item.get("constraint_id"))
-            for item in after.get("implementation_mapping", [])
-            if isinstance(item, dict)
-        }
-        summary["implementation_mapping"] = {
-            "added_constraint_ids": sorted(new_ids - old_ids),
-            "removed_constraint_ids": sorted(old_ids - new_ids),
-            "retained_constraint_ids": sorted(old_ids & new_ids),
         }
     return summary
 

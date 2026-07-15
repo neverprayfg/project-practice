@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
 from typing import Any, Protocol, TypeVar
 
 import httpx
@@ -11,78 +10,111 @@ from pydantic import BaseModel, ValidationError
 from app.config import Settings
 from app.errors import AppError
 from app.models import (
-    CodeGenerationSubmission,
     CodeRepairPatch,
     Defect,
-    GlobalInput,
+    GeneratorGenerationSubmission,
+    InputNormalizationDraft,
     InputStructureDraft,
     SemanticAudit,
     SubtaskPlanDraft,
     TargetedDefectCheck,
+    ValidatorGenerationSubmission,
 )
-
-_TESTLIB_ROOT = Path(__file__).resolve().parent.parent / "testlib_doc_context"
-TESTLIB_GUIDANCE = "\n\n".join(
-    (_TESTLIB_ROOT / filename).read_text(encoding="utf-8").strip()
-    for filename in ("testlib_generator.md", "testlib_validator.md")
-)
-TESTLIB_GUIDANCE_BY_TARGET = {
-    "generator.cpp": (_TESTLIB_ROOT / "testlib_generator.md")
-    .read_text(encoding="utf-8")
-    .strip(),
-    "validator.cpp": (_TESTLIB_ROOT / "testlib_validator.md")
-    .read_text(encoding="utf-8")
-    .strip(),
-}
 
 AGENT1_PROMPT = (
-    "你是独立的 Agent1，只负责 INPUT 规范化。保留题目原文、难度和标程源码；"
-    "整理输入说明、输出说明和样例，不得推断或补造事实。输出完整 GlobalInput。"
+    "你是独立的 Agent1，只负责从原始题目中整理输入说明、输出说明和样例，不得推断或补造事实。"
+    "只输出 InputNormalizationDraft；题目原文、难度、标程源码、编译状态、输入结构和 revision "
+    "均由后端持有，禁止在响应中返回。"
 )
 AGENT2_PROMPT = (
-    "你是独立的 Agent2，只负责输入结构和结构标签。按标程真实读取顺序描述输入；"
-    "标签只能来自给定目录。遇到歧义时在 issues 中输出 needs_tag_review，不得猜测或修复阶段四。"
+    "你是独立的 Agent2，只负责输入结构模板。结合题面和标程，按真实读取顺序清晰描述字段、"
+    "类型和重复关系；不要返回结构标签，也不要处理阶段四。"
 )
 AGENT3_PROMPT = (
-    "你是独立的 Agent3，只负责子任务契约。首次生成恰好五个子任务；为每个测试点提供"
-    "完整 runtime_parameters。约束、特殊情况、参数和标签必须互相一致，不能把矛盾留给 Agent4。"
+    "你是独立的 Agent3，只负责生成阶段四的初始配置。首次生成恰好一个子任务，id 必须为 1；"
+    "为每个测试点提供完整 runtime_parameters。规模、分布和构造策略只写入 special_cases 或 "
+    "runtime_parameters；不要创建约束清单。特殊情况和参数必须互相一致，"
+    "不能把矛盾留给 Agent4。"
 )
-AGENT4_GENERATE_PROMPT = (
-    "你是独立的 Agent4 代码生成器。根据已确认契约和读取到的 jngen 文档生成 generator.cpp "
-    "与 validator.cpp。proof_obligations 由后端注入，响应中不要返回；只为每项提交 "
-    "implementation_mapping："
-    "实现文件、符号、精确行号、实际使用的参数、已读取文档文件和 API 符号、测试构造策略。"
-    "document_evidence 只能引用 inputs.context.jngen_documentation.selected_documents "
-    "中的 filename 和 symbols，字段只有 filename 与 symbol，不包含 digest；不得把 testlib commit、"
-    "候选 revision 或任何截断摘要当作文档证据。validator 的 testlib 接入由后端固定策略验证，"
-    "不要伪造其文档证据。"
-    "参数必须实际影响数据构造；文档没有出现的 API 禁止使用。validator 必须严格读取并 readEof。"
+AGENT3_REVISE_PROMPT = (
+    "你是 Agent3 的契约修订器。只修复 inputs.context.validation_issues 明确指出的阶段四问题，"
+    "必须保留候选的子任务数量、顺序和 id，以及已经合法的测试点与参数，"
+    "不得新增、删除或重做无关内容。"
+    "规模、分布和构造策略必须留在 special_cases 或 runtime_parameters，不要创建约束清单。"
+    "返回完整 SubtaskPlanDraft；这是唯一一次自动修订，仍不合法时流程会停止。"
+)
+AGENT4_GENERATOR_PROMPT = (
+    "你是 Agent4 的独立 generator.cpp 生成器。本次响应绝对禁止返回 validator.cpp。"
+    "结合题意，严格参照 inputs.context.library_context JSON 中唯一提供的 "
+    "jngen_context 文档与实例生成 generator.cpp。"
+    "inputs.context.input_format_contract 是后端冻结的输入格式：必须原样回显 format_contract_id，"
+    "并根据题面、input_template、样例和完整文档自行判断数据结构，按所有 policy 向标准输出写出"
+    "一个完整测试点。"
+    "同一行相邻 token 必须恰好使用一个 ASCII 空格 U+0020；禁止行首空格、行尾空格、Tab、"
+    "模板未要求的空行和 CRLF；必须使用 LF 换行且文件末尾必须有一个换行。"
+    "标准输出只能包含测试数据，禁止日志或解释。"
+    '必须先调用 registerGen(argc, argv) 和 parseArgs(argc, argv)，再通过 '
+    'getOpt("参数名") 读取 runtime_parameters；参数名必须与 runtime_parameters.name '
+    "逐字一致，禁止 getOpt(0)、getOpt(1) 等位置参数，也禁止自行缩写或改名；读取值必须实际影响构造。"
+    "inputs.context.library_context 的递归 JSON 中 jngen_context 包含 doc 和 example；"
+    "同一子目录内的文件"
+    "使用 <<<FILE_SEPARATOR>>> 分隔。inputs.context.library_document_manifest 是对应文件清单；"
+    "参数必须实际影响数据构造；文档没有出现的 API 禁止使用。"
+)
+AGENT4_VALIDATOR_PROMPT = (
+    "你是 Agent4 的独立 validator.cpp 生成器。本次响应绝对禁止返回 generator.cpp。"
+    "参考 inputs.context.library_context JSON 中 testlib validator 的文档和实例生成校验器。"
+    "inputs.context.input_format_contract 是与 generator 并行共享且由后端冻结的输入格式："
+    "必须原样回显 format_contract_id，根据题面、input_template、样例和完整文档自行判断字段，"
+    "严格按 input_template 的顺序读取一个测试点，"
+    "不得自行添加、删除或重排字段。必须用 readSpace、readEoln 和 readEof 等 testlib 接口严格"
+    "约束格式：同一行相邻 token 恰好一个 ASCII 空格 U+0020，禁止行首/行尾空格、Tab、"
+    "模板未要求的空行和 CRLF，要求 LF 换行及文件末尾换行；完成全部约束检查后必须 readEof。"
+    "只生成 validator.cpp。"
+    "inputs.context.library_context 只提供 validator 角色的 testlib_context，且递归包含 doc 和 "
+    "example；不要假设或引用未提供的 jngen 文档。"
 )
 AGENT4_AUDIT_PROMPT = (
     "你是 Agent4 的只读语义审查器。只能输出结构化 defects，绝对禁止返回、改写或建议整份代码。"
-    "逐项检查 proof_obligations 与 implementation_mapping 及源码是否一致；自然语言只用于 message，"
+    "根据题面、已确认输入格式、样例、完整文档和实际运行结果检查当前源码；自然语言只用于 message，"
     "流程身份必须由 category、target_file、constraint_id、subtask、test_point、error_code 构成。"
-    "每个缺陷必须标注 origin：只有修改 generator.cpp 或 validator.cpp 能关闭时才是 candidate；"
-    "阶段三/四的约束、特殊情况或 runtime parameters 自相矛盾时必须是 upstream_contract，"
-    "不得伪装成可修复的代码缺陷。"
+    "只报告能通过修改 generator.cpp 或 validator.cpp 关闭的 candidate 缺陷；"
+    "不要审查或退回上游阶段。"
     "context.known_semantic_defects 是必须逐项复验的历史缺陷：仍存在时原样保留其 identity，"
     "已不存在时不要返回；除此之外可报告本次首次发现的语义缺陷。"
+    "context.library_contexts 是 generator 与 validator 的严格递归 JSON 文档和实例；"
+    "library_document_manifests 是对应证据清单，不得假设存在未提供的文档。"
 )
 AGENT4_REPAIR_PROMPT = (
     "你是 Agent4 的定向修复器。只处理 target_defect，返回最小字段补丁；不得处理或发现其他缺陷，"
-    "不得重写无关角色。用 rationale 简述补丁为何能关闭目标缺陷；只能使用 repair_documentation "
-    "中的目标文档片段。implementation_mapping_upserts 只返回需要新增或更新的约束映射，"
-    "后端会按 constraint_id 合并，绝对不要重复返回整张映射表；只有删除错误映射时才填写 "
-    "implementation_mapping_remove_ids。代码改动导致行号变化时，必须 upsert 所有受影响映射。"
+    "不得重写无关角色。用 rationale 简述补丁为何能关闭目标缺陷；"
+    "context.required_patch_field 非空时必须返回该源码字段。PARAMETER_NO_EFFECT 必须修改参数读取"
+    "或实际构造逻辑。"
+    "一次修复响应只能返回 generator_code 或 validator_code 之一，绝对禁止同时返回两者。"
+    "context.library_contexts 只包含目标缺陷所需角色，或在目标无法归属单一角色时包含两个角色；"
+    "必须以递归 JSON 的完整正文为依据。"
 )
 AGENT4_RECHECK_PROMPT = (
     "你是 Agent4 的只读定向复验器。只回答给定 target_defect 是否仍存在；不得开放审查、"
-    "不得报告新缺陷、不得修改代码。"
+    "不得报告新缺陷、不得修改代码。必须基于本次请求 candidate 中的当前源码判断，禁止复用"
+    "target_defect 里的旧代码片段。若 still_present=true，evidence 必须给出 target_file、"
+    "当前源码中逐字连续存在且足以证明同一缺陷的 code_snippet，以及解释该片段为何仍违反约束的"
+    "rationale；若无法提供当前源码证据，必须返回 still_present=false。"
+    "context.library_contexts 是目标角色的完整递归 JSON 文档集。"
 )
 JSON_OUTPUT_PROMPT = (
     "必须只返回一个 JSON（json）object，不得输出 Markdown、解释或 JSON 之外的文本。"
     "JSON 的字段、嵌套结构和类型必须严格符合用户消息中的 response_contract。"
 )
+
+
+def structured_output_controls() -> dict[str, Any]:
+    """Disable model reasoning and require JSON for every structured call."""
+    return {
+        "thinking": {"type": "disabled"},
+        "response_format": {"type": "json_object"},
+    }
+
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -90,7 +122,7 @@ T = TypeVar("T", bound=BaseModel)
 class AgentModel(Protocol):
     async def agent1_normalize(
         self, context: dict[str, Any], candidate: dict[str, Any]
-    ) -> GlobalInput: ...
+    ) -> InputNormalizationDraft: ...
 
     async def agent2_structure(
         self, context: dict[str, Any], candidate: dict[str, Any]
@@ -100,9 +132,17 @@ class AgentModel(Protocol):
         self, context: dict[str, Any], candidate: dict[str, Any]
     ) -> SubtaskPlanDraft: ...
 
-    async def agent4_generate(
+    async def agent3_revise(
         self, context: dict[str, Any], candidate: dict[str, Any]
-    ) -> CodeGenerationSubmission: ...
+    ) -> SubtaskPlanDraft: ...
+
+    async def agent4_generate_generator(
+        self, context: dict[str, Any], candidate: dict[str, Any]
+    ) -> GeneratorGenerationSubmission: ...
+
+    async def agent4_generate_validator(
+        self, context: dict[str, Any], candidate: dict[str, Any]
+    ) -> ValidatorGenerationSubmission: ...
 
     async def agent4_audit(
         self,
@@ -142,11 +182,11 @@ class OpenAICompatibleAgentModel:
 
     async def agent1_normalize(
         self, context: dict[str, Any], candidate: dict[str, Any]
-    ) -> GlobalInput:
+    ) -> InputNormalizationDraft:
         return await self._call(
             "agent1.normalize",
             AGENT1_PROMPT,
-            GlobalInput,
+            InputNormalizationDraft,
             {"context": context, "candidate": candidate},
         )
 
@@ -170,13 +210,33 @@ class OpenAICompatibleAgentModel:
             {"context": context, "candidate": candidate},
         )
 
-    async def agent4_generate(
+    async def agent3_revise(
         self, context: dict[str, Any], candidate: dict[str, Any]
-    ) -> CodeGenerationSubmission:
+    ) -> SubtaskPlanDraft:
         return await self._call(
-            "agent4.generate",
-            AGENT4_GENERATE_PROMPT + "\n\n" + TESTLIB_GUIDANCE,
-            CodeGenerationSubmission,
+            "agent3.revise",
+            AGENT3_REVISE_PROMPT,
+            SubtaskPlanDraft,
+            {"context": context, "candidate": candidate},
+        )
+
+    async def agent4_generate_generator(
+        self, context: dict[str, Any], candidate: dict[str, Any]
+    ) -> GeneratorGenerationSubmission:
+        return await self._call(
+            "agent4.generate_generator",
+            AGENT4_GENERATOR_PROMPT,
+            GeneratorGenerationSubmission,
+            {"context": context, "candidate": _candidate_for_model(candidate)},
+        )
+
+    async def agent4_generate_validator(
+        self, context: dict[str, Any], candidate: dict[str, Any]
+    ) -> ValidatorGenerationSubmission:
+        return await self._call(
+            "agent4.generate_validator",
+            AGENT4_VALIDATOR_PROMPT,
+            ValidatorGenerationSubmission,
             {"context": context, "candidate": _candidate_for_model(candidate)},
         )
 
@@ -191,7 +251,7 @@ class OpenAICompatibleAgentModel:
             AGENT4_AUDIT_PROMPT,
             SemanticAudit,
             {
-                "context": _without_document_bodies(context),
+                "context": context,
                 "candidate": _candidate_for_model(candidate),
                 "execution": _execution_for_model(execution),
             },
@@ -203,13 +263,9 @@ class OpenAICompatibleAgentModel:
         candidate: dict[str, Any],
         target_defect: Defect,
     ) -> CodeRepairPatch:
-        targeted_guidance = TESTLIB_GUIDANCE_BY_TARGET.get(
-            target_defect.identity.target_file, ""
-        )
         return await self._call(
             "agent4.repair",
-            AGENT4_REPAIR_PROMPT
-            + ("\n\n目标文件的 testlib 说明：\n" + targeted_guidance if targeted_guidance else ""),
+            AGENT4_REPAIR_PROMPT,
             CodeRepairPatch,
             {
                 "context": context,
@@ -230,7 +286,7 @@ class OpenAICompatibleAgentModel:
             AGENT4_RECHECK_PROMPT,
             TargetedDefectCheck,
             {
-                "context": _without_document_bodies(context),
+                "context": context,
                 "candidate": _candidate_for_model(candidate),
                 "target_defect": target_defect.model_dump(mode="json"),
                 "execution": _execution_for_model(execution),
@@ -257,7 +313,7 @@ class OpenAICompatibleAgentModel:
             "response_contract": response_model.model_json_schema(),
             "output_instructions": (
                 "仅输出符合 response_contract 的 JSON object；"
-                "例如对象必须使用 {\"字段名\": \"符合契约的值\"} 这种 JSON 形式。"
+                '例如对象必须使用 {"字段名": "符合契约的值"} 这种 JSON 形式。'
             ),
         }
         payload = {
@@ -267,8 +323,8 @@ class OpenAICompatibleAgentModel:
                 {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
             ],
             "temperature": 0,
-            "response_format": {"type": "json_object"},
             "max_tokens": self.settings.model_max_output_tokens,
+            **structured_output_controls(),
         }
         if self._client is None:
             self._client = httpx.AsyncClient(timeout=self.settings.model_timeout_seconds)
@@ -286,6 +342,7 @@ class OpenAICompatibleAgentModel:
                 response.raise_for_status()
                 body = response.json()
                 choice = body["choices"][0]
+                message = choice["message"]
                 usage = body.get("usage") if isinstance(body, dict) else None
                 response_metadata = {
                     "finish_reason": choice.get("finish_reason")
@@ -298,8 +355,11 @@ class OpenAICompatibleAgentModel:
                     }
                     if isinstance(usage, dict)
                     else {},
+                    "reasoning_content_present": bool(message.get("reasoning_content"))
+                    if isinstance(message, dict)
+                    else False,
                 }
-                content = choice["message"]["content"]
+                content = message["content"]
                 return response_model.model_validate(_parse_json(content))
             except httpx.HTTPError as exc:
                 status = getattr(getattr(exc, "response", None), "status_code", None)
@@ -311,8 +371,7 @@ class OpenAICompatibleAgentModel:
                 }
                 attempt_failures.append(failure)
                 if attempt == 0 and (
-                    status in {408, 429, 500, 502, 503, 504}
-                    or isinstance(exc, httpx.RequestError)
+                    status in {408, 429, 500, 502, 503, 504} or isinstance(exc, httpx.RequestError)
                 ):
                     last_error = exc
                     continue
@@ -336,11 +395,10 @@ class OpenAICompatibleAgentModel:
                     response_metadata,
                 )
                 attempt_failures.append(failure)
-                if attempt == 0:
+                truncated = response_metadata.get("finish_reason") == "length"
+                if attempt == 0 and not truncated:
                     if isinstance(content, str):
-                        payload["messages"].append(
-                            {"role": "assistant", "content": str(content)}
-                        )
+                        payload["messages"].append({"role": "assistant", "content": str(content)})
                     payload["messages"].append(
                         {
                             "role": "user",
@@ -353,12 +411,23 @@ class OpenAICompatibleAgentModel:
                         }
                     )
                     continue
+                if truncated:
+                    break
+        truncated = bool(
+            attempt_failures
+            and attempt_failures[-1].get("response", {}).get("finish_reason") == "length"
+        )
         raise AppError(
-            "MODEL_FAILED",
-            "模型返回的 JSON 未通过响应契约校验。",
+            "MODEL_RESPONSE_TRUNCATED" if truncated else "MODEL_FAILED",
+            (
+                "模型输出达到 token 上限，未形成可验证的最终 JSON。"
+                if truncated
+                else "模型返回的 JSON 未通过响应契约校验。"
+            ),
             status_code=502,
             details={
                 "operation": operation,
+                "max_tokens": self.settings.model_max_output_tokens,
                 "failure_kind": attempt_failures[-1]["kind"] if attempt_failures else "unknown",
                 "attempts": attempt_failures,
                 "contract_error": str(last_error)[:800],
@@ -398,33 +467,13 @@ def _http_error_details(exc: httpx.HTTPError) -> dict[str, Any]:
     return details
 
 
-def _without_document_bodies(context: dict[str, Any]) -> dict[str, Any]:
-    prepared = dict(context)
-    documentation = prepared.get("jngen_documentation")
-    if isinstance(documentation, dict):
-        prepared["jngen_documentation"] = {
-            **{key: value for key, value in documentation.items() if key != "selected_documents"},
-            "selected_documents": [
-                {
-                    "filename": item.get("filename"),
-                    "digest": item.get("digest"),
-                    "symbols": item.get("symbols", []),
-                }
-                for item in documentation.get("selected_documents", [])
-                if isinstance(item, dict)
-            ],
-        }
-    return prepared
-
-
 def _candidate_for_model(candidate: dict[str, Any]) -> dict[str, Any]:
     return {
         key: candidate[key]
         for key in (
             "generator_code",
             "validator_code",
-            "proof_obligations",
-            "implementation_mapping",
+            "format_contract_id",
         )
         if key in candidate
     }
@@ -490,11 +539,6 @@ def _parse_json(value: Any) -> dict[str, Any]:
     text = value.strip()
     if not text:
         raise ValueError("model output content is empty")
-    if text.startswith("<think>") and "</think>" in text:
-        text = text.split("</think>", 1)[1].strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        text = "\n".join(lines[1:-1])
     parsed = json.loads(text)
     if not isinstance(parsed, dict):
         raise ValueError("model output must be a JSON object")
@@ -529,11 +573,7 @@ def _contract_failure_details(
             }
         ]
     else:
-        kind = (
-            "response_envelope"
-            if isinstance(error, (KeyError, TypeError))
-            else "json_contract"
-        )
+        kind = "response_envelope" if isinstance(error, (KeyError, TypeError)) else "json_contract"
         errors = [{"type": type(error).__name__, "location": [], "message": str(error)[:500]}]
     raw = content if isinstance(content, str) else ""
     return {
@@ -554,8 +594,5 @@ def _bounded_contract_value(value: Any) -> Any:
     if isinstance(value, list):
         return [_bounded_contract_value(item) for item in value[:5]]
     if isinstance(value, dict):
-        return {
-            str(key): _bounded_contract_value(item)
-            for key, item in list(value.items())[:8]
-        }
+        return {str(key): _bounded_contract_value(item) for key, item in list(value.items())[:8]}
     return str(value)[:160]

@@ -9,7 +9,6 @@ from app.models import (
     CounterexampleRepair,
     Defect,
 )
-from app.services.candidate_verifier import AGENT4_VERIFIER_REVISION
 from app.storage import ProjectStorage
 
 
@@ -18,13 +17,9 @@ class CounterexampleLedgerService:
         self.storage = storage
 
     def load(self, project_id: str) -> CounterexampleLedger:
-        stored = self.storage.load_agent4_ledger(project_id)
-        if stored.get("verifier_revision") != AGENT4_VERIFIER_REVISION:
-            ledger = CounterexampleLedger(verifier_revision=AGENT4_VERIFIER_REVISION)
-            self.storage.save_agent4_ledger(project_id, ledger.model_dump(mode="json"))
-            self.storage.clear_agent4_last_valid_candidate(project_id)
-            return ledger
-        return CounterexampleLedger.model_validate(stored)
+        return CounterexampleLedger.model_validate(
+            self.storage.load_agent4_ledger(project_id)
+        )
 
     def observe(
         self,

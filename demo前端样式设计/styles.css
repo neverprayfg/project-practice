@@ -89,7 +89,7 @@ svg {
   z-index: 10;
   display: flex;
   flex-direction: column;
-  gap: 20px;
+  gap: 14px;
   height: 100vh;
   padding: 20px 14px 16px;
   overflow: auto;
@@ -135,6 +135,91 @@ svg {
   margin-top: 2px;
   color: var(--muted);
   font-size: 12px;
+}
+
+.project-actions {
+  display: grid;
+  gap: 8px;
+}
+
+.project-panel {
+  display: grid;
+  gap: 8px;
+  padding: 11px 0 12px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.project-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 5px;
+}
+
+.project-panel-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.project-panel-heading-icon {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  border-radius: 6px;
+  color: var(--teal);
+  background: var(--teal-soft);
+}
+
+.project-panel-heading-icon svg {
+  width: 15px;
+  height: 15px;
+}
+
+.project-panel-heading-copy {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.project-panel-header strong {
+  color: var(--ink);
+  font-size: 12.5px;
+  line-height: 1.25;
+}
+
+.project-panel-header small {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.3;
+}
+
+.project-panel-tools {
+  display: flex;
+  gap: 4px;
+}
+
+.project-panel-tools .icon-button {
+  width: 28px;
+  height: 28px;
+  border: 0;
+  background: transparent;
+}
+
+.project-panel-tools svg {
+  width: 14px;
+  height: 14px;
+}
+
+.project-panel-close,
+.project-panel-mobile-new,
+.project-panel-backdrop {
+  display: none;
 }
 
 .stage-nav {
@@ -323,6 +408,10 @@ svg {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+#projectHistoryTopbarBtn {
+  display: none;
 }
 
 .api-status {
@@ -1309,6 +1398,192 @@ svg {
   background: var(--surface-muted);
 }
 
+.project-history-list {
+  display: grid;
+  align-content: start;
+  gap: 3px;
+  max-height: 210px;
+  padding: 0 2px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.project-history-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 30px;
+  gap: 2px;
+  align-items: center;
+  padding: 3px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  transition: border-color 140ms ease, background 140ms ease;
+}
+
+.project-history-row:hover {
+  border-color: var(--line-strong);
+  background: var(--surface-muted);
+}
+
+.project-history-row.current {
+  border-color: #91b9b7;
+  background: var(--teal-soft);
+}
+
+.project-history-row.current::before {
+  position: absolute;
+  top: 9px;
+  bottom: 9px;
+  left: 0;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  content: "";
+  background: var(--teal);
+}
+
+.project-history-main {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+  min-height: 43px;
+  padding: 4px 3px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  text-align: left;
+  transition: background 140ms ease;
+}
+
+.project-history-main:hover:not(:disabled) {
+  background: rgba(15, 102, 105, 0.06);
+}
+
+.project-history-icon {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 5px;
+  color: var(--teal);
+  background: var(--teal-soft);
+}
+
+.project-history-icon svg {
+  width: 14px;
+  height: 14px;
+}
+
+.project-history-row.current .project-history-icon {
+  color: #fff;
+  background: var(--teal);
+}
+
+.project-history-copy,
+.project-history-title,
+.project-history-meta {
+  min-width: 0;
+}
+
+.project-history-copy {
+  display: grid;
+  gap: 3px;
+}
+
+.project-history-title {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.project-history-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.current-project-label {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  border: 0;
+  border-radius: 4px;
+  color: var(--teal-dark);
+  background: rgba(15, 102, 105, 0.09);
+  font-size: 9px;
+  font-weight: 800;
+}
+
+.project-history-meta {
+  display: block;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-history-meta span:not(:first-child) {
+  display: none;
+}
+
+.project-history-chevron {
+  display: none;
+}
+
+.project-delete-button {
+  width: 28px;
+  height: 28px;
+  border-color: transparent;
+  color: var(--muted);
+  background: transparent;
+  opacity: 0;
+  transition: color 140ms ease, background 140ms ease, border-color 140ms ease, opacity 140ms ease;
+}
+
+.project-history-row:hover .project-delete-button,
+.project-delete-button:focus-visible,
+.project-delete-button:disabled {
+  opacity: 1;
+}
+
+.project-delete-button:hover:not(:disabled) {
+  border-color: #e0aaaa;
+  color: var(--red);
+  background: var(--red-soft);
+}
+
+.project-history-empty {
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 8px;
+  min-height: 92px;
+  padding: 16px 8px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.project-history-empty svg {
+  width: 22px;
+  height: 22px;
+  color: var(--teal);
+}
+
+.project-history-empty strong {
+  color: var(--ink);
+  font-size: 11px;
+}
+
+.project-history-empty span {
+  font-size: 10px;
+}
+
 .model-config-status {
   display: flex;
   align-items: center;
@@ -1447,12 +1722,17 @@ svg {
 }
 
 @media (max-width: 900px) {
+  body.project-panel-visible {
+    overflow: hidden;
+  }
+
   .app-shell {
     display: block;
   }
 
   .sidebar {
     position: static;
+    z-index: auto;
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
     height: auto;
@@ -1462,10 +1742,114 @@ svg {
     border-bottom: 1px solid var(--line);
   }
 
-  .sidebar > .button,
+  .project-actions,
   .stage-nav,
   .sidebar-footer {
     display: none;
+  }
+
+  #projectHistoryTopbarBtn {
+    display: grid;
+  }
+
+  .project-panel {
+    position: fixed;
+    inset: 0 auto 0 0;
+    z-index: 50;
+    grid-template-rows: auto auto minmax(0, 1fr);
+    width: min(350px, calc(100vw - 36px));
+    height: 100dvh;
+    padding: 18px 14px;
+    border: 0;
+    border-right: 1px solid var(--line);
+    background: #fbfcfd;
+    box-shadow: 18px 0 46px rgba(20, 34, 43, 0.2);
+    transform: translateX(-105%);
+    transition: transform 180ms ease;
+  }
+
+  .project-panel.open {
+    transform: translateX(0);
+  }
+
+  .project-panel-header {
+    padding: 0 2px 10px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .project-panel-header strong {
+    font-size: 15px;
+  }
+
+  .project-panel-header small {
+    font-size: 11px;
+  }
+
+  .project-panel-close {
+    display: grid;
+  }
+
+  .project-panel-mobile-new {
+    display: flex;
+  }
+
+  .project-panel .project-history-list {
+    max-height: none;
+    padding-right: 2px;
+  }
+
+  .project-panel .project-history-row {
+    grid-template-columns: minmax(0, 1fr) 34px;
+    padding: 5px;
+    border-color: var(--line);
+    background: var(--surface);
+  }
+
+  .project-panel .project-history-row.current {
+    border-color: #91b9b7;
+    background: var(--teal-soft);
+  }
+
+  .project-panel .project-history-main {
+    grid-template-columns: 34px minmax(0, 1fr);
+    min-height: 52px;
+  }
+
+  .project-panel .project-history-icon {
+    width: 34px;
+    height: 34px;
+  }
+
+  .project-panel .project-history-title {
+    font-size: 13px;
+  }
+
+  .project-panel .project-history-meta {
+    font-size: 10px;
+  }
+
+  .project-panel .project-delete-button {
+    width: 32px;
+    height: 32px;
+    opacity: 1;
+  }
+
+  .project-panel-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    display: block;
+    padding: 0;
+    border: 0;
+    background: rgba(23, 36, 45, 0.42);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 180ms ease;
+  }
+
+  .project-panel-backdrop.open {
+    opacity: 1;
+    pointer-events: auto;
   }
 
   .workspace {
@@ -1647,5 +2031,15 @@ svg {
   .settings-dialog-footer .form-actions,
   .settings-dialog-footer .form-actions .button {
     width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .project-panel,
+  .project-panel-backdrop,
+  .project-history-row,
+  .project-history-main,
+  .project-delete-button {
+    transition: none;
   }
 }

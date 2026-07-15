@@ -131,13 +131,16 @@ def _target_file(operation: str, role: str) -> str:
         return f"{role}.cpp"
     return {
         "generate": "generator.cpp",
-        "jngen_usage": "generator.cpp",
-        "validate": "validator.cpp",
+        "generator_library_usage": "generator.cpp",
+        "generator_runtime_parameters": "generator.cpp",
+        # A validator rejection during candidate trials means the generated
+        # artifact did not satisfy the accepted input contract.  Repair the
+        # producer first; weakening validator.cpp can only hide bad data.
+        "validate": "generator.cpp",
         "testlib_usage": "validator.cpp",
         "solve": "solution.cpp",
-        "implementation_mapping": "implementation_mapping",
         "runtime_parameters": "stage4_contract",
-        "jngen_documentation": "document_index",
+        "agent4_library_context_bundle": "document_index",
     }.get(operation, "candidate")
 
 

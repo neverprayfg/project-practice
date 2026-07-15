@@ -4,17 +4,18 @@ import pytest
 
 from app.errors import AppError
 from app.models import ProjectCreate, SubtaskPlanDraft
-from app.services.jngen_document_context import JngenDocumentContext
 from app.services.project_service import ProjectService
 from app.services.runtime_parameters import structure_tag_parameter_issues
 from app.services.structure_tag_catalog import StructureTagCatalog
 from app.storage import ProjectStorage
 
-ROOT = Path(__file__).parents[1] / "app/jngen_doc_context"
+APP_ROOT = Path(__file__).parents[1] / "app"
+CATALOG_PATH = APP_ROOT / "structure_context" / "tag_catalog.json"
+DOCUMENT_ROOT = APP_ROOT / "generator_context" / "jngen_context" / "doc"
 
 
 def test_catalog_rejects_unknown_conflicting_and_manual_only_tags() -> None:
-    catalog = StructureTagCatalog(ROOT)
+    catalog = StructureTagCatalog(CATALOG_PATH, DOCUMENT_ROOT)
 
     assert catalog.validate_tag_ids(["not.a.tag"])
     assert catalog.validate_tag_ids(["graph.directed", "graph.undirected"])
@@ -22,7 +23,7 @@ def test_catalog_rejects_unknown_conflicting_and_manual_only_tags() -> None:
 
 
 def test_scoped_mixed_primitive_tags_do_not_conflict() -> None:
-    catalog = StructureTagCatalog(ROOT)
+    catalog = StructureTagCatalog(CATALOG_PATH, DOCUMENT_ROOT)
 
     issues = catalog.validate_structure_tags(
         [
@@ -42,49 +43,21 @@ def test_scoped_mixed_primitive_tags_do_not_conflict() -> None:
     assert issues == []
 
 
-def test_document_union_is_language_independent_and_budgeted() -> None:
-    catalog = StructureTagCatalog(ROOT)
-    documents = JngenDocumentContext(ROOT, catalog)
-    tags = [
-        {
-            "tag_id": "tree",
-            "applies_to": "edges",
-            "evidence": "n-1 edges",
-        },
-        {
-            "tag_id": "collection.query_sequence",
-            "applies_to": "queries",
-            "evidence": "q operations follow",
-        },
-    ]
-
-    chinese = documents.route_documents(
-        {
-            "input": {"problem": {"description": "树上询问"}},
-            "confirmed_structure_tags": tags,
-        },
-        100_000,
-    )
-    english = documents.route_documents(
-        {
-            "input": {"problem": {"description": "queries on a tree"}},
-            "confirmed_structure_tags": tags,
-        },
-        100_000,
-    )
+def test_catalog_document_metadata_is_deterministic_and_budgeted() -> None:
+    catalog = StructureTagCatalog(CATALOG_PATH, DOCUMENT_ROOT)
+    tag_ids = ["tree", "collection.query_sequence"]
+    chinese = catalog.resolve_documents(tag_ids, 100_000)
+    english = catalog.resolve_documents(tag_ids, 100_000)
 
     assert chinese == english
     assert {"tree.md", "generic_graph.md", "random.md"}.issubset(chinese["selected_filenames"])
     with pytest.raises(AppError) as error:
-        documents.route_documents(
-            {"confirmed_structure_tags": tags},
-            1,
-        )
+        catalog.resolve_documents(tag_ids, 1)
     assert error.value.code == "STRUCTURE_TAG_DOCUMENT_BUDGET_EXCEEDED"
 
 
 def test_runtime_parameter_requirements_are_driven_by_catalog_metadata() -> None:
-    catalog = StructureTagCatalog(ROOT)
+    catalog = StructureTagCatalog(CATALOG_PATH, DOCUMENT_ROOT)
     plan = SubtaskPlanDraft.model_validate(
         {
             "subtasks": [
@@ -93,7 +66,7 @@ def test_runtime_parameter_requirements_are_driven_by_catalog_metadata() -> None
                     "constraints": "tree with n vertices",
                     "test_count": 1,
                     "expected_complexity": "O(n)",
-                    "subtask_tags": [],
+                    "additional_structure_tag_ids": [],
                     "runtime_parameters": [
                         {
                             "case_id": 1,
@@ -113,7 +86,7 @@ def test_runtime_parameter_requirements_are_driven_by_catalog_metadata() -> None
 
 
 def test_ai_result_preserves_manual_tag_for_visible_review(tmp_path: Path) -> None:
-    catalog = StructureTagCatalog(ROOT)
+    catalog = StructureTagCatalog(CATALOG_PATH, DOCUMENT_ROOT)
     projects = ProjectService(ProjectStorage(tmp_path), catalog)
     record = projects.create(
         ProjectCreate(

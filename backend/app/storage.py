@@ -12,9 +12,15 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from pydantic import ValidationError
+
 from app.errors import AppError
 from app.models import (
+    AGENT4_CACHE_FORMAT_VERSION,
+    AGENT4_VERIFIER_REVISION,
+    Agent4VerificationCache,
     CodeDraft,
+    CounterexampleLedger,
     GlobalInput,
     InputStructureDraft,
     ProblemInput,
@@ -22,7 +28,7 @@ from app.models import (
     SolutionInput,
     SubtaskPlanDraft,
 )
-from app.services.proof_obligations import candidate_revision
+from app.services.code_candidate import candidate_revision
 
 PROJECT_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 STAGE_FILES = {
@@ -50,6 +56,17 @@ class ProjectStorage:
             and PROJECT_ID_PATTERN.fullmatch(path.name)
             and (path / "project.json").is_file()
         )
+
+    def delete_project(self, project_id: str) -> None:
+        """Delete a project and its private verification workspace."""
+        project_dir = self.project_dir(project_id)
+        if not (project_dir / "project.json").is_file():
+            raise AppError("PROJECT_NOT_FOUND", "project does not exist", status_code=404)
+        workspace_id = hashlib.sha256(
+            f"agent4-verification:{project_id}".encode()
+        ).hexdigest()[:32]
+        shutil.rmtree(project_dir)
+        shutil.rmtree(self.project_dir(workspace_id), ignore_errors=True)
 
     def initialize(self, record: ProjectRecord, input_data: GlobalInput) -> None:
         project_dir = self.project_dir(record.project_id)
@@ -123,7 +140,10 @@ class ProjectStorage:
             return InputStructureDraft.model_validate(value).model_dump(mode="json")
         if stage == 4:
             return SubtaskPlanDraft.model_validate(value).model_dump(mode="json")
-        return value
+        try:
+            return CodeDraft.model_validate(value).model_dump(mode="json")
+        except ValidationError as exc:
+            raise _incompatible_agent4_state("code draft", exc) from exc
 
     def save_draft(self, project_id: str, stage: int, draft: dict[str, Any]) -> None:
         filename = STAGE_FILES.get(stage)
@@ -153,7 +173,6 @@ class ProjectStorage:
             self._ensure_code_projection(project_dir)
 
         for filename in (
-            "agent4_feedback.json",
             "batch.json",
         ):
             with suppress(FileNotFoundError):
@@ -172,7 +191,6 @@ class ProjectStorage:
             self.clear_directory(project_id, directory)
 
     def save_code_draft(self, project_id: str, draft: CodeDraft) -> CodeDraft:
-        previous_revision = self.current_revision(project_id)
         digest = candidate_revision(draft)
         saved = draft.model_copy(update={"revision_id": digest})
         project_dir = self.project_dir(project_id)
@@ -190,9 +208,7 @@ class ProjectStorage:
                     temporary / "generated" / "validator.cpp",
                     saved.validator_code,
                 )
-                self.write_json(
-                    temporary / STAGE_FILES[5], saved.model_dump(mode="json")
-                )
+                self.write_json(temporary / STAGE_FILES[5], saved.model_dump(mode="json"))
                 os.replace(temporary, revision_dir)
             except Exception:
                 shutil.rmtree(temporary, ignore_errors=True)
@@ -209,10 +225,6 @@ class ProjectStorage:
         finally:
             with suppress(FileNotFoundError):
                 temporary_link.unlink()
-        if previous_revision != digest:
-            for filename in ("agent4_feedback.json",):
-                with suppress(FileNotFoundError):
-                    (project_dir / "state" / filename).unlink()
         return saved
 
     @staticmethod
@@ -249,9 +261,7 @@ class ProjectStorage:
         """
 
         project_dir = self.project_dir(project_id)
-        workspace_id = hashlib.sha256(
-            f"agent4-verification:{project_id}".encode()
-        ).hexdigest()[:32]
+        workspace_id = hashlib.sha256(f"agent4-verification:{project_id}".encode()).hexdigest()[:32]
         workspace = self.project_dir(workspace_id)
         if (workspace / "project.json").exists():
             raise AppError(
@@ -274,72 +284,64 @@ class ProjectStorage:
         draft = self.load_draft(project_id, 5)
         return None if draft is None else draft.get("revision_id")
 
-    def load_agent4_feedback(self, project_id: str) -> list[dict[str, Any]]:
-        path = self.project_dir(project_id) / "state" / "agent4_feedback.json"
-        if not path.is_file():
-            return []
-        value = json.loads(path.read_text(encoding="utf-8"))
-        return value if isinstance(value, list) else []
-
-    def append_agent4_feedback(self, project_id: str, value: dict[str, Any]) -> None:
-        feedback = self.load_agent4_feedback(project_id)
-        feedback.append(value)
-        self.write_json(
-            self.project_dir(project_id) / "state" / "agent4_feedback.json",
-            feedback[-10:],
-        )
-
-    def clear_agent4_feedback(self, project_id: str) -> None:
-        path = self.project_dir(project_id) / "state" / "agent4_feedback.json"
-        with suppress(FileNotFoundError):
-            path.unlink()
-
     def load_agent4_ledger(self, project_id: str) -> dict[str, Any]:
         path = self.project_dir(project_id) / "state" / "agent4-ledger.json"
         if not path.is_file():
-            return {"counterexamples": [], "last_valid_candidate_revision": None}
-        value = json.loads(path.read_text(encoding="utf-8"))
-        return (
-            value
-            if isinstance(value, dict)
-            else {
-                "counterexamples": [],
-                "last_valid_candidate_revision": None,
-            }
-        )
+            return CounterexampleLedger(
+                verifier_revision=AGENT4_VERIFIER_REVISION
+            ).model_dump(mode="json")
+        try:
+            return CounterexampleLedger.model_validate_json(
+                path.read_text(encoding="utf-8")
+            ).model_dump(mode="json")
+        except ValidationError as exc:
+            raise _incompatible_agent4_state("counterexample ledger", exc) from exc
 
     def save_agent4_ledger(self, project_id: str, value: dict[str, Any]) -> None:
-        self.write_json(self.project_dir(project_id) / "state" / "agent4-ledger.json", value)
+        validated = CounterexampleLedger.model_validate(value)
+        self.write_json(
+            self.project_dir(project_id) / "state" / "agent4-ledger.json",
+            validated.model_dump(mode="json"),
+        )
 
     def load_agent4_cache(self, project_id: str) -> dict[str, Any]:
         path = self.project_dir(project_id) / "state" / "agent4-cache.json"
         if not path.is_file():
-            return {"candidates": {}, "documents": {}}
-        value = json.loads(path.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else {"candidates": {}, "documents": {}}
+            return Agent4VerificationCache(
+                format_version=AGENT4_CACHE_FORMAT_VERSION,
+                verifier_revision=AGENT4_VERIFIER_REVISION,
+            ).model_dump(mode="json")
+        try:
+            return Agent4VerificationCache.model_validate_json(
+                path.read_text(encoding="utf-8")
+            ).model_dump(mode="json")
+        except ValidationError as exc:
+            raise _incompatible_agent4_state("verification cache", exc) from exc
 
     def save_agent4_cache(self, project_id: str, value: dict[str, Any]) -> None:
-        self.write_json(self.project_dir(project_id) / "state" / "agent4-cache.json", value)
-
-    def save_agent4_last_valid_candidate(
-        self, project_id: str, value: dict[str, Any]
-    ) -> None:
+        validated = Agent4VerificationCache.model_validate(value)
         self.write_json(
-            self.project_dir(project_id) / "state" / "agent4-last-valid-candidate.json",
-            value,
+            self.project_dir(project_id) / "state" / "agent4-cache.json",
+            validated.model_dump(mode="json"),
         )
 
-    def clear_agent4_last_valid_candidate(self, project_id: str) -> None:
-        path = self.project_dir(project_id) / "state" / "agent4-last-valid-candidate.json"
-        with suppress(FileNotFoundError):
-            path.unlink()
+    def save_agent4_last_valid_candidate(self, project_id: str, value: dict[str, Any]) -> None:
+        validated = CodeDraft.model_validate(value)
+        self.write_json(
+            self.project_dir(project_id) / "state" / "agent4-last-valid-candidate.json",
+            validated.model_dump(mode="json"),
+        )
 
     def load_agent4_last_valid_candidate(self, project_id: str) -> dict[str, Any] | None:
         path = self.project_dir(project_id) / "state" / "agent4-last-valid-candidate.json"
         if not path.is_file():
             return None
-        value = json.loads(path.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else None
+        try:
+            return CodeDraft.model_validate_json(
+                path.read_text(encoding="utf-8")
+            ).model_dump(mode="json")
+        except ValidationError as exc:
+            raise _incompatible_agent4_state("last valid candidate", exc) from exc
 
     def append_agent4_decision(self, project_id: str, entry: dict[str, Any]) -> None:
         path = self.project_dir(project_id) / "logs" / "agent4-decisions.jsonl"
@@ -372,14 +374,6 @@ class ProjectStorage:
 
     def save_batch_manifest(self, project_id: str, value: dict[str, Any]) -> None:
         self.write_json(self.project_dir(project_id) / "state" / "batch.json", value)
-
-    def append_agent4_document_selection(self, project_id: str, entry: dict[str, Any]) -> None:
-        """Append a content-free trace of Agent4's document retrieval."""
-        path = self.project_dir(project_id) / "logs" / "agent4-document-selection.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        value = {"timestamp": datetime.now(UTC).isoformat(), **entry}
-        with path.open("a", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n")
 
     def append_agent4_timing(self, project_id: str, entry: dict[str, Any]) -> None:
         """Append one stage-5 timing event without candidate or source content."""
@@ -443,3 +437,22 @@ class ProjectStorage:
             with suppress(FileNotFoundError):
                 os.unlink(temporary_name)
             raise
+
+
+def _incompatible_agent4_state(kind: str, exc: ValidationError) -> AppError:
+    return AppError(
+        "AGENT4_STATE_INCOMPATIBLE",
+        f"阶段五 {kind} 不符合当前严格契约；旧阶段五状态不会被迁移或兼容。",
+        stage=5,
+        status_code=409,
+        details={
+            "validation_errors": [
+                {
+                    "location": ".".join(str(part) for part in error["loc"]),
+                    "type": error["type"],
+                    "message": error["msg"],
+                }
+                for error in exc.errors(include_url=False)
+            ]
+        },
+    )

@@ -12,7 +12,11 @@ from pydantic import ValidationError
 from app.config import Settings
 from app.errors import AppError
 from app.models import ModelConfigurationUpdate, ModelRuntimeConfiguration
-from app.services.model_client import AgentModel, OpenAICompatibleAgentModel
+from app.services.model_client import (
+    AgentModel,
+    OpenAICompatibleAgentModel,
+    structured_output_controls,
+)
 from app.storage import ProjectStorage
 
 logger = logging.getLogger(__name__)
@@ -83,42 +87,102 @@ class ModelConfigurationService:
         client = self._client or httpx.AsyncClient(timeout=config.timeout_seconds)
         started = time.perf_counter()
         try:
-            response = await client.post(
-                f"{config.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {config.api_key}"},
-                json={
-                    "model": config.model_name,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": "只返回 JSON（json）对象，不要输出解释或 Markdown。",
-                        },
-                        {
-                            "role": "user",
-                            "content": '请严格返回这个 JSON 示例：{"ok": true}',
-                        },
-                    ],
-                    "temperature": 0,
-                    "response_format": {"type": "json_object"},
-                    "max_tokens": 64,
-                },
-            )
-            response.raise_for_status()
-            body = response.json()
-            if not body.get("choices"):
-                raise ValueError("响应中缺少 choices")
-            content = body["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
+            try:
+                response = await client.post(
+                    f"{config.base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {config.api_key}"},
+                    json={
+                        "model": config.model_name,
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": "只返回 JSON（json）对象，不要输出解释或 Markdown。",
+                            },
+                            {
+                                "role": "user",
+                                "content": '请严格返回这个 JSON 示例：{"ok": true}',
+                            },
+                        ],
+                        "temperature": 0,
+                        "max_tokens": 64,
+                        **structured_output_controls(),
+                    },
+                )
+            except httpx.RequestError as exc:
+                raise AppError(
+                    "MODEL_CONNECTION_FAILED",
+                    "无法连接模型服务，请检查 API 地址和网络连接。",
+                    status_code=502,
+                    details={"error_type": type(exc).__name__},
+                ) from exc
+
+            if response.is_error:
+                details = self._provider_error_details(response)
+                provider_message = details.get("provider_message")
+                message = f"模型服务拒绝了连接测试请求（HTTP {response.status_code}）"
+                if provider_message:
+                    message += f"：{provider_message}"
+                raise AppError(
+                    "MODEL_PROVIDER_REQUEST_FAILED",
+                    message,
+                    status_code=502,
+                    details=details,
+                )
+
+            try:
+                body = response.json()
+                choices = body["choices"]
+                choice = choices[0]
+                content = choice["message"]["content"]
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+                raise AppError(
+                    "MODEL_RESPONSE_INVALID",
+                    "模型服务已连接，但返回内容不符合 Chat Completions 协议。",
+                    status_code=502,
+                ) from exc
+
+            if not isinstance(content, str) or not content.strip():
+                finish_reason = choice.get("finish_reason")
+                truncated = finish_reason == "length"
+                raise AppError(
+                    "MODEL_RESPONSE_TRUNCATED" if truncated else "MODEL_RESPONSE_INVALID",
+                    (
+                        "模型服务已连接，但测试输出达到 token 上限，未生成最终 JSON。"
+                        if truncated
+                        else "模型服务已连接，但没有返回可验证的最终内容。"
+                    ),
+                    status_code=502,
+                    details={
+                        "finish_reason": finish_reason,
+                        "reasoning_content_present": bool(
+                            choice.get("message", {}).get("reasoning_content")
+                        ),
+                    },
+                )
+
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError as exc:
+                raise AppError(
+                    "MODEL_JSON_OUTPUT_INVALID",
+                    "模型服务已连接，但没有返回有效的 JSON Object。",
+                    status_code=502,
+                ) from exc
             if not isinstance(parsed, dict) or parsed.get("ok") is not True:
-                raise ValueError("JSON Output 未返回预期内容")
-        except (httpx.HTTPError, KeyError, ValueError, TypeError) as exc:
-            status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
-            details = {"http_status": status} if status is not None else None
+                raise AppError(
+                    "MODEL_JSON_OUTPUT_INVALID",
+                    "模型服务已连接，但返回的 JSON 不符合连接测试契约。",
+                    status_code=502,
+                )
+        except AppError:
+            raise
+        except Exception as exc:
+            logger.exception("Unexpected model connection test failure")
             raise AppError(
                 "MODEL_CONNECTION_FAILED",
-                "模型连接测试失败，请检查地址、模型名称和 API Key。",
+                "模型连接测试发生未预期错误。",
                 status_code=502,
-                details=details,
+                details={"error_type": type(exc).__name__},
             ) from exc
         finally:
             if owns_client:
@@ -129,6 +193,29 @@ class ModelConfigurationService:
             "latency_ms": round((time.perf_counter() - started) * 1000),
             "message": "模型连接测试通过。",
         }
+
+    @staticmethod
+    def _provider_error_details(response: httpx.Response) -> dict[str, Any]:
+        details: dict[str, Any] = {"http_status": response.status_code}
+        try:
+            body = response.json()
+        except (json.JSONDecodeError, ValueError):
+            return details
+        if not isinstance(body, dict):
+            return details
+        error = body.get("error", body)
+        if not isinstance(error, dict):
+            return details
+        for source, target in (
+            ("code", "provider_code"),
+            ("type", "provider_type"),
+            ("param", "provider_param"),
+            ("message", "provider_message"),
+        ):
+            value = error.get(source)
+            if isinstance(value, (str, int, float, bool)):
+                details[target] = str(value)[:500]
+        return details
 
     def _load(self) -> ModelRuntimeConfiguration:
         if self.path.is_file():
@@ -171,9 +258,7 @@ class ModelConfigurationService:
         self.settings.agent_trial_seeds_per_subtask = config.trial_seeds_per_subtask
 
     @staticmethod
-    def _ensure_configured(
-        config: ModelRuntimeConfiguration, *, status_code: int = 500
-    ) -> None:
+    def _ensure_configured(config: ModelRuntimeConfiguration, *, status_code: int = 500) -> None:
         if config.api_key:
             return
         raise AppError(

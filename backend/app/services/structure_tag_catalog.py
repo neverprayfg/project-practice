@@ -8,13 +8,19 @@ from typing import Any
 from app.errors import AppError
 
 TAG_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$")
-DEFAULT_TAG_CATALOG_ROOT = Path(__file__).resolve().parent.parent / "jngen_doc_context"
+APP_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_TAG_CATALOG_PATH = APP_ROOT / "structure_context" / "tag_catalog.json"
+DEFAULT_JNGEN_DOCUMENT_ROOT = APP_ROOT / "generator_context" / "jngen_context" / "doc"
 
 
 class StructureTagCatalog:
-    def __init__(self, root: Path = DEFAULT_TAG_CATALOG_ROOT) -> None:
-        self.root = root
-        self.path = root / "tag_catalog.json"
+    def __init__(
+        self,
+        catalog_path: Path = DEFAULT_TAG_CATALOG_PATH,
+        document_root: Path = DEFAULT_JNGEN_DOCUMENT_ROOT,
+    ) -> None:
+        self.path = catalog_path
+        self.document_root = document_root
         self._raw = self._load_and_validate()
         self.version = int(self._raw["version"])
         self.base_documents = list(self._raw["base_documents"])
@@ -178,7 +184,8 @@ class StructureTagCatalog:
             )
         )
         selected_characters = sum(
-            len((self.root / filename).read_text(encoding="utf-8")) for filename in filenames
+            len((self.document_root / filename).read_text(encoding="utf-8"))
+            for filename in filenames
         )
         if selected_characters > maximum_context_characters:
             raise AppError(
@@ -218,7 +225,9 @@ class StructureTagCatalog:
         if len(ids) != len(tags) or len(ids) != len(set(ids)):
             raise AppError("TAG_CATALOG_INVALID", "结构标签 ID 必须唯一。", stage=3)
         entries = {str(item["id"]): item for item in tags}
-        available_documents = {path.name for path in self.root.glob("*.md") if path.is_file()}
+        available_documents = {
+            path.name for path in self.document_root.glob("*.md") if path.is_file()
+        }
         required_keys = {
             "id",
             "display_name",

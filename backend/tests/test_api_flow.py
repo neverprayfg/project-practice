@@ -8,13 +8,6 @@ from fastapi.testclient import TestClient
 
 INPUT_DRAFT = {
     "template": "第一行读取整数 n，表示后续整数序列的长度。",
-    "structure_tags": [
-        {
-            "tag_id": "primitive.integer",
-            "applies_to": "整数 n 及序列元素",
-            "evidence": "输入模板明确它们都是整数。",
-        }
-    ],
     "issues": [],
 }
 
@@ -22,7 +15,6 @@ PLAN_DRAFT = {
     "subtasks": [
         {
             "id": 1,
-            "constraints": "n 不超过 10。",
             "test_count": 2,
             "expected_complexity": "O(n)",
             "special_cases": [{"count": 1, "description": "minimum value"}],
@@ -31,20 +23,12 @@ PLAN_DRAFT = {
     "issues": [],
 }
 
-TWO_SUBTASK_PLAN = {
+WHOLE_PROBLEM_PLAN = {
     "subtasks": [
         {
             "id": 1,
-            "constraints": "1 <= n <= 10",
-            "test_count": 2,
-            "expected_complexity": "O(n)",
-            "special_cases": [],
-        },
-        {
-            "id": 2,
-            "constraints": "11 <= n <= 100",
             "test_count": 3,
-            "expected_complexity": "O(n log n)",
+            "expected_complexity": "O(n)",
             "special_cases": [],
         },
     ],
@@ -52,37 +36,13 @@ TWO_SUBTASK_PLAN = {
 }
 
 CODE_DRAFT = {
+    "format_contract_id": "format_" + "0" * 24,
     "generator_code": (
         '#include "testlib.h"\nint main(int argc,char** argv){registerGen(argc,argv,1);}'
     ),
     "validator_code": (
         '#include "testlib.h"\nint main(int argc,char** argv){registerValidation(argc,argv);}'
     ),
-    "proof_obligations": [
-        {
-            "constraint_id": "placeholder:code",
-            "scope": "candidate",
-            "severity": "blocker",
-            "verification_method": "static",
-            "requirement": "由 Agent4 运行时替换。",
-        }
-    ],
-    "implementation_mapping": [
-        {
-            "constraint_id": "placeholder:code",
-            "locations": [
-                {
-                    "target_file": "generator.cpp",
-                    "symbol": "include",
-                    "line_start": 1,
-                    "line_end": 1,
-                }
-            ],
-            "used_parameters": [],
-            "document_evidence": [],
-            "test_strategy": "由 Agent4 运行时替换。",
-        }
-    ],
     "issues": [],
 }
 
@@ -112,7 +72,7 @@ def test_structure_tag_catalog_is_exposed(app_bundle) -> None:
     assert any(item["id"] == "tree" for item in response.json()["tags"])
 
 
-def test_stage_five_contract_preflight_returns_project_to_stage_four(app_bundle) -> None:
+def test_stage_five_does_not_return_project_to_stage_four_for_plan_advice(app_bundle) -> None:
     client, _sandbox = app_bundle
     created = client.post(
         "/api/projects",
@@ -134,13 +94,11 @@ def test_stage_five_contract_preflight_returns_project_to_stage_four(app_bundle)
 
     response = client.post(f"/api/projects/{project_id}/stages/5/run", json={})
 
-    assert response.status_code == 409
-    assert response.json()["code"] == "UPSTREAM_CONTRACT_INVALID"
-    assert response.json()["stage"] == 4
+    assert response.status_code == 200
     project = client.get(f"/api/projects/{project_id}").json()["project"]
-    assert project["current_stage"] == 4
-    assert project["stages"]["4"]["status"] == "draft"
-    assert project["stages"]["5"]["status"] == "failed"
+    assert project["current_stage"] == 5
+    assert project["stages"]["4"]["status"] == "passed"
+    assert project["stages"]["5"]["status"] == "draft"
 
 
 def test_complete_mvp_flow_exports_only_required_files(
@@ -295,7 +253,7 @@ def test_stage_three_runs_langgraph_and_waits_for_user(
     assert project["stage_threads"]["3"].startswith(f"{project_id}:agent2:")
 
 
-def test_agent_three_creates_five_subtasks_on_initial_run(
+def test_agent_three_creates_one_whole_problem_subtask_on_initial_run(
     created_project: tuple[TestClient, str],
 ) -> None:
     client, project_id = created_project
@@ -310,11 +268,51 @@ def test_agent_three_creates_five_subtasks_on_initial_run(
     stage_four = client.post(f"/api/projects/{project_id}/stages/4/run", json={})
 
     assert stage_four.status_code == 200, stage_four.text
-    assert len(stage_four.json()["draft"]["subtasks"]) == 5
+    assert len(stage_four.json()["draft"]["subtasks"]) == 1
     assert stage_four.json()["agent"]["waiting_user"] is True
 
 
-def test_generate_selected_subtask_then_validate_as_separate_stages(
+def test_agent_three_preserves_user_configured_subtask_count(
+    created_project: tuple[TestClient, str],
+) -> None:
+    client, project_id = created_project
+    client.post(f"/api/projects/{project_id}/solution/compile")
+    stage_three = client.post(f"/api/projects/{project_id}/stages/3/run", json={})
+    assert stage_three.status_code == 200, stage_three.text
+    client.post(
+        f"/api/projects/{project_id}/stages/3/confirm",
+        json={"confirmed": True},
+    )
+    subtasks = [
+        {
+            "id": subtask_id,
+            "test_count": 1,
+            "expected_complexity": "O(n)",
+            "special_cases": [],
+            "runtime_parameters": [
+                {
+                    "case_id": 1,
+                    "parameters": [
+                        {"name": "n", "value": subtask_id, "category": "size"},
+                    ],
+                }
+            ],
+        }
+        for subtask_id in (1, 2)
+    ]
+    saved = client.put(
+        f"/api/projects/{project_id}/stages/4/draft",
+        json={"draft": {"subtasks": subtasks, "issues": []}},
+    )
+    assert saved.status_code == 200, saved.text
+
+    stage_four = client.post(f"/api/projects/{project_id}/stages/4/run", json={})
+
+    assert stage_four.status_code == 200, stage_four.text
+    assert [item["id"] for item in stage_four.json()["draft"]["subtasks"]] == [1, 2]
+
+
+def test_generate_whole_problem_plan_then_validate_as_separate_stages(
     app_bundle: tuple[TestClient, FakeSandbox],
 ) -> None:
     client, sandbox = app_bundle
@@ -329,17 +327,17 @@ def test_generate_selected_subtask_then_validate_as_separate_stages(
     project_id = created.json()["project_id"]
     client.post(f"/api/projects/{project_id}/solution/compile")
     save_run_confirm(client, project_id, 3, INPUT_DRAFT)
-    save_run_confirm(client, project_id, 4, TWO_SUBTASK_PLAN)
+    save_run_confirm(client, project_id, 4, WHOLE_PROBLEM_PLAN)
     save_run_confirm(client, project_id, 5, CODE_DRAFT)
 
     generated = client.post(
         f"/api/projects/{project_id}/generate",
-        json={"base_seed": 17, "selected_subtask_ids": [2]},
+        json={"base_seed": 17, "selected_subtask_ids": [1]},
     )
 
     assert generated.status_code == 200, generated.text
     assert generated.json()["generated_tests"] == 3
-    assert generated.json()["selected_subtasks"] == [2]
+    assert generated.json()["selected_subtasks"] == [1]
     project = client.get(f"/api/projects/{project_id}").json()["project"]
     assert project["current_stage"] == 7
     assert project["generation_complete"] is True
@@ -348,7 +346,7 @@ def test_generate_selected_subtask_then_validate_as_separate_stages(
     generated_paths = [
         call[4] for call in sandbox.calls if call[0] == "generate" and call[4].startswith("data/")
     ]
-    assert generated_paths == ["data/2_1.in", "data/2_2.in", "data/2_3.in"]
+    assert generated_paths == ["data/1_1.in", "data/1_2.in", "data/1_3.in"]
 
     validated = client.post(f"/api/projects/{project_id}/validate", json={})
 
@@ -362,7 +360,7 @@ def test_generate_selected_subtask_then_validate_as_separate_stages(
     assert manifest is not None
     assert manifest["status"] == "completed"
     assert manifest["base_seed"] == 17
-    assert manifest["selected_subtasks"] == [2]
+    assert manifest["selected_subtasks"] == [1]
     assert len(manifest["files"]) == 3
     assert all(item["runtime_arguments"] for item in manifest["files"])
     assert all(item["validation"]["ok"] for item in manifest["files"])
@@ -475,7 +473,6 @@ def test_editing_earlier_stage_clears_active_downstream_context_and_artifacts(
     save_run_confirm(client, project_id, 5, CODE_DRAFT)
     storage = client.app.state.storage
     before = client.get(f"/api/projects/{project_id}").json()["project"]
-    storage.append_agent4_feedback(project_id, {"message": "old feedback"})
     storage.save_batch_manifest(project_id, {"status": "completed"})
     for directory, filename in (
         ("preview", "old.in"),
@@ -497,7 +494,6 @@ def test_editing_earlier_stage_clears_active_downstream_context_and_artifacts(
     assert project["workflow_revision"] == before["workflow_revision"] + 1
     assert loaded["drafts"]["4"] is None
     assert loaded["drafts"]["5"] is None
-    assert storage.load_agent4_feedback(project_id) == []
     assert storage.load_batch_manifest(project_id) is None
     for directory in ("preview", "data", "bin", "export"):
         assert list((storage.project_dir(project_id) / directory).iterdir()) == []
@@ -564,8 +560,11 @@ def test_validator_failure_returns_project_to_stage_five(
     response = client.post(f"/api/projects/{project_id}/validate", json={})
     assert response.status_code == 400
     assert response.json()["stage"] == 5
-    assert response.json()["details"]["failure_category"] == "validation"
-    assert response.json()["details"]["feedback"]["operation"] == "validate"
+    details = response.json()["details"]
+    assert details["defect_id"].startswith("defect_")
+    assert details["defect"]["identity"]["category"] == "validation"
+    assert details["defect"]["identity"]["target_file"] == "generator.cpp"
+    assert details["check"]["operation"] == "validate"
     project = client.get(f"/api/projects/{project_id}").json()["project"]
     assert project["current_stage"] == 5
     assert project["stages"]["5"]["ai_confirmed"] is False

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import defaultdict
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
+
+from pydantic import ValidationError
 
 from app.errors import AppError
 from app.models import (
@@ -25,8 +28,9 @@ from app.storage import ProjectStorage
 STAGE_TASKS = {
     Stage.INPUT_STRUCTURE: TaskType.INPUT_STRUCTURE,
     Stage.SUBTASK_PLAN: TaskType.SUBTASK_PLAN,
-    Stage.CODE_DRAFT: TaskType.CODE_DRAFT,
 }
+
+logger = logging.getLogger(__name__)
 
 
 class PipelineService:
@@ -91,9 +95,7 @@ class PipelineService:
                 "input": self.storage.load_input(project_id).model_dump(mode="json"),
             }
 
-    async def run_stage(
-        self, project_id: str, stage: int, requested_task: TaskType | None = None
-    ) -> dict[str, Any]:
+    async def run_stage(self, project_id: str, stage: int) -> dict[str, Any]:
         async with self._locks[project_id]:
             record = self.projects.get(project_id)
             self._check_stage_prerequisites(record, stage)
@@ -104,16 +106,7 @@ class PipelineService:
                     stage=stage,
                     status_code=409,
                 )
-            task_type = STAGE_TASKS[Stage(stage)]
-            if stage == Stage.CODE_DRAFT and requested_task not in {
-                None,
-                TaskType.CODE_DRAFT,
-            }:
-                raise AppError(
-                    "INVALID_TASK_TYPE",
-                    "阶段 5 只能运行统一的代码生成与验证任务。",
-                    stage=5,
-                )
+            stage_value = Stage(stage)
             state = record.stages[stage]
             if state.status == StageStatus.WAITING_USER or stage in record.stage_threads:
                 raise AppError(
@@ -151,12 +144,16 @@ class PipelineService:
                 if current is not None:
                     current = dict(current)
                     current.pop("issues", None)
-                context = self.contexts.build(project_id, task_type)
-                if task_type == TaskType.INPUT_STRUCTURE:
+                context = (
+                    self.contexts.build_agent4(project_id)
+                    if stage_value == Stage.CODE_DRAFT
+                    else self.contexts.build(project_id, STAGE_TASKS[stage_value])
+                )
+                if stage_value == Stage.INPUT_STRUCTURE:
                     thread_id, output, waiting_user = await self.agents.run_agent2(
                         project_id, context, current or {}, requires_user=True
                     )
-                elif task_type == TaskType.SUBTASK_PLAN:
+                elif stage_value == Stage.SUBTASK_PLAN:
                     thread_id, output, waiting_user = await self.agents.run_agent3(
                         project_id, context, current or {}, requires_user=True
                     )
@@ -213,12 +210,27 @@ class PipelineService:
                     self._record_failure(project_id, stage, exc)
                 raise
             except Exception as exc:
+                logger.exception(
+                    "Unexpected stage failure: project_id=%s stage=%s",
+                    project_id,
+                    stage,
+                )
+                details: dict[str, Any] = {"exception_type": type(exc).__name__}
+                if isinstance(exc, ValidationError):
+                    details["validation_errors"] = [
+                        {
+                            "location": ".".join(str(part) for part in item["loc"]),
+                            "type": item["type"],
+                            "message": item["msg"],
+                        }
+                        for item in exc.errors(include_url=False, include_context=False)
+                    ]
                 error = AppError(
                     "STAGE_RUN_FAILED",
                     "阶段执行发生未预期错误，已安全结束本次运行。",
                     stage=stage,
                     status_code=500,
-                    details={"exception_type": type(exc).__name__},
+                    details=details,
                 )
                 thread_id = getattr(exc, "agent_thread_id", None) or retry_thread
                 if thread_id:

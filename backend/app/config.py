@@ -33,8 +33,7 @@ class Settings(BaseSettings):
     model_api_key: str = ""
     model_name: str = "deepseek-chat"
     model_timeout_seconds: float = 120.0
-    model_max_output_tokens: int = Field(default=32_768, ge=1_024, le=131_072)
-    agent_jngen_document_context_chars: int = Field(default=64_000, ge=8_000, le=100_000)
+    model_max_output_tokens: int = Field(default=131_072, ge=1_024, le=131_072)
     agent_trial_seeds_per_subtask: int = Field(default=1, ge=1, le=5)
 
     docker_host: str | None = Field(default=None, validation_alias="DOCKER_HOST")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from time import perf_counter
 from typing import Any
@@ -8,16 +9,35 @@ from uuid import uuid4
 
 from app.config import Settings
 from app.models import CodeDraft, Counterexample, SubtaskPlanDraft
+from app.services.agent4_document_context import (
+    CONTEXT_FORMAT_VERSION,
+    CONTEXT_LOADING_METHOD,
+)
 from app.services.compiler_diagnostics import parse_compiler_diagnostics
-from app.services.jngen_policy import jngen_usage_issues
-from app.services.proof_obligations import implementation_mapping_findings
+from app.services.generator_policy import generator_usage_issues
 from app.services.runtime_parameters import runtime_parameter_issues, serialized_arguments
 from app.services.sandbox import GenerationJob, Sandbox, ValidationJob
-from app.services.structure_tag_catalog import StructureTagCatalog
 from app.services.testlib_policy import validator_usage_issues
 from app.storage import ProjectStorage
 
-AGENT4_VERIFIER_REVISION = "agent4-verifier-v5"
+
+def _recursive_context_value(value: Any) -> bool:
+    if isinstance(value, str):
+        return True
+    if not isinstance(value, dict):
+        return False
+    return all(
+        isinstance(key, str) and bool(key) and _recursive_context_value(child)
+        for key, child in value.items()
+    )
+
+
+def _context_has_text(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if not isinstance(value, dict):
+        return False
+    return any(_context_has_text(child) for child in value.values())
 
 
 class Agent4CandidateVerifier:
@@ -28,12 +48,10 @@ class Agent4CandidateVerifier:
         settings: Settings,
         storage: ProjectStorage,
         sandbox: Sandbox,
-        tag_catalog: StructureTagCatalog | None = None,
     ) -> None:
         self.settings = settings
         self.storage = storage
         self.sandbox = sandbox
-        self.tag_catalog = tag_catalog or StructureTagCatalog()
 
     async def verify(
         self,
@@ -69,9 +87,7 @@ class Agent4CandidateVerifier:
         replayable_counterexamples = [
             item for item in counterexamples if self._replay_signature(item) is not None
         ]
-        requested_replay_ids = {
-            item.counterexample_id for item in replayable_counterexamples
-        }
+        requested_replay_ids = {item.counterexample_id for item in replayable_counterexamples}
         completed_replay_ids: set[str] = set()
         fully_evaluated_operations: set[str] = set()
 
@@ -83,67 +99,131 @@ class Agent4CandidateVerifier:
             execution["history_replay_complete"] = requested_replay_ids.issubset(
                 completed_replay_ids
             )
-            execution["fully_evaluated_operations"] = sorted(
-                fully_evaluated_operations
-            )
+            execution["fully_evaluated_operations"] = sorted(fully_evaluated_operations)
             return verified, execution
-        documentation = context.get("jngen_documentation", {})
-        selected_documents = (
-            documentation.get("selected_documents", []) if isinstance(documentation, dict) else []
-        )
-        selected_filenames = [
+
+        documentation = context.get("agent4_library_context_bundle", {})
+        documents = documentation.get("documents", []) if isinstance(documentation, dict) else []
+        filenames = [
             str(item["filename"])
-            for item in selected_documents
+            for item in documents
             if isinstance(item, dict) and item.get("filename")
         ]
+        role_contexts = (
+            documentation.get("role_contexts", {})
+            if isinstance(documentation, dict)
+            else {}
+        )
+        raw_generator_libraries = (
+            role_contexts.get("generator") if isinstance(role_contexts, dict) else None
+        )
+        raw_validator_libraries = (
+            role_contexts.get("validator") if isinstance(role_contexts, dict) else None
+        )
+        generator_libraries = (
+            raw_generator_libraries
+            if isinstance(raw_generator_libraries, dict)
+            else {}
+        )
+        validator_libraries = (
+            raw_validator_libraries
+            if isinstance(raw_validator_libraries, dict)
+            else {}
+        )
+        documentation_ok = bool(
+            isinstance(documentation, dict)
+            and documentation.get("loading_method") == CONTEXT_LOADING_METHOD
+            and documentation.get("format_version") == CONTEXT_FORMAT_VERSION
+            and isinstance(documentation.get("roles"), dict)
+            and isinstance(role_contexts, dict)
+            and set(generator_libraries) == {"jngen_context"}
+            and set(validator_libraries) == {"testlib_context"}
+            and all(
+                isinstance(library, dict)
+                and set(library) == {"doc", "example"}
+                and _recursive_context_value(library)
+                and _context_has_text(library["doc"])
+                and _context_has_text(library["example"])
+                for library in (
+                    generator_libraries.get("jngen_context"),
+                    validator_libraries.get("testlib_context"),
+                )
+            )
+            and bool(documents)
+            and len(filenames) == documentation.get("document_count")
+            and len(filenames) == len(set(filenames))
+            and set(documentation["roles"]) == {"generator", "validator"}
+            and all(
+                documentation["roles"].get(role)
+                and documentation["roles"][role]
+                == [
+                    item["filename"]
+                    for item in documents
+                    if isinstance(item, dict) and item.get("role") == role
+                ]
+                for role in ("generator", "validator")
+            )
+            and all(
+                isinstance(item, dict)
+                and item.get("role") in {"generator", "validator"}
+                and isinstance(item.get("content"), str)
+                and bool(item["content"])
+                and isinstance(item.get("digest"), str)
+                and item["digest"] == hashlib.sha256(item["content"].encode("utf-8")).hexdigest()
+                for item in documents
+            )
+            and documentation.get("total_characters")
+            == sum(len(item["content"]) for item in documents)
+        )
+        expected_format_contract_id = (
+            context.get("input_format_contract", {}).get("format_contract_id")
+            if isinstance(context.get("input_format_contract"), dict)
+            else None
+        )
+        format_contract_ok = bool(
+            expected_format_contract_id
+            and model.format_contract_id == expected_format_contract_id
+        )
         checks: list[dict[str, Any]] = [
             {
-                "operation": "jngen_documentation",
-                "selected_filenames": selected_filenames,
-                "selection_method": documentation.get("selection_method")
+                "operation": "input_format_contract",
+                "ok": format_contract_ok,
+                "expected_format_contract_id": expected_format_contract_id,
+                "candidate_format_contract_id": model.format_contract_id,
+            },
+            {
+                "operation": "agent4_library_context_bundle",
+                "ok": documentation_ok,
+                "filenames": filenames,
+                "loading_method": documentation.get("loading_method")
                 if isinstance(documentation, dict)
                 else None,
-                "selected_tag_ids": documentation.get("selected_tag_ids", [])
-                if isinstance(documentation, dict)
-                else [],
+                "document_count": len(filenames),
+                "role_contexts_valid": bool(role_contexts),
             }
         ]
-        if not selected_filenames:
-            return finish(
-                model.model_dump(mode="json", exclude={"issues"}),
-                self._failed("缺少 Agent4 已读取的 jngen 文档上下文。", checks, "library_api"),
-            )
-        document_index = {
-            str(item["filename"]): item
-            for item in selected_documents
-            if isinstance(item, dict) and item.get("filename")
-        }
-        mapping_findings = implementation_mapping_findings(model, document_index)
-        fully_evaluated_operations.add("implementation_mapping")
-        if mapping_findings:
+        fully_evaluated_operations.add("input_format_contract")
+        if not format_contract_ok:
             return finish(
                 model.model_dump(mode="json", exclude={"issues"}),
                 self._failed(
-                    "约束实现映射未通过验证。",
-                    [
-                    *checks,
-                    *(
-                        {
-                            "operation": "implementation_mapping",
-                            "ok": False,
-                            "constraint_id": finding["constraint_id"],
-                            "target_file": finding["target_file"],
-                            "error_code": finding["error_code"],
-                            "issues": [finding["message"]],
-                        }
-                        for finding in mapping_findings
-                    ),
-                    ],
-                    "proof_obligation",
+                    "generator 与 validator 没有绑定到当前冻结的输入格式契约。",
+                    checks,
+                    "input_format",
                 ),
             )
-        checks.append({"operation": "implementation_mapping", "ok": True, "level": "static"})
-        usage_issues = jngen_usage_issues(model.generator_code)
+        fully_evaluated_operations.add("agent4_library_context_bundle")
+        if not documentation_ok:
+            return finish(
+                model.model_dump(mode="json", exclude={"issues"}),
+                self._failed(
+                    "Agent4 必须接收 generator 与 validator 的完整角色文档上下文。",
+                    checks,
+                    "library_api",
+                ),
+            )
+        usage_issues = generator_usage_issues(model.generator_code)
+        fully_evaluated_operations.add("generator_library_usage")
         if usage_issues:
             return finish(
                 model.model_dump(mode="json", exclude={"issues"}),
@@ -151,27 +231,49 @@ class Agent4CandidateVerifier:
                     "ok": False,
                     "failure_category": "library_api",
                     "validation_level": "static",
-                    "message": "生成器未按当前输入结构使用 jngen。",
+                    "message": "生成器未正确接入 testlib 或 jngen。",
                     "checks": [
                         *checks,
-                        {"operation": "jngen_usage", "ok": False, "issues": usage_issues},
+                        {
+                            "operation": "generator_library_usage",
+                            "ok": False,
+                            "issues": usage_issues,
+                        },
                     ],
                 },
             )
-        checks.append({"operation": "jngen_usage", "ok": True, "level": "static"})
-        validator_issues = validator_usage_issues(model.validator_code)
+        checks.append(
+            {"operation": "generator_library_usage", "ok": True, "level": "static"}
+        )
+        input_format_contract = context.get("input_format_contract", {})
+        sample_inputs = (
+            input_format_contract.get("reference_sample_inputs", [])
+            if isinstance(input_format_contract, dict)
+            else []
+        )
+        requires_ascii_space = any(
+            " " in line
+            for sample in sample_inputs
+            if isinstance(sample, str)
+            for line in sample.splitlines()
+        )
+        validator_issues = validator_usage_issues(
+            model.validator_code,
+            requires_ascii_space=requires_ascii_space,
+        )
+        fully_evaluated_operations.add("testlib_usage")
         if validator_issues:
             return finish(
                 model.model_dump(mode="json", exclude={"issues"}),
                 self._failed(
                     "validator 未遵守 testlib 固定接入骨架。",
                     [
-                    *checks,
-                    {
-                        "operation": "testlib_usage",
-                        "ok": False,
-                        "issues": validator_issues,
-                    },
+                        *checks,
+                        {
+                            "operation": "testlib_usage",
+                            "ok": False,
+                            "issues": validator_issues,
+                        },
                     ],
                     "library_api",
                 ),
@@ -181,14 +283,15 @@ class Agent4CandidateVerifier:
         if plan_raw is None:
             return finish(
                 model.model_dump(mode="json", exclude={"issues"}),
-                self._failed("缺少已确认的子任务。", checks, "upstream_contract"),
+                self._failed("缺少已确认的生成计划。", checks, "generation_plan"),
             )
         plan = SubtaskPlanDraft.model_validate(plan_raw)
         parameter_issues = runtime_parameter_issues(plan)
+        fully_evaluated_operations.add("runtime_parameters")
         if parameter_issues:
             return finish(
                 model.model_dump(mode="json", exclude={"issues"}),
-                self._failed("；".join(parameter_issues), checks, "upstream_contract"),
+                self._failed("；".join(parameter_issues), checks, "generation_plan"),
             )
         checks.append({"operation": "runtime_parameters", "ok": True, "level": "static"})
         required_parameters = {
@@ -197,7 +300,8 @@ class Agent4CandidateVerifier:
             for profile in subtask.runtime_parameters
             for parameter in profile.parameters
         }
-        usage_issues = jngen_usage_issues(model.generator_code, required_parameters)
+        usage_issues = generator_usage_issues(model.generator_code, required_parameters)
+        fully_evaluated_operations.add("generator_runtime_parameters")
         if usage_issues:
             return finish(
                 model.model_dump(mode="json", exclude={"issues"}),
@@ -205,13 +309,20 @@ class Agent4CandidateVerifier:
                     "ok": False,
                     "failure_category": "library_api",
                     "validation_level": "static",
-                    "message": "生成器未按当前输入结构使用 jngen。",
+                    "message": "生成器没有通过所选库读取全部运行时参数。",
                     "checks": [
                         *checks,
-                        {"operation": "jngen_usage", "ok": False, "issues": usage_issues},
+                        {
+                            "operation": "generator_runtime_parameters",
+                            "ok": False,
+                            "issues": usage_issues,
+                        },
                     ],
                 },
             )
+        checks.append(
+            {"operation": "generator_runtime_parameters", "ok": True, "level": "static"}
+        )
         roles = ("solution", "generator", "validator")
         compile_started = perf_counter()
         try:
@@ -236,6 +347,7 @@ class Agent4CandidateVerifier:
             status="ok" if all(result.ok for result in compiled_results) else "failed",
             metadata={"roles": list(roles)},
         )
+        fully_evaluated_operations.add("compile")
         for role, result in zip(roles, compiled_results, strict=True):
             serialized = result.model_dump(mode="json")
             compile_check = {
@@ -281,9 +393,7 @@ class Agent4CandidateVerifier:
                         output_relative,
                     )
 
-        jobs_by_signature = {
-            self._job_signature(job): job for job in generation_jobs
-        }
+        jobs_by_signature = {self._job_signature(job): job for job in generation_jobs}
         replay_ids_by_input: dict[str, set[str]] = {}
         for counterexample in replayable_counterexamples:
             signature = self._replay_signature(counterexample)
@@ -553,10 +663,7 @@ class Agent4CandidateVerifier:
             check
             for check in checks
             if check.get("ok") is False
-            or (
-                isinstance(check.get("result"), dict)
-                and check["result"].get("ok") is False
-            )
+            or (isinstance(check.get("result"), dict) and check["result"].get("ok") is False)
         ]
         context_checks = [check for check in checks if check not in failed_checks][-8:]
         return {

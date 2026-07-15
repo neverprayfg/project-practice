@@ -11,6 +11,8 @@ from uuid import uuid4
 from app.config import Settings
 from app.errors import AppError
 from app.models import Stage, StageStatus, Subtask, SubtaskPlanDraft
+from app.services.counterexample_ledger import CounterexampleLedgerService
+from app.services.defects import defects_from_execution
 from app.services.project_service import ProjectService
 from app.services.runtime_parameters import profile_for_case, serialized_arguments
 from app.services.sandbox import GenerationJob, Sandbox, ValidationJob
@@ -127,8 +129,9 @@ class DatasetService:
                     {
                         "operation": "generate",
                         "subtask_id": subtask.id,
-                        "internal_id": internal_id,
+                        "case_id": internal_id,
                         "seed": seed,
+                        "runtime_arguments": job.runtime_arguments,
                         "result": generated,
                     },
                 )
@@ -224,14 +227,28 @@ class DatasetService:
                 output_relative = f"data/{stem}.out"
                 input_path = self.storage.project_dir(project_id) / input_relative
                 if not input_path.is_file():
+                    batch_entry = next(
+                        (
+                            item
+                            for item in manifest["files"]
+                            if item.get("subtask_id") == subtask.id
+                            and item.get("internal_id") == internal_id
+                        ),
+                        {},
+                    )
                     self._fail_to_agent4(
                         project_id,
                         "INPUT_MISSING",
                         f"缺少输入文件 {stem}.in。",
                         {
-                            "operation": "validate",
+                            "operation": "generate",
+                            "target_file": "generator.cpp",
                             "subtask_id": subtask.id,
-                            "internal_id": internal_id,
+                            "case_id": internal_id,
+                            "seed": batch_entry.get("seed"),
+                            "runtime_arguments": batch_entry.get(
+                                "runtime_arguments", {}
+                            ),
                         },
                     )
                 jobs.append(ValidationJob(input_relative, output_relative))
@@ -256,6 +273,19 @@ class DatasetService:
         for job in jobs:
             subtask, internal_id, stem = job_details[job.input_relative]
             outcome = outcomes[job.input_relative]
+            file_entry = file_index.get((subtask.id, internal_id))
+            if file_entry is None:
+                self._fail_to_agent4(
+                    project_id,
+                    "INPUT_MISSING",
+                    f"批次清单缺少 {stem}.in。",
+                    {
+                        "operation": "generate",
+                        "target_file": "generator.cpp",
+                        "subtask_id": subtask.id,
+                        "case_id": internal_id,
+                    },
+                )
             if not outcome.validation.ok:
                 self._fail_to_agent4(
                     project_id,
@@ -264,7 +294,9 @@ class DatasetService:
                     {
                         "operation": "validate",
                         "subtask_id": subtask.id,
-                        "internal_id": internal_id,
+                        "case_id": internal_id,
+                        "seed": file_entry.get("seed"),
+                        "runtime_arguments": file_entry.get("runtime_arguments", {}),
                         "result": outcome.validation,
                     },
                 )
@@ -276,20 +308,10 @@ class DatasetService:
                     {
                         "operation": "solve",
                         "subtask_id": subtask.id,
-                        "internal_id": internal_id,
+                        "case_id": internal_id,
+                        "seed": file_entry.get("seed"),
+                        "runtime_arguments": file_entry.get("runtime_arguments", {}),
                         "result": outcome.solution,
-                    },
-                )
-            file_entry = file_index.get((subtask.id, internal_id))
-            if file_entry is None:
-                self._fail_to_agent4(
-                    project_id,
-                    "INPUT_MISSING",
-                    f"批次清单缺少 {stem}.in。",
-                    {
-                        "operation": "validate",
-                        "subtask_id": subtask.id,
-                        "internal_id": internal_id,
                     },
                 )
             file_entry["validation"] = self._result_summary(outcome.validation)
@@ -306,7 +328,6 @@ class DatasetService:
         manifest["updated_at"] = datetime.now(UTC).isoformat()
         self.storage.save_batch_manifest(project_id, manifest)
         self.projects.mark_validation_complete(project_id)
-        self.storage.clear_agent4_feedback(project_id)
         return {
             "validation_ok": True,
             "validated_tests": validated_count,
@@ -388,24 +409,64 @@ class DatasetService:
         project_id: str,
         code: str,
         message: str,
-        feedback: dict[str, Any],
+        check_data: dict[str, Any],
     ) -> None:
         record = self.projects.get(project_id)
         serialized = {
             key: value.model_dump(mode="json") if hasattr(value, "model_dump") else value
-            for key, value in feedback.items()
+            for key, value in check_data.items()
         }
+        check = {
+            **serialized,
+            "ok": False,
+            "error_code": code,
+            "issues": [message],
+        }
+        execution = {
+            "ok": False,
+            "failure_category": self._failure_category(code, serialized),
+            "validation_level": (
+                "compile" if serialized.get("operation") == "compile" else "complete"
+            ),
+            "message": message,
+            "checks": [check],
+        }
+        defects = defects_from_execution(execution)
+        if len(defects) != 1:
+            raise AppError(
+                "AGENT4_DEFECT_NORMALIZATION_FAILED",
+                "后续阶段失败无法转换为唯一稳定缺陷。",
+                stage=5,
+            )
+        defect = defects[0]
+        revision = self.storage.current_revision(project_id)
+        if revision is None:
+            raise AppError(
+                "AGENT4_STATE_INCOMPATIBLE",
+                "后续阶段失败缺少当前阶段五候选修订。",
+                stage=5,
+                status_code=409,
+            )
+        ledger_service = CounterexampleLedgerService(self.storage)
+        ledger = ledger_service.load(project_id)
+        ledger_service.observe(
+            project_id,
+            ledger,
+            [defect],
+            revision,
+            closable_defect_ids=set(),
+        )
         entry = {
             "code": code,
             "message": message,
-            "failure_category": self._failure_category(code, serialized),
+            "defect_id": defect.defect_id,
+            "defect": defect.model_dump(mode="json"),
             "workflow_revision": record.workflow_revision,
             "input_revision": record.input_revision,
             "subtasks_revision": record.subtasks_revision,
             "code_revision": self.storage.current_revision(project_id),
-            "feedback": serialized,
+            "check": check,
         }
-        self.storage.append_agent4_feedback(project_id, entry)
         manifest = self.storage.load_batch_manifest(project_id)
         if manifest is not None:
             manifest["status"] = "failed"

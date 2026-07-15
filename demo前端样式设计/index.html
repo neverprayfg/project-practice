@@ -15,9 +15,29 @@
           <span class="brand-copy"><strong>TestForge</strong><small>竞赛数据工作台</small></span>
         </div>
 
-        <button class="button button-primary button-block" id="newProjectBtn" type="button">
-          <i data-lucide="plus"></i><span>新建项目</span>
-        </button>
+        <div class="project-actions">
+          <button class="button button-primary button-block" id="newProjectBtn" type="button">
+            <i data-lucide="plus"></i><span>新建项目</span>
+          </button>
+        </div>
+
+        <section class="project-panel" id="projectPanel" aria-label="项目管理">
+          <header class="project-panel-header">
+            <div class="project-panel-heading">
+              <span class="project-panel-heading-icon" aria-hidden="true"><i data-lucide="folder-clock"></i></span>
+              <span class="project-panel-heading-copy">
+                <strong>项目管理</strong>
+                <small><span id="sidebarProjectCount">0</span> 个历史项目</small>
+              </span>
+            </div>
+            <div class="project-panel-tools">
+              <button class="icon-button small" id="refreshProjectHistoryBtn" type="button" title="刷新项目列表" aria-label="刷新项目列表"><i data-lucide="refresh-cw"></i></button>
+              <button class="icon-button small project-panel-close" id="closeProjectPanelBtn" type="button" title="关闭" aria-label="关闭项目管理"><i data-lucide="x"></i></button>
+            </div>
+          </header>
+          <button class="button button-primary button-block project-panel-mobile-new" id="newProjectFromSidebarBtn" type="button"><i data-lucide="plus"></i><span>新建项目</span></button>
+          <div class="project-history-list" id="projectHistoryList" aria-live="polite"></div>
+        </section>
 
         <nav class="stage-nav" id="stageNav">
           <button class="stage-link active" type="button" data-stage="1">
@@ -51,6 +71,7 @@
           <span id="sidebarConnectionText">正在连接后端</span>
         </div>
       </aside>
+      <button class="project-panel-backdrop" id="projectPanelBackdrop" type="button" aria-label="关闭项目管理"></button>
 
       <main class="workspace">
         <header class="topbar">
@@ -60,6 +81,7 @@
           </div>
           <div class="topbar-actions">
             <span class="api-status" id="apiStatus"><span class="connection-dot"></span><span>连接中</span></span>
+            <button class="icon-button" id="projectHistoryTopbarBtn" type="button" title="项目管理" aria-label="打开项目管理" aria-expanded="false"><i data-lucide="folders"></i></button>
             <button class="icon-button" id="modelSettingsBtn" type="button" title="模型与 API 设置" aria-label="模型与 API 设置"><i data-lucide="settings-2"></i></button>
             <button class="icon-button" id="refreshBtn" type="button" title="刷新项目状态" aria-label="刷新项目状态"><i data-lucide="refresh-cw"></i></button>
           </div>

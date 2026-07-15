@@ -166,6 +166,7 @@ async def test_connection_checks_json_output_capability(tmp_path: Path) -> None:
     def respond(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
         assert payload["response_format"] == {"type": "json_object"}
+        assert payload["thinking"] == {"type": "disabled"}
         assert payload["max_tokens"] == 64
         assert any("JSON" in message["content"] for message in payload["messages"])
         return httpx.Response(
@@ -184,6 +185,41 @@ async def test_connection_checks_json_output_capability(tmp_path: Path) -> None:
         result = await service.test_connection()
 
     assert result["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_connection_reports_provider_error_details(tmp_path: Path) -> None:
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401,
+            json={
+                "error": {
+                    "code": "invalid_api_key",
+                    "message": "API key is invalid",
+                    "type": "authentication_error",
+                }
+            },
+        )
+
+    storage = ProjectStorage(tmp_path / "storage")
+    settings = Settings(
+        _env_file=None,
+        storage_root=storage.root,
+        model_api_key="test-key",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        service = ModelConfigurationService(settings, storage, client)
+        with pytest.raises(AppError) as exc_info:
+            await service.test_connection()
+
+    error = exc_info.value
+    assert error.code == "MODEL_PROVIDER_REQUEST_FAILED"
+    assert error.details == {
+        "http_status": 401,
+        "provider_code": "invalid_api_key",
+        "provider_type": "authentication_error",
+        "provider_message": "API key is invalid",
+    }
 
 
 def test_model_configuration_rejects_busy_pipeline_and_invalid_url(

@@ -5,11 +5,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from app.models import GlobalInput, InputStructureDraft, SubtaskPlanDraft
-from app.services.runtime_parameters import (
-    runtime_parameter_issues,
-    structure_tag_parameter_issues,
-)
-from app.services.structure_tag_catalog import StructureTagCatalog
+from app.services.stage4_plan import subtask_plan_issues
 
 
 class Agent1Validator:
@@ -34,29 +30,18 @@ class Agent1Validator:
 
 
 class Agent2Validator:
-    """Agent2 exposes tag ambiguity to the user instead of repairing it itself."""
-
-    def __init__(self, tag_catalog: StructureTagCatalog) -> None:
-        self.tag_catalog = tag_catalog
+    """Agent2 validates only the human-readable input template."""
 
     def verify(self, candidate: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         try:
             model = InputStructureDraft.model_validate(candidate)
         except ValidationError as exc:
             return candidate, [f"输入结构结果不符合 Schema：{exc}"]
-        issues = (
-            self.tag_catalog.validate_structure_tags(model.structure_tags)
-            if model.structure_tags
-            else ["needs_tag_review：阶段三必须确认至少一个结构标签。"]
-        )
-        return model.model_dump(mode="json", exclude={"issues"}), issues
+        return model.model_dump(mode="json", exclude={"issues"}), []
 
 
 class Agent3Validator:
     """Agent3 rejects invalid plans; it does not push contradictions to Agent4."""
-
-    def __init__(self, tag_catalog: StructureTagCatalog) -> None:
-        self.tag_catalog = tag_catalog
 
     def verify(
         self, candidate: dict[str, Any], context: dict[str, Any]
@@ -66,13 +51,5 @@ class Agent3Validator:
         except ValidationError as exc:
             return candidate, [f"子任务计划不符合 Schema：{exc}"]
         issues: list[str] = []
-        if not context.get("subtasks") and len(model.subtasks) != 5:
-            issues.append("首次规划必须生成 5 个子任务。")
-        issues.extend(runtime_parameter_issues(model))
-        global_tags = [
-            str(item["tag_id"])
-            for item in context.get("confirmed_structure_tags", [])
-            if isinstance(item, dict) and item.get("tag_id")
-        ]
-        issues.extend(structure_tag_parameter_issues(model, global_tags, self.tag_catalog))
+        issues.extend(subtask_plan_issues(model))
         return model.model_dump(mode="json", exclude={"issues"}), list(dict.fromkeys(issues))

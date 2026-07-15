@@ -28,6 +28,20 @@ RuntimeString = Annotated[
     ),
 ]
 RuntimeScalar = StrictBool | StrictInt | StrictFloat | RuntimeString
+FormatContractId = Annotated[str, StringConstraints(pattern=r"^format_[0-9a-f]{24}$")]
+StructureTagId = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$",
+    ),
+]
+Agent4VerifierRevision = Literal["agent4-verifier-v12-code-gates-only"]
+AGENT4_VERIFIER_REVISION: Agent4VerifierRevision = "agent4-verifier-v12-code-gates-only"
+AGENT4_CACHE_FORMAT_VERSION = 1
+AGENT4_GRAPH_ID = "agent4-v15"
 
 
 class StrictModel(BaseModel):
@@ -57,7 +71,6 @@ class TaskType(StrEnum):
     INPUT_NORMALIZATION = "input_normalization"
     INPUT_STRUCTURE = "input_structure"
     SUBTASK_PLAN = "subtask_plan"
-    CODE_DRAFT = "code_draft"
 
 
 class Confirmation(StrEnum):
@@ -132,6 +145,14 @@ class ProblemInput(StrictModel):
     difficulty: NonEmptyText
 
 
+class InputNormalizationDraft(StrictModel):
+    """Agent1 may enrich parsed problem fields but cannot echo authoritative input."""
+
+    input_description: NonEmptyText
+    output_description: NonEmptyText
+    samples: list[ProblemSample] = Field(default_factory=list)
+
+
 class CompileState(StrictModel):
     status: Literal["pending", "passed", "failed"] = "pending"
     log: str = ""
@@ -195,23 +216,8 @@ class ProjectRecord(StrictModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
-class StructureTag(StrictModel):
-    tag_id: Annotated[
-        str,
-        StringConstraints(
-            strip_whitespace=True,
-            min_length=1,
-            max_length=64,
-            pattern=r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$",
-        ),
-    ]
-    applies_to: NonEmptyText
-    evidence: NonEmptyText
-
-
 class InputStructureDraft(StrictModel):
     template: NonEmptyText
-    structure_tags: list[StructureTag] = Field(default_factory=list)
     issues: list[str] = Field(default_factory=list)
 
 
@@ -262,12 +268,10 @@ class TestPointRuntimeParameters(StrictModel):
 
 class Subtask(StrictModel):
     id: int = Field(gt=0)
-    constraints: NonEmptyText
     test_count: int = Field(gt=0)
     expected_complexity: NonEmptyText
     special_cases: list[SpecialCase] = Field(default_factory=list)
     runtime_parameters: list[TestPointRuntimeParameters] = Field(default_factory=list)
-    subtask_tags: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def special_count_fits_total(self) -> Subtask:
@@ -277,8 +281,6 @@ class Subtask(StrictModel):
             case_ids = [profile.case_id for profile in self.runtime_parameters]
             if case_ids != list(range(1, self.test_count + 1)):
                 raise ValueError("runtime parameter case ids must exactly match 1..test_count")
-        if len(self.subtask_tags) != len(set(self.subtask_tags)):
-            raise ValueError("subtask structure tags must be unique")
         return self
 
 
@@ -287,93 +289,38 @@ class SubtaskPlanDraft(StrictModel):
     issues: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def subtask_ids_are_unique(self) -> SubtaskPlanDraft:
+    def subtask_ids_are_contiguous(self) -> SubtaskPlanDraft:
         ids = [subtask.id for subtask in self.subtasks]
-        if len(ids) != len(set(ids)):
-            raise ValueError("subtask ids must be unique")
+        if ids != list(range(1, len(self.subtasks) + 1)):
+            raise ValueError("subtask ids must be contiguous and ordered from 1")
         return self
 
 
-class ProofObligation(StrictModel):
-    constraint_id: Annotated[
-        str,
-        StringConstraints(
-            strip_whitespace=True,
-            min_length=1,
-            max_length=160,
-            pattern=r"^[a-z0-9][a-z0-9_.:-]*$",
-        ),
-    ]
-    scope: NonEmptyText
-    severity: Literal["blocker", "warning"]
-    verification_method: Literal[
-        "static",
-        "compile",
-        "counterexample",
-        "semantic",
-        "contract",
-    ]
-    requirement: NonEmptyText
+class InputWhitespaceContract(StrictModel):
+    token_separator: Literal["single_ascii_space"] = "single_ascii_space"
+    leading_space: Literal["forbidden"] = "forbidden"
+    trailing_space: Literal["forbidden"] = "forbidden"
+    tab_character: Literal["forbidden"] = "forbidden"
+    blank_line: Literal["forbidden_unless_template_requires"] = "forbidden_unless_template_requires"
+    line_ending: Literal["lf"] = "lf"
+    final_newline: Literal["required"] = "required"
 
 
-class ImplementationLocation(StrictModel):
-    target_file: Literal["generator.cpp", "validator.cpp"]
-    symbol: NonEmptyText
-    line_start: int = Field(gt=0)
-    line_end: int = Field(gt=0)
+class InputFormatContract(StrictModel):
+    """Backend-owned interface shared by parallel generator/validator calls."""
 
-    @model_validator(mode="after")
-    def line_range_is_ordered(self) -> ImplementationLocation:
-        if self.line_end < self.line_start:
-            raise ValueError("implementation line range is reversed")
-        return self
-
-
-class DocumentApiClaim(StrictModel):
-    filename: NonEmptyText
-    symbol: NonEmptyText
-
-
-class ConstraintImplementationClaim(StrictModel):
-    constraint_id: NonEmptyText
-    locations: list[ImplementationLocation] = Field(min_length=1)
-    used_parameters: list[str] = Field(default_factory=list)
-    document_evidence: list[DocumentApiClaim] = Field(default_factory=list)
-    test_strategy: NonEmptyText
-
-    @model_validator(mode="after")
-    def implementation_fields_are_unique(self) -> ConstraintImplementationClaim:
-        if len(self.used_parameters) != len(set(self.used_parameters)):
-            raise ValueError("implementation parameter names must be unique")
-        evidence = [(item.filename, item.symbol) for item in self.document_evidence]
-        if len(evidence) != len(set(evidence)):
-            raise ValueError("document evidence must be unique")
-        return self
-
-
-class DocumentApiEvidence(StrictModel):
-    filename: NonEmptyText
-    digest: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")] | None = None
-    symbol: NonEmptyText
-
-
-class ConstraintImplementation(StrictModel):
-    constraint_id: NonEmptyText
-    locations: list[ImplementationLocation] = Field(min_length=1)
-    used_parameters: list[str] = Field(default_factory=list)
-    document_evidence: list[DocumentApiEvidence] = Field(default_factory=list)
-    test_strategy: NonEmptyText
-
-    @model_validator(mode="after")
-    def implementation_fields_are_unique(self) -> ConstraintImplementation:
-        if len(self.used_parameters) != len(set(self.used_parameters)):
-            raise ValueError("implementation parameter names must be unique")
-        evidence = [
-            (item.filename, item.digest, item.symbol) for item in self.document_evidence
-        ]
-        if len(evidence) != len(set(evidence)):
-            raise ValueError("document evidence must be unique")
-        return self
+    format_version: Literal[1] = 1
+    format_contract_id: FormatContractId
+    input_template: NonEmptyText
+    reference_sample_inputs: list[str] = Field(default_factory=list)
+    testcase_cardinality: Literal["one_testcase_per_process"] = "one_testcase_per_process"
+    encoding: Literal["utf-8"] = "utf-8"
+    layout_policy: Literal["follow_input_template_exactly"] = "follow_input_template_exactly"
+    whitespace: InputWhitespaceContract = Field(default_factory=InputWhitespaceContract)
+    generator_stdout_policy: Literal["input_only_no_diagnostics"] = "input_only_no_diagnostics"
+    validator_consumption_policy: Literal["read_exact_template_then_eof"] = (
+        "read_exact_template_then_eof"
+    )
 
 
 class DefectIdentity(StrictModel):
@@ -443,7 +390,7 @@ class Counterexample(StrictModel):
 
 
 class CounterexampleLedger(StrictModel):
-    verifier_revision: NonEmptyText = "agent4-verifier-v5"
+    verifier_revision: Agent4VerifierRevision
     counterexamples: list[Counterexample] = Field(default_factory=list)
     last_valid_candidate_revision: str | None = None
 
@@ -453,7 +400,8 @@ class AgentDecisionEvent(StrictModel):
     candidate_revision: NonEmptyText
     target_defect_id: str | None = None
     model_call_type: Literal[
-        "generation",
+        "generator_generation",
+        "validator_generation",
         "semantic_audit",
         "targeted_recheck",
         "repair",
@@ -469,7 +417,6 @@ class AgentDecisionEvent(StrictModel):
 
 
 class ReportedDefect(StrictModel):
-    origin: Literal["candidate", "upstream_contract"]
     identity: DefectIdentity
     severity: Literal["blocker", "warning"] = "blocker"
     validation_level: Literal["semantic"] = "semantic"
@@ -481,11 +428,29 @@ class SemanticAudit(StrictModel):
     defects: list[ReportedDefect] = Field(default_factory=list)
 
 
+class TargetedDefectEvidence(StrictModel):
+    target_file: Literal["generator.cpp", "validator.cpp"]
+    code_snippet: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=12, max_length=4000),
+    ]
+    rationale: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=1000),
+    ]
+
+
 class TargetedDefectCheck(StrictModel):
     defect_id: NonEmptyText
     still_present: bool
     message: NonEmptyText
-    evidence: dict[str, Any] = Field(default_factory=dict)
+    evidence: TargetedDefectEvidence | None = None
+
+    @model_validator(mode="after")
+    def persistence_requires_current_source_evidence(self) -> TargetedDefectCheck:
+        if self.still_present and self.evidence is None:
+            raise ValueError("still-present semantic defect requires source evidence")
+        return self
 
 
 class CodeRepairPatch(StrictModel):
@@ -496,65 +461,57 @@ class CodeRepairPatch(StrictModel):
     ]
     generator_code: str | None = None
     validator_code: str | None = None
-    implementation_mapping_upserts: list[ConstraintImplementationClaim] = Field(
-        default_factory=list
-    )
-    implementation_mapping_remove_ids: list[NonEmptyText] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def patch_changes_at_least_one_field(self) -> CodeRepairPatch:
-        if (
-            self.generator_code is None
-            and self.validator_code is None
-            and not self.implementation_mapping_upserts
-            and not self.implementation_mapping_remove_ids
-        ):
+        if self.generator_code is None and self.validator_code is None:
             raise ValueError("repair patch must change at least one field")
         if self.generator_code is not None and not self.generator_code.strip():
             raise ValueError("generator patch cannot be blank")
         if self.validator_code is not None and not self.validator_code.strip():
             raise ValueError("validator patch cannot be blank")
-        upsert_ids = [item.constraint_id for item in self.implementation_mapping_upserts]
-        if len(upsert_ids) != len(set(upsert_ids)):
-            raise ValueError("implementation mapping upsert ids must be unique")
-        if len(self.implementation_mapping_remove_ids) != len(
-            set(self.implementation_mapping_remove_ids)
-        ):
-            raise ValueError("implementation mapping remove ids must be unique")
-        overlap = set(upsert_ids) & set(self.implementation_mapping_remove_ids)
-        if overlap:
-            raise ValueError("implementation mapping cannot upsert and remove the same id")
+        if self.generator_code is not None and self.validator_code is not None:
+            raise ValueError("one repair call cannot return both generator and validator code")
         return self
 
 
-class CodeGenerationSubmission(StrictModel):
-    """Agent4 wire contract; backend-owned proof data is injected by the graph."""
+class GeneratorGenerationSubmission(StrictModel):
+    """Generator-only wire contract for one Agent4 model call."""
 
+    format_contract_id: FormatContractId
     generator_code: NonEmptyText
+
+
+class ValidatorGenerationSubmission(StrictModel):
+    """Validator-only wire contract for one Agent4 model call."""
+
+    format_contract_id: FormatContractId
     validator_code: NonEmptyText
-    implementation_mapping: list[ConstraintImplementationClaim] = Field(min_length=1)
 
 
 class CodeDraft(StrictModel):
+    format_contract_id: FormatContractId
     generator_code: NonEmptyText
     validator_code: NonEmptyText
-    proof_obligations: list[ProofObligation] = Field(min_length=1)
-    implementation_mapping: list[ConstraintImplementation] = Field(min_length=1)
     revision_id: str | None = None
     input_revision: int | None = Field(default=None, ge=1)
     subtasks_revision: int | None = Field(default=None, ge=1)
     trial_results: list[dict[str, Any]] = Field(default_factory=list)
     issues: list[str] = Field(default_factory=list)
 
-    @model_validator(mode="after")
-    def proof_and_implementation_ids_are_unique(self) -> CodeDraft:
-        proof_ids = [item.constraint_id for item in self.proof_obligations]
-        mapping_ids = [item.constraint_id for item in self.implementation_mapping]
-        if len(proof_ids) != len(set(proof_ids)):
-            raise ValueError("proof obligation ids must be unique")
-        if len(mapping_ids) != len(set(mapping_ids)):
-            raise ValueError("implementation mapping ids must be unique")
-        return self
+class Agent4VerificationCacheEntry(StrictModel):
+    candidate: CodeDraft
+    execution: dict[str, Any]
+    replayed_counterexamples: list[str] = Field(default_factory=list)
+    gates: list[str] = Field(default_factory=list)
+    role_digests: dict[Literal["solution", "generator", "validator"], NonEmptyText]
+    environment_fingerprint: NonEmptyText
+
+
+class Agent4VerificationCache(StrictModel):
+    format_version: Literal[1]
+    verifier_revision: Agent4VerifierRevision
+    candidates: dict[str, Agent4VerificationCacheEntry] = Field(default_factory=dict)
 
 
 class WorkflowOutput(StrictModel):
@@ -574,7 +531,7 @@ class DraftUpdate(StrictModel):
 
 
 class StageRunRequest(StrictModel):
-    task_type: TaskType | None = None
+    pass
 
 
 class UserConfirmation(StrictModel):

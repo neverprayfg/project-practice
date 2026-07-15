@@ -10,11 +10,16 @@ const STAGES = [
 ];
 
 const COMPLEXITIES = ["O(1)", "O(log n)", "O(n)", "O(n log n)", "O(n²)", "O(n³)"];
-const API_BASE = window.location.port === "8000" ? "" : "http://localhost:8000";
+const API_BASE = ["3000", "5173", "5500"].includes(window.location.port)
+  ? "http://localhost:8000"
+  : "";
 
 const state = {
   projectId: localStorage.getItem("testforge.projectId"),
   project: null,
+  projects: [],
+  projectHistoryBusy: false,
+  deletingProjectId: null,
   drafts: { "3": null, "4": null, "5": null },
   draftBaselines: { "3": null, "4": null, "5": null },
   solutionCode: "",
@@ -24,7 +29,6 @@ const state = {
   apiOnline: false,
   apiMode: "",
   modelConfig: null,
-  tagCatalog: { version: null, tags: [] },
   modelSettingsBusy: false,
   busy: false,
   busyLabel: "",
@@ -57,14 +61,12 @@ function draftContent(stage, draft) {
   if (stage === 3) {
     return {
       template: String(draft?.template || "").trim(),
-      structure_tags: Array.isArray(draft?.structure_tags) ? cloneJson(draft.structure_tags) : [],
     };
   }
   if (stage === 4) {
     return {
       subtasks: Array.isArray(draft?.subtasks) ? draft.subtasks.map((subtask) => ({
         id: Number(subtask.id),
-        constraints: String(subtask.constraints || "").trim(),
         test_count: Number(subtask.test_count || 0),
         expected_complexity: String(subtask.expected_complexity || "").trim(),
         special_cases: Array.isArray(subtask.special_cases) ? subtask.special_cases.map((item) => ({
@@ -74,19 +76,13 @@ function draftContent(stage, draft) {
         runtime_parameters: Array.isArray(subtask.runtime_parameters)
           ? cloneJson(subtask.runtime_parameters)
           : [],
-        subtask_tags: Array.isArray(subtask.subtask_tags) ? [...subtask.subtask_tags] : [],
       })) : [],
     };
   }
   return {
+    format_contract_id: String(draft?.format_contract_id || "").trim(),
     generator_code: String(draft?.generator_code || "").trim(),
     validator_code: String(draft?.validator_code || "").trim(),
-    proof_obligations: Array.isArray(draft?.proof_obligations)
-      ? cloneJson(draft.proof_obligations)
-      : [],
-    implementation_mapping: Array.isArray(draft?.implementation_mapping)
-      ? cloneJson(draft.implementation_mapping)
-      : [],
   };
 }
 
@@ -219,12 +215,33 @@ async function runMutation(label, operation, successMessage = "操作完成") {
 
 function projectName() {
   if (!state.project) return "尚未创建项目";
-  const firstLine = state.project.problem_description
+  return projectDisplayName(state.project, 28);
+}
+
+function projectDisplayName(project, maxLength = 48) {
+  const firstLine = String(project?.problem_description || "")
     .split("\n")
     .map((line) => line.replace(/^#+\s*/, "").trim())
     .find(Boolean);
-  if (!firstLine) return `项目 ${state.project.project_id.slice(0, 8)}`;
-  return firstLine.length > 28 ? `${firstLine.slice(0, 28)}…` : firstLine;
+  if (!firstLine) return `项目 ${String(project?.project_id || "").slice(0, 8)}`;
+  return firstLine.length > maxLength ? `${firstLine.slice(0, maxLength)}…` : firstLine;
+}
+
+function projectStageLabel(project) {
+  if (project?.export_ready) return "全部流程已完成";
+  const stage = Math.max(1, Math.min(8, Number(project?.current_stage || 1)));
+  return `阶段 ${stage} · ${STAGES[stage - 1]}`;
+}
+
+function formatProjectTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "时间未知";
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
 }
 
 function stageState(stage) {
@@ -281,6 +298,39 @@ function renderConnection() {
   $("#modelSettingsBtn").disabled = !state.apiOnline;
 }
 
+function renderProjectHistory() {
+  const count = state.projects.length;
+  $("#sidebarProjectCount").textContent = String(count);
+  const list = $("#projectHistoryList");
+  if (!list) return;
+  if (state.projectHistoryBusy && !count) {
+    list.innerHTML = `<div class="project-history-empty">${icon("loader-circle", "spinner")}<strong>正在加载项目历史</strong></div>`;
+    hydrateIcons();
+    return;
+  }
+  if (!count) {
+    list.innerHTML = `<div class="project-history-empty">${icon("folder-open")}<strong>还没有历史项目</strong><span>新建项目后会自动出现在这里。</span></div>`;
+    hydrateIcons();
+    return;
+  }
+  list.innerHTML = state.projects.map((project) => {
+    const current = project.project_id === state.projectId;
+    const deleting = state.deletingProjectId === project.project_id;
+    return `<article class="project-history-row${current ? " current" : ""}">
+      <button class="project-history-main" type="button" data-open-project="${project.project_id}" title="打开 ${escapeHtml(projectDisplayName(project))}" ${current ? 'aria-current="true"' : ""} ${deleting ? "disabled" : ""}>
+        <span class="project-history-icon">${icon(project.export_ready ? "badge-check" : "folder")}</span>
+        <span class="project-history-copy">
+          <span class="project-history-title"><span class="project-history-name">${escapeHtml(projectDisplayName(project))}</span>${current ? '<span class="current-project-label">当前</span>' : ""}</span>
+          <span class="project-history-meta"><span>${escapeHtml(projectStageLabel(project))}</span><span>更新于 ${escapeHtml(formatProjectTime(project.updated_at))}</span><span>${escapeHtml(project.difficulty)}</span></span>
+        </span>
+        ${icon("chevron-right", "project-history-chevron")}
+      </button>
+      <button class="icon-button project-delete-button" type="button" data-delete-project="${project.project_id}" title="删除项目" aria-label="删除 ${escapeHtml(projectDisplayName(project))}" ${deleting ? "disabled" : ""}>${deleting ? icon("loader-circle", "spinner") : icon("trash-2")}</button>
+    </article>`;
+  }).join("");
+  hydrateIcons();
+}
+
 function errorNotice() {
   const error = displayedError();
   if (!error) return "";
@@ -305,6 +355,7 @@ function applyValidationMarkers() {
 function render() {
   renderNav();
   renderConnection();
+  renderProjectHistory();
   $("#projectLabel").textContent = projectName();
   $("#stageLabel").textContent = `阶段 ${state.activeStage} · ${STAGES[state.activeStage - 1]}`;
   $("#pageTitle").textContent = pageTitle(state.activeStage);
@@ -403,14 +454,10 @@ function renderStage3() {
   if (!state.project || !canOpenStage(3)) return lockedEmpty(3);
   const draft = state.drafts["3"];
   const template = draft?.template || "";
-  const structureTags = draft?.structure_tags || [];
-  const supportedTags = (state.tagCatalog.tags || []).filter((item) => item.status === "supported");
   const info = state.project.stages?.["3"] || {};
   return `${confirmationBand(3)}<div class="page-intro"><div><h2>输入结构模板</h2><p>AI 综合题目描述与标程读取逻辑生成非结构化文本，统一变量名称并说明读取顺序、类型和依赖关系；用户可直接审核和修改。</p></div><span class="badge info">确认后保存为 Template</span></div>
     <section class="work-surface"><div class="surface-body">
       <label class="field"><span class="required">输入结构描述</span><textarea id="inputStructureTemplate" class="text-area structure-template" placeholder="运行 AI 分析后将在此生成输入结构模板；也可以先手动填写。">${escapeHtml(template)}</textarea><small>该文本确认后将作为阶段 4 的只读模板；需要修改时必须返回本阶段重新确认。</small></label>
-      <label class="field"><span class="required">已识别的结构标签</span><textarea id="structureTagsInput" class="text-area" rows="9" placeholder='[{"tag_id":"graph.directed.weighted","applies_to":"边表","evidence":"M 行起点、终点和边权"}]'>${escapeHtml(JSON.stringify(structureTags, null, 2))}</textarea><small>标签与模板一起由用户确认；混合结构应保留多个标签及各自适用部分。目录版本：${escapeHtml(state.tagCatalog.version ?? "-")}</small></label>
-      <div class="tag-catalog"><span class="helper-text">当前可用标签：</span>${supportedTags.map((item) => `<span class="badge">${escapeHtml(item.id)}</span>`).join(" ")}</div>
       ${stageIssues(draft, 3)}
     </div></section>
     ${interactiveActionBar(3, Boolean(template.trim()), info)}`;
@@ -423,8 +470,13 @@ function defaultSubtaskPlan() {
   };
 }
 
-function emptySubtask(id) {
-  return { id, constraints: "", test_count: 10, expected_complexity: "O(n)", special_cases: [], runtime_parameters: [], subtask_tags: [] };
+function emptySubtask(id, source = null) {
+  const value = source ? cloneJson(source) : { test_count: 10, expected_complexity: "O(n)", special_cases: [], runtime_parameters: [] };
+  return { ...value, id };
+}
+
+function renumberSubtasks(draft) {
+  draft.subtasks.forEach((subtask, index) => { subtask.id = index + 1; });
 }
 
 function complexityControl(value, index) {
@@ -434,7 +486,7 @@ function complexityControl(value, index) {
     <input class="text-input custom-complexity" data-plan-key="custom-complexity" data-subtask="${index}" value="${common ? "" : escapeHtml(value)}" placeholder="填写其它复杂度" ${common ? "hidden" : ""}>`;
 }
 
-function renderSubtask(subtask, index) {
+function renderSubtask(subtask, index, totalSubtasks) {
   const expanded = state.expandedSubtasks.has(index);
   const specialTotal = subtask.special_cases.reduce((sum, item) => sum + Number(item.count || 0), 0);
   const normalCount = Number(subtask.test_count || 0) - specialTotal;
@@ -445,13 +497,11 @@ function renderSubtask(subtask, index) {
     </div>`).join("");
 
   return `<article class="subtask-editor" data-subtask-editor="${index}">
-    <header class="subtask-summary"><div class="subtask-title"><button class="icon-button small" data-toggle-subtask="${index}" type="button" title="${expanded ? "收起" : "展开"}" aria-label="${expanded ? "收起" : "展开"}子任务 ${subtask.id}">${icon(expanded ? "chevron-down" : "chevron-right")}</button><h3>子任务 ${subtask.id}</h3><span class="badge info">${escapeHtml(subtask.expected_complexity || "未设置")}</span></div><div class="subtask-tools"><span class="badge">${subtask.test_count} 个测试点</span><button class="icon-button small" data-delete-subtask="${index}" type="button" title="删除子任务" aria-label="删除子任务 ${subtask.id}">${icon("trash-2")}</button></div></header>
+    <header class="subtask-summary"><div class="subtask-title"><button class="icon-button small" data-toggle-subtask="${index}" type="button" title="${expanded ? "收起" : "展开"}" aria-label="${expanded ? "收起" : "展开"}生成计划">${icon(expanded ? "chevron-down" : "chevron-right")}</button><h3>子任务 ${subtask.id}</h3><span class="badge info">${escapeHtml(subtask.expected_complexity || "未设置")}</span></div><div class="subtask-tools"><span class="badge">${subtask.test_count} 个测试点</span><button class="icon-button small" data-remove-subtask="${index}" type="button" title="删除子任务" aria-label="删除子任务" ${totalSubtasks > 1 ? "" : "disabled"}>${icon("trash-2")}</button></div></header>
     <div class="subtask-body" ${expanded ? "" : "hidden"}>
-      <section class="subtask-column constraints-column"><h4 class="column-title"><span>数据限制描述</span><span class="badge">自由文本</span></h4><textarea class="text-area constraint-editor" data-plan-key="constraints" data-subtask="${index}" placeholder="请参照输入结构描述约束，例如：n: [1000, 5000]">${escapeHtml(subtask.constraints || "")}</textarea><p class="helper-text">支持自然语言、数学不等式、键值范围、区间和分行文本，无需改写为固定句式。轻微名称差别会由 AI 自动修正。</p></section>
       <section class="subtask-column form-stack"><h4 class="column-title">数量与复杂度</h4><label class="field"><span class="required">测试点总数</span><input class="number-input" type="number" min="1" step="1" data-plan-key="test-count" data-subtask="${index}" value="${escapeHtml(subtask.test_count)}"></label><label class="field"><span class="required">期望通过的算法复杂度</span>${complexityControl(subtask.expected_complexity, index)}</label></section>
       <section class="subtask-column"><h4 class="column-title"><span>非规模性特殊测试点</span><button class="link-button" data-add-special="${index}" type="button">${icon("plus")}添加一项</button></h4><div class="special-list">${specials || `<p class="helper-text">当前没有特殊测试点，全部测试点按普通规模生成。</p>`}</div></section>
       <section class="subtask-column constraints-column"><h4 class="column-title"><span>逐测试点运行时参数</span><span class="badge">JSON</span></h4><textarea class="text-area constraint-editor" data-plan-key="runtime-parameters" data-subtask="${index}" placeholder='[{"case_id":1,"parameters":[{"name":"n_max","value":10,"category":"size"}]}]'>${escapeHtml(JSON.stringify(subtask.runtime_parameters || [], null, 2))}</textarea><p class="helper-text">case_id 必须覆盖 1..测试点总数；参数会作为白名单命令行选项传给 generator。</p></section>
-      <section class="subtask-column constraints-column"><h4 class="column-title"><span>子任务结构细化</span><span class="badge">JSON</span></h4><textarea class="text-area constraint-editor" data-plan-key="subtask-tags" data-subtask="${index}" placeholder='["graph.dag"]'>${escapeHtml(JSON.stringify(subtask.subtask_tags || [], null, 2))}</textarea><p class="helper-text">仅填写该子任务新增的结构属性，不得删除阶段 3 全局标签。</p></section>
     </div>
     <div class="count-summary" ${expanded ? "" : "hidden"}><div><span>特殊测试点</span><strong data-special-total>${specialTotal}</strong></div><div><span>测试点总数</span><strong data-test-total>${subtask.test_count}</strong></div><div class="${normalCount < 0 ? "invalid-count" : ""}" data-normal-box><span>普通规模测试点</span><strong data-normal-total>${normalCount}</strong></div></div>
   </article>`;
@@ -463,11 +513,10 @@ function renderStage4() {
   const draft = state.drafts["4"];
   const info = state.project.stages?.["4"] || {};
   const template = state.drafts["3"]?.template || "";
-  const globalTags = state.drafts["3"]?.structure_tags || [];
-  return `${confirmationBand(4)}<div class="page-intro"><div><h2>模板与子任务配置</h2><p>左侧模板来自阶段 3 且不可编辑；右侧以自由文本描述各子任务的数据限制。</p></div><button class="button button-secondary" id="addSubtaskBtn" type="button">${icon("plus")}添加子任务</button></div>
+  return `${confirmationBand(4)}<div class="page-intro"><div><h2>模板与生成计划</h2><p>Agent3 初次只生成一个配置；用户可按需要复制或删除配置来调整子任务数量。</p></div></div>
     <div class="stage4-layout">
-      <aside class="template-reference"><div class="section-heading"><div><h3>输入结构 Template</h3><p>阶段 3 已确认版本</p></div><span class="badge success">只读</span></div><textarea class="template-view" readonly aria-label="已确认输入结构模板">${escapeHtml(template)}</textarea><p class="helper-text">全局标签：${escapeHtml(globalTags.map((item) => item.tag_id).join(", ") || "无")}</p><p class="helper-text">如需修改，请返回阶段 3，重新运行 AI 检查并确认。</p></aside>
-      <section class="stage4-planner"><div class="section-heading"><div><h3>子任务配置</h3><p>特殊测试点总数不得超过所属子任务测试点总数</p></div><span class="badge">${draft.subtasks.length} 个子任务</span></div><div class="subtask-list" id="subtaskList">${draft.subtasks.length ? draft.subtasks.map(renderSubtask).join("") : `<div class="planner-empty">${icon("list-plus")}<strong>等待 Agent3 规划</strong><span>直接运行 AI 检查将根据题目自动生成 5 个初始子任务，也可以先手动添加。</span></div>`}</div><div class="planner-issues">${stageIssues(draft, 4)}</div></section>
+      <aside class="template-reference"><div class="section-heading"><div><h3>输入结构 Template</h3><p>阶段 3 已确认版本</p></div><span class="badge success">只读</span></div><textarea class="template-view" readonly aria-label="已确认输入结构模板">${escapeHtml(template)}</textarea><p class="helper-text">如需修改，请返回阶段 3，重新运行 AI 检查并确认。</p></aside>
+      <section class="stage4-planner"><div class="section-heading"><div><h3>子任务生成配置</h3><p>AI 初次生成 1 个；后续数量由用户决定</p></div><div class="subtask-tools"><span class="badge">${draft.subtasks.length} 个子任务</span><button class="link-button" id="addSubtaskBtn" type="button">${icon("copy-plus")}复制配置</button></div></div><div class="subtask-list" id="subtaskList">${draft.subtasks.length ? draft.subtasks.map((subtask, index) => renderSubtask(subtask, index, draft.subtasks.length)).join("") : `<div class="planner-empty">${icon("list-plus")}<strong>等待 Agent3 规划</strong><span>运行 AI 检查会自动生成第一个配置，也可以手动添加。</span></div>`}</div><div class="planner-issues">${stageIssues(draft, 4)}</div></section>
     </div>
     ${interactiveActionBar(4, draft.subtasks.length > 0, info)}`;
 }
@@ -484,7 +533,6 @@ function renderStage5() {
       <section class="work-surface code-pane"><div class="section-heading"><div><h3>generator.cpp</h3><p>testlib / jngen</p></div></div><textarea id="generatorCode" class="code-editor" spellcheck="false" placeholder="运行 AI 生成 generator.cpp">${escapeHtml(draft.generator_code)}</textarea></section>
       <section class="work-surface code-pane"><div class="section-heading"><div><h3>validator.cpp</h3><p>testlib strict validation</p></div></div><textarea id="validatorCode" class="code-editor" spellcheck="false" placeholder="运行 AI 生成 validator.cpp">${escapeHtml(draft.validator_code)}</textarea></section>
     </div>
-    <details class="work-surface" style="margin-top:16px"><summary class="section-heading" style="padding:12px 16px;cursor:pointer"><div><h3>证明义务与实现映射</h3><p>约束 ID 对应源码位置、实际参数、文档/API 证据与构造策略</p></div><span class="badge">${draft.proof_obligations?.length || 0} 项</span></summary><div class="surface-body"><h4>Proof Obligations</h4><pre>${escapeHtml(JSON.stringify(draft.proof_obligations || [], null, 2))}</pre><h4>Implementation Mapping</h4><pre>${escapeHtml(JSON.stringify(draft.implementation_mapping || [], null, 2))}</pre></div></details>
     <div class="preview-layout">
       <section class="work-surface preview-controls form-stack"><div><h3 style="margin:0;font-size:15px">种子试运行</h3><p class="helper-text">选择子任务和测试点；对应的数据与规模限制会通过命令行传给 generator。</p></div><label class="field"><span>子任务</span><select id="previewSubtask" class="select-input">${subtasks.map((item) => `<option value="${item.id}">子任务 ${item.id}</option>`).join("")}</select></label><label class="field"><span>测试点</span><input id="previewCase" class="number-input" type="number" min="1" step="1" value="${preview?.case_id ?? 1}"></label><label class="field"><span>种子</span><input id="previewSeed" class="number-input" type="number" step="1" value="${preview?.seed ?? 42}"></label><button class="button button-secondary" id="previewBtn" type="button" ${hasBoth && !state.busy ? "" : "disabled"}>${icon("play")}编译并试运行</button><ul class="preview-history">${state.previewHistory.map((item) => `<li><span>子任务 ${item.subtaskId} · 测试点 ${item.caseId} · seed ${item.seed}</span><strong>${item.ok ? "通过" : "失败"}</strong></li>`).join("")}</ul></section>
       <section class="work-surface preview-output"><div class="section-heading" style="margin-bottom:12px"><div><h3>输入数据预览</h3><p>${preview ? `seed ${escapeHtml(preview.seed)} · validator ${preview.validator?.ok ? "通过" : "未通过"}` : "尚未运行"}</p></div>${preview ? `<span class="badge ${preview.validator?.ok ? "success" : "error"}">${preview.validator?.ok ? "合法输入" : "校验失败"}</span>` : ""}</div><pre>${escapeHtml(preview?.content || "运行生成器后在此查看输入数据。")}</pre></section>
@@ -571,28 +619,19 @@ function readIssues() {
 }
 
 function readStructureDraft() {
-  let structureTags;
-  try {
-    structureTags = JSON.parse($("#structureTagsInput")?.value.trim() || "[]");
-  } catch {
-    throw new Error("结构标签不是合法 JSON。");
-  }
   return {
     template: $("#inputStructureTemplate")?.value.trim() || "",
-    structure_tags: structureTags,
     issues: readIssues(),
   };
 }
 
 function validateStructure(draft) {
   if (!draft.template) throw new Error("输入结构模板不能为空，请先运行 AI 分析或手动填写。");
-  if (!Array.isArray(draft.structure_tags)) throw new Error("结构标签必须是 JSON 数组。");
 }
 
 function readPlanDraft() {
   const current = state.drafts["4"] || defaultSubtaskPlan();
   const subtasks = current.subtasks.map((subtask, index) => {
-    const constraints = $(`[data-plan-key="constraints"][data-subtask="${index}"]`)?.value.trim() || "";
     const testCount = Number($(`[data-plan-key="test-count"][data-subtask="${index}"]`)?.value || 0);
     const complexitySelect = $(`[data-plan-key="complexity"][data-subtask="${index}"]`);
     const complexity = complexitySelect?.value === "other"
@@ -612,26 +651,18 @@ function readPlanDraft() {
     } catch {
       throw new Error(`子任务 ${subtask.id} 的运行时参数不是合法 JSON。`);
     }
-    const tagText = $(`[data-plan-key="subtask-tags"][data-subtask="${index}"]`)?.value.trim() || "[]";
-    let subtaskTags;
-    try {
-      subtaskTags = JSON.parse(tagText);
-    } catch {
-      throw new Error(`子任务 ${subtask.id} 的结构细化标签不是合法 JSON。`);
-    }
-    return { id: subtask.id, constraints, test_count: testCount, expected_complexity: complexity || "", special_cases: specialCases, runtime_parameters: runtimeParameters, subtask_tags: subtaskTags };
+    return { id: subtask.id, test_count: testCount, expected_complexity: complexity || "", special_cases: specialCases, runtime_parameters: runtimeParameters };
   });
   return { subtasks, issues: readIssues() };
 }
 
 function validatePlan(draft) {
-  if (!draft.subtasks.length) throw new Error("至少需要一个子任务。");
-  for (const subtask of draft.subtasks) {
-    if (!subtask.constraints) throw new Error(`子任务 ${subtask.id} 缺少数据限制描述。`);
+  if (!draft.subtasks.length) throw new Error("阶段四至少需要一个子任务配置。");
+  for (const [index, subtask] of draft.subtasks.entries()) {
+    if (Number(subtask.id) !== index + 1) throw new Error("子任务编号必须从 1 开始连续排列。");
     if (!Number.isInteger(subtask.test_count) || subtask.test_count <= 0) throw new Error(`子任务 ${subtask.id} 的测试点总数必须为正整数。`);
     if (!subtask.expected_complexity) throw new Error(`子任务 ${subtask.id} 缺少期望复杂度。`);
     if (!Array.isArray(subtask.runtime_parameters) || subtask.runtime_parameters.length !== subtask.test_count) throw new Error(`子任务 ${subtask.id} 必须为每个测试点提供一组运行时参数。`);
-    if (!Array.isArray(subtask.subtask_tags) || subtask.subtask_tags.some((item) => typeof item !== "string")) throw new Error(`子任务 ${subtask.id} 的结构细化标签必须是字符串数组。`);
     let specialTotal = 0;
     for (const item of subtask.special_cases) {
       if (!Number.isInteger(item.count) || item.count <= 0 || !item.description) throw new Error(`子任务 ${subtask.id} 的特殊测试点需要填写正整数数量与完整描述。`);
@@ -643,10 +674,9 @@ function validatePlan(draft) {
 
 function readCodeDraft() {
   return {
+    format_contract_id: state.drafts["5"]?.format_contract_id || "",
     generator_code: $("#generatorCode")?.value.trim() || "",
     validator_code: $("#validatorCode")?.value.trim() || "",
-    proof_obligations: cloneJson(state.drafts["5"]?.proof_obligations || []),
-    implementation_mapping: cloneJson(state.drafts["5"]?.implementation_mapping || []),
     revision_id: state.drafts["5"]?.revision_id || null,
     issues: readIssues(),
   };
@@ -667,11 +697,10 @@ async function saveDraft(stage, draft) {
   state.activeStage = Number(state.project.current_stage);
 }
 
-async function runAiStage(stage, taskType = null) {
-  const body = taskType ? { task_type: taskType } : {};
+async function runAiStage(stage) {
   const response = await api(`/api/projects/${state.projectId}/stages/${stage}/run`, {
     method: "POST",
-    body: JSON.stringify(body),
+    body: JSON.stringify({}),
   });
   state.drafts[String(stage)] = response.draft;
   state.dirtyStages.delete(stage);
@@ -810,6 +839,7 @@ function createProject() {
     state.project = response.project;
     state.compileResult = response.result;
     await refreshProject({ silent: true });
+    await loadProjectHistory({ silent: true });
     state.activeStage = state.project.solution_compiled ? 3 : 2;
     if (!state.project.solution_compiled) throw Object.assign(new Error("solution compilation failed"), { payload: state.project.last_error });
   }, "项目已创建，标程编译通过");
@@ -848,7 +878,7 @@ function bindStage2() {
 }
 
 function bindStage3() {
-  bindInteractiveStage(3, readStructureDraft, validateStructure, "#inputStructureTemplate, #structureTagsInput");
+  bindInteractiveStage(3, readStructureDraft, validateStructure, "#inputStructureTemplate");
 }
 
 function preservePlanAndRender(mutator) {
@@ -860,27 +890,26 @@ function preservePlanAndRender(mutator) {
 
 function bindStage4() {
   bindInteractiveStage(4, readPlanDraft, validatePlan, "[data-plan-key], [data-special-count], [data-special-description]");
-  $("#addSubtaskBtn")?.addEventListener("click", () => preservePlanAndRender((draft) => {
-    const id = Math.max(0, ...draft.subtasks.map((item) => item.id)) + 1;
-    draft.subtasks.push(emptySubtask(id));
-    state.expandedSubtasks.add(draft.subtasks.length - 1);
-  }));
   $$('[data-toggle-subtask]').forEach((button) => button.addEventListener("click", () => preservePlanAndRender(() => {
     const index = Number(button.dataset.toggleSubtask);
     if (state.expandedSubtasks.has(index)) state.expandedSubtasks.delete(index); else state.expandedSubtasks.add(index);
   })));
-  $$('[data-delete-subtask]').forEach((button) => button.addEventListener("click", () => {
-    if ((state.drafts["4"]?.subtasks.length || 0) <= 1) {
-      showToast("至少保留一个子任务；如需重新规划，请直接运行 AI 检查。", "error");
-      return;
-    }
-    preservePlanAndRender((draft) => draft.subtasks.splice(Number(button.dataset.deleteSubtask), 1));
-  }));
   $$('[data-add-special]').forEach((button) => button.addEventListener("click", () => preservePlanAndRender((draft) => {
     draft.subtasks[Number(button.dataset.addSpecial)].special_cases.push({ count: 1, description: "" });
   })));
   $$('[data-remove-special]').forEach((button) => button.addEventListener("click", () => preservePlanAndRender((draft) => {
     draft.subtasks[Number(button.dataset.subtask)].special_cases.splice(Number(button.dataset.removeSpecial), 1);
+  })));
+  $("#addSubtaskBtn")?.addEventListener("click", () => preservePlanAndRender((draft) => {
+    const source = draft.subtasks.at(-1) || null;
+    draft.subtasks.push(emptySubtask(draft.subtasks.length + 1, source));
+    state.expandedSubtasks.add(draft.subtasks.length - 1);
+  }));
+  $$('[data-remove-subtask]').forEach((button) => button.addEventListener("click", () => preservePlanAndRender((draft) => {
+    if (draft.subtasks.length <= 1) return;
+    draft.subtasks.splice(Number(button.dataset.removeSubtask), 1);
+    renumberSubtasks(draft);
+    state.expandedSubtasks = new Set(draft.subtasks.map((_item, index) => index));
   })));
   $$('[data-plan-key="complexity"]').forEach((select) => select.addEventListener("change", () => {
     const custom = $(`[data-plan-key="custom-complexity"][data-subtask="${select.dataset.subtask}"]`);
@@ -1014,25 +1043,59 @@ function activateStage(stage) {
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
 
+function hasUnsavedChanges() {
+  return state.dirtySolution || state.dirtyStages.size > 0;
+}
+
+function confirmProjectNavigation(message) {
+  if (!hasUnsavedChanges()) return true;
+  return window.confirm(message || "当前修改尚未保存。离开将放弃这些修改，是否继续？");
+}
+
+function clearProjectWorkspace({ removeStoredId = true } = {}) {
+  if (removeStoredId) localStorage.removeItem("testforge.projectId");
+  Object.assign(state, {
+    projectId: null,
+    project: null,
+    drafts: { "3": null, "4": null, "5": null },
+    draftBaselines: { "3": null, "4": null, "5": null },
+    solutionCode: "",
+    solutionBaseline: "",
+    dirtySolution: false,
+    activeStage: 1,
+    error: null,
+    compileResult: null,
+    preview: null,
+    previewHistory: [],
+    buildResult: null,
+    expandedSubtasks: new Set([0]),
+    dirtyStages: new Set(),
+  });
+}
+
+async function fetchProjectWorkspace(projectId) {
+  const [projectResponse, solutionResponse] = await Promise.all([
+    api(`/api/projects/${projectId}`),
+    api(`/api/projects/${projectId}/solution`),
+  ]);
+  state.project = projectResponse.project;
+  state.drafts = projectResponse.drafts;
+  state.draftBaselines = Object.fromEntries([3, 4, 5].map((stage) => {
+    const baseline = cloneJson(projectResponse.drafts[String(stage)]);
+    if (baseline) baseline.issues = stageIssueValues(baseline, stage);
+    return [String(stage), baseline];
+  }));
+  state.dirtyStages.clear();
+  state.solutionCode = solutionResponse.solution_code;
+  state.solutionBaseline = solutionResponse.solution_code;
+  state.dirtySolution = false;
+  state.error = null;
+}
+
 async function refreshProject({ silent = false, keepError = false } = {}) {
   if (!state.projectId) return;
   try {
-    const [projectResponse, solutionResponse] = await Promise.all([
-      api(`/api/projects/${state.projectId}`),
-      api(`/api/projects/${state.projectId}/solution`),
-    ]);
-    state.project = projectResponse.project;
-    state.tagCatalog = projectResponse.structure_tag_catalog || { version: null, tags: [] };
-    state.drafts = projectResponse.drafts;
-    state.draftBaselines = Object.fromEntries([3, 4, 5].map((stage) => {
-      const baseline = cloneJson(projectResponse.drafts[String(stage)]);
-      if (baseline) baseline.issues = stageIssueValues(baseline, stage);
-      return [String(stage), baseline];
-    }));
-    state.dirtyStages.clear();
-    state.solutionCode = solutionResponse.solution_code;
-    state.solutionBaseline = solutionResponse.solution_code;
-    state.dirtySolution = false;
+    await fetchProjectWorkspace(state.projectId);
     if (!canOpenStage(state.activeStage)) {
       state.activeStage = Number(state.project.current_stage);
     }
@@ -1040,13 +1103,104 @@ async function refreshProject({ silent = false, keepError = false } = {}) {
     if (!silent) showToast("项目状态已刷新");
   } catch (error) {
     if (error.status === 404) {
-      localStorage.removeItem("testforge.projectId");
-      state.projectId = null;
-      state.project = null;
-      state.activeStage = 1;
+      clearProjectWorkspace();
     } else {
       state.error = error;
     }
+  }
+}
+
+async function loadProjectHistory({ silent = false } = {}) {
+  if (!state.apiOnline) return;
+  state.projectHistoryBusy = true;
+  renderProjectHistory();
+  try {
+    const response = await api("/api/projects");
+    state.projects = Array.isArray(response?.projects) ? response.projects : [];
+  } catch (error) {
+    if (!silent) showToast(errorMessage(error), "error");
+  } finally {
+    state.projectHistoryBusy = false;
+    renderProjectHistory();
+  }
+}
+
+async function openProjectHistory() {
+  if (!state.apiOnline) {
+    showToast("后端未连接，暂时无法读取项目历史。", "error");
+    return;
+  }
+  if (window.matchMedia("(max-width: 900px)").matches) {
+    setProjectPanelOpen(true);
+  } else {
+    $("#projectPanel").scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
+  await loadProjectHistory();
+}
+
+function setProjectPanelOpen(open) {
+  $("#projectPanel").classList.toggle("open", open);
+  $("#projectPanelBackdrop").classList.toggle("open", open);
+  $("#projectHistoryTopbarBtn").setAttribute("aria-expanded", String(open));
+  document.body.classList.toggle(
+    "project-panel-visible",
+    open && window.matchMedia("(max-width: 900px)").matches,
+  );
+}
+
+async function switchProject(projectId) {
+  if (projectId === state.projectId) {
+    setProjectPanelOpen(false);
+    return;
+  }
+  if (state.busy || !confirmProjectNavigation("当前修改尚未保存。切换项目将放弃这些修改，是否继续？")) return;
+  const previousId = state.projectId;
+  state.busy = true;
+  state.busyLabel = "加载项目中";
+  state.error = null;
+  render();
+  try {
+    clearProjectWorkspace();
+    state.projectId = projectId;
+    localStorage.setItem("testforge.projectId", projectId);
+    await fetchProjectWorkspace(projectId);
+    state.activeStage = Number(state.project.current_stage);
+    setProjectPanelOpen(false);
+    showToast(`已切换到「${projectDisplayName(state.project, 24)}」`);
+  } catch (error) {
+    clearProjectWorkspace();
+    if (previousId) {
+      state.projectId = previousId;
+      localStorage.setItem("testforge.projectId", previousId);
+      await refreshProject({ silent: true });
+    }
+    showToast(errorMessage(error), "error");
+    await loadProjectHistory({ silent: true });
+  } finally {
+    state.busy = false;
+    state.busyLabel = "";
+    render();
+  }
+}
+
+async function deleteProject(projectId) {
+  if (state.busy || state.deletingProjectId) return;
+  const project = state.projects.find((item) => item.project_id === projectId);
+  const name = projectDisplayName(project, 28);
+  if (projectId === state.projectId && !confirmProjectNavigation("当前修改尚未保存。删除项目会永久丢失这些修改，是否继续？")) return;
+  if (!window.confirm(`确定永久删除项目「${name}」吗？项目数据、运行记录和导出文件都将被移除，此操作无法撤销。`)) return;
+  state.deletingProjectId = projectId;
+  renderProjectHistory();
+  try {
+    await api(`/api/projects/${projectId}`, { method: "DELETE" });
+    if (projectId === state.projectId) clearProjectWorkspace();
+    await loadProjectHistory({ silent: true });
+    showToast(`项目「${name}」已删除`);
+  } catch (error) {
+    showToast(errorMessage(error), "error");
+  } finally {
+    state.deletingProjectId = null;
+    render();
   }
 }
 
@@ -1193,25 +1347,9 @@ async function saveModelSettings(event) {
 }
 
 function resetForNewProject() {
-  if (state.project && !window.confirm("创建新项目不会删除当前项目，但会从本机工作台移除其快捷入口。是否继续？")) return;
-  localStorage.removeItem("testforge.projectId");
-  Object.assign(state, {
-    projectId: null,
-    project: null,
-    drafts: { "3": null, "4": null, "5": null },
-    draftBaselines: { "3": null, "4": null, "5": null },
-    solutionCode: "",
-    solutionBaseline: "",
-    dirtySolution: false,
-    activeStage: 1,
-    error: null,
-    compileResult: null,
-    preview: null,
-    previewHistory: [],
-    buildResult: null,
-    expandedSubtasks: new Set([0]),
-    dirtyStages: new Set(),
-  });
+  if (state.busy || !confirmProjectNavigation("当前修改尚未保存。新建项目会保留当前项目，但未保存的修改将丢失，是否继续？")) return;
+  clearProjectWorkspace();
+  setProjectPanelOpen(false);
   render();
 }
 
@@ -1219,6 +1357,26 @@ async function init() {
   $$(".stage-link").forEach((button) => button.addEventListener("click", () => activateStage(Number(button.dataset.stage))));
   $("#stageSelect").addEventListener("change", (event) => activateStage(Number(event.target.value)));
   $("#newProjectBtn").addEventListener("click", resetForNewProject);
+  $("#projectHistoryTopbarBtn").addEventListener("click", openProjectHistory);
+  $("#refreshProjectHistoryBtn").addEventListener("click", () => loadProjectHistory());
+  $("#closeProjectPanelBtn").addEventListener("click", () => setProjectPanelOpen(false));
+  $("#projectPanelBackdrop").addEventListener("click", () => setProjectPanelOpen(false));
+  $("#newProjectFromSidebarBtn").addEventListener("click", resetForNewProject);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") setProjectPanelOpen(false);
+  });
+  window.addEventListener("resize", () => {
+    if (!window.matchMedia("(max-width: 900px)").matches) setProjectPanelOpen(false);
+  });
+  $("#projectHistoryList").addEventListener("click", (event) => {
+    const deleteButton = event.target.closest("[data-delete-project]");
+    if (deleteButton) {
+      deleteProject(deleteButton.dataset.deleteProject);
+      return;
+    }
+    const projectButton = event.target.closest("[data-open-project]");
+    if (projectButton) switchProject(projectButton.dataset.openProject);
+  });
   $("#modelSettingsBtn").addEventListener("click", openModelSettings);
   $("#modelSettingsForm").addEventListener("submit", saveModelSettings);
   $("#testModelConnectionBtn").addEventListener("click", testModelConnection);
@@ -1239,11 +1397,13 @@ async function init() {
       try { await loadModelConfiguration(); } catch { /* keep health state visible */ }
     }
     await refreshProject();
+    await loadProjectHistory({ silent: true });
     render();
   });
   await checkHealth();
   if (state.apiOnline) {
     try { await loadModelConfiguration(); } catch { /* health remains authoritative for connectivity */ }
+    await loadProjectHistory({ silent: true });
   }
   if (state.projectId) {
     await refreshProject({ silent: true });

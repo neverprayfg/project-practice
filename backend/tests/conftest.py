@@ -12,14 +12,16 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 from app.main import create_app
 from app.models import (
-    CodeGenerationSubmission,
     CodeRepairPatch,
+    GeneratorGenerationSubmission,
     GlobalInput,
+    InputNormalizationDraft,
     InputStructureDraft,
     SandboxResult,
     SemanticAudit,
     SubtaskPlanDraft,
     TargetedDefectCheck,
+    ValidatorGenerationSubmission,
 )
 from app.services.sandbox import (
     GenerationJob,
@@ -115,8 +117,13 @@ class DeterministicTestModel:
 
     async def agent1_normalize(
         self, context: dict[str, Any], candidate: dict[str, Any]
-    ) -> GlobalInput:
-        return GlobalInput.model_validate(candidate or context["input"])
+    ) -> InputNormalizationDraft:
+        value = GlobalInput.model_validate(candidate or context["input"])
+        return InputNormalizationDraft(
+            input_description=value.problem.input_description,
+            output_description=value.problem.output_description,
+            samples=value.problem.samples,
+        )
 
     async def agent2_structure(
         self, context: dict[str, Any], candidate: dict[str, Any]
@@ -126,13 +133,6 @@ class DeterministicTestModel:
             candidate
             or {
                 "template": "按题目与标程的读取顺序读取一个整数。",
-                "structure_tags": [
-                    {
-                        "tag_id": "primitive.integer",
-                        "applies_to": "输入整数 n",
-                        "evidence": "标程从标准输入读取整数 n。",
-                    }
-                ],
             }
         )
 
@@ -142,11 +142,23 @@ class DeterministicTestModel:
         value = candidate or self._default_plan()
         return SubtaskPlanDraft.model_validate(self._runtime_parameters(value))
 
-    async def agent4_generate(
+    async def agent3_revise(
         self, context: dict[str, Any], candidate: dict[str, Any]
-    ) -> CodeGenerationSubmission:
+    ) -> SubtaskPlanDraft:
+        del context
+        return SubtaskPlanDraft.model_validate(self._runtime_parameters(candidate))
+
+    async def agent4_generate_generator(
+        self, context: dict[str, Any], candidate: dict[str, Any]
+    ) -> GeneratorGenerationSubmission:
         del candidate
-        return self._code_draft(context)
+        return self._generator_submission(context)
+
+    async def agent4_generate_validator(
+        self, context: dict[str, Any], candidate: dict[str, Any]
+    ) -> ValidatorGenerationSubmission:
+        del candidate
+        return self._validator_submission(context)
 
     async def agent4_audit(
         self,
@@ -164,7 +176,7 @@ class DeterministicTestModel:
         raise AssertionError("valid test candidate has no historical semantic defect")
 
     @staticmethod
-    def _code_draft(context: dict[str, Any]) -> CodeGenerationSubmission:
+    def _generator_submission(context: dict[str, Any]) -> GeneratorGenerationSubmission:
         parameter_names = sorted(
             {
                 str(parameter["name"])
@@ -191,41 +203,25 @@ class DeterministicTestModel:
             ["auto sample=Array::random(1,0,0);", "std::cout << sample;", "return 0;}"]
         )
         generator_code = "\n".join(generator_lines)
+        return GeneratorGenerationSubmission.model_validate(
+            {
+                "format_contract_id": context["input_format_contract"]["format_contract_id"],
+                "generator_code": generator_code,
+            }
+        )
+
+    @staticmethod
+    def _validator_submission(context: dict[str, Any]) -> ValidatorGenerationSubmission:
         validator_code = (
             '#include "testlib.h"\n'
             "int main(int argc,char** argv){registerValidation(argc,argv);"
-            "inf.readEof();return 0;}"
+            'inf.readInt(-1000000000,1000000000,"value");'
+            "inf.readEoln();inf.readEof();return 0;}"
         )
-        obligations = context["proof_obligations"]
-        document = context["jngen_documentation"]["selected_documents"][0]
-        symbol = document["symbols"][0]
-        mapping = [
+        return ValidatorGenerationSubmission.model_validate(
             {
-                "constraint_id": obligation["constraint_id"],
-                "locations": [
-                    {
-                        "target_file": "generator.cpp",
-                        "symbol": "main",
-                        "line_start": 3,
-                        "line_end": len(generator_lines),
-                    }
-                ],
-                "used_parameters": parameter_names,
-                "document_evidence": [
-                    {
-                        "filename": document["filename"],
-                        "symbol": symbol,
-                    }
-                ],
-                "test_strategy": "按约束和测试点参数显式构造。",
-            }
-            for obligation in obligations
-        ]
-        return CodeGenerationSubmission.model_validate(
-            {
-                "generator_code": generator_code,
+                "format_contract_id": context["input_format_contract"]["format_contract_id"],
                 "validator_code": validator_code,
-                "implementation_mapping": mapping,
             }
         )
 
@@ -259,14 +255,11 @@ class DeterministicTestModel:
         return {
             "subtasks": [
                 {
-                    "id": index,
-                    "constraints": f"第 {index} 个规模梯度。",
+                    "id": 1,
                     "test_count": 1,
                     "expected_complexity": "O(n)",
                     "special_cases": [],
-                    "subtask_tags": [],
                 }
-                for index in range(1, 6)
             ]
         }
 
