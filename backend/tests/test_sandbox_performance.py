@@ -57,6 +57,13 @@ def test_runner_container_keeps_all_security_limits(tmp_path: Path) -> None:
     }
     assert captured["tmpfs"] == {"/tmp": "rw,noexec,nosuid,size=64m"}
     assert captured["mem_limit"] == settings.runner_memory
+    assert captured["ulimits"] == [
+        {
+            "Name": "stack",
+            "Soft": 256 * 1024 * 1024,
+            "Hard": -1,
+        }
+    ]
     assert captured["nano_cpus"] == settings.runner_nano_cpus
     assert captured["pids_limit"] == 128
     assert captured["cap_drop"] == ["ALL"]

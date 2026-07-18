@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 from app.errors import AppError
 from app.main import create_app
+from app.models import SubtaskPlanDraft
 from app.services.model_client import OpenAICompatibleAgentModel
 from app.services.model_configuration import ModelConfigurationService
 from app.storage import ProjectStorage
@@ -156,9 +157,217 @@ async def test_ai_operation_requires_model_configuration(tmp_path: Path) -> None
     )
 
     with pytest.raises(AppError) as exc_info:
-        await service.build_model().agent2_structure({}, {})
+        await service.build_model().agent2_test_data_plan({}, {})
 
     assert exc_info.value.code == "MODEL_NOT_CONFIGURED"
+
+
+@pytest.mark.asyncio
+async def test_agent2_returns_raw_markdown_without_json_output_controls(tmp_path: Path) -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert "response_format" not in payload
+        assert "thinking" not in payload
+        assert payload["temperature"] == 0.5
+        assert "<constraints>" in payload["messages"][0]["content"]
+        assert "<test-matrix>" in payload["messages"][0]["content"]
+        assert "<blueprint-for-generator>" in payload["messages"][0]["content"]
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                "# P1 测试数据设计方案\n"
+                                "<constraints>constraints</constraints>\n"
+                                "<test-matrix>matrix</test-matrix>\n"
+                                "<blueprint-for-generator>blueprint</blueprint-for-generator>"
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    storage = ProjectStorage(tmp_path / "storage")
+    settings = Settings(
+        _env_file=None,
+        storage_root=storage.root,
+        model_api_key="test-key",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        model = OpenAICompatibleAgentModel(settings, client)
+        result = await model.agent2_test_data_plan({"input": {}}, {})
+
+    assert result.plan_markdown.startswith("# P1 测试数据设计方案")
+
+
+@pytest.mark.asyncio
+async def test_agent3_uses_requested_temperature(tmp_path: Path) -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["temperature"] == 0.5
+        assert payload["response_format"] == {"type": "json_object"}
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "subtasks": [
+                                        {
+                                            "id": 1,
+                                            "test_count": 3,
+                                            "expected_complexity": "O(n)",
+                                            "generation_profiles": [
+                                                {
+                                                    "id": "format",
+                                                    "category": "rules_format",
+                                                    "count": 1,
+                                                    "goal": "valid",
+                                                    "parameter_names": ["n"],
+                                                },
+                                                {
+                                                    "id": "stress",
+                                                    "category": "anti_algorithm",
+                                                    "count": 1,
+                                                    "goal": "stress",
+                                                    "parameter_names": ["n"],
+                                                },
+                                                {
+                                                    "id": "edge",
+                                                    "category": "boundary_edge",
+                                                    "count": 1,
+                                                    "goal": "edge",
+                                                    "parameter_names": ["n"],
+                                                },
+                                            ],
+                                            "runtime_parameters": [
+                                                {
+                                                    "case_id": case_id,
+                                                    "generation_profile_id": profile,
+                                                    "parameters": [
+                                                        {
+                                                            "name": "n",
+                                                            "value": case_id,
+                                                            "category": "size",
+                                                        }
+                                                    ],
+                                                }
+                                                for case_id, profile in enumerate(
+                                                    ["format", "stress", "edge"], start=1
+                                                )
+                                            ],
+                                        }
+                                    ]
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    storage = ProjectStorage(tmp_path / "storage")
+    settings = Settings(_env_file=None, storage_root=storage.root, model_api_key="test-key")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        model = OpenAICompatibleAgentModel(settings, client)
+        result = await model.agent3_plan({"test_data_plan": {"plan_markdown": "plan"}}, {})
+
+    assert len(result.subtasks) == 1
+
+
+@pytest.mark.asyncio
+async def test_agent3_returns_contract_evidence_for_dedicated_repair(tmp_path: Path) -> None:
+    calls = 0
+
+    def plan(parameter_name: str, values: list[object]) -> dict:
+        profiles = (
+            ("format", "rules_format"),
+            ("stress", "anti_algorithm"),
+            ("edge", "boundary_edge"),
+        )
+        return {
+            "subtasks": [
+                {
+                    "id": 1,
+                    "test_count": 3,
+                    "expected_complexity": "O(n log n)",
+                    "generation_profiles": [
+                        {
+                            "id": profile_id,
+                            "category": category,
+                            "count": 1,
+                            "goal": profile_id,
+                            "parameter_names": [parameter_name],
+                        }
+                        for profile_id, category in profiles
+                    ],
+                    "runtime_parameters": [
+                        {
+                            "case_id": case_id,
+                            "generation_profile_id": profile_id,
+                            "parameters": [
+                                {
+                                    "name": parameter_name,
+                                    "value": values[case_id - 1],
+                                    "category": "structure",
+                                }
+                            ],
+                        }
+                        for case_id, (profile_id, _category) in enumerate(profiles, start=1)
+                    ],
+                }
+            ]
+        }
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        payload = json.loads(request.content)
+        if calls == 1:
+            assert "禁止把边列表" in payload["messages"][0]["content"]
+            content = plan("edges", ["1:2:5", "1:2:10;1:2:5", "1:2:5;2:3:3"])
+        else:
+            request_inputs = json.loads(payload["messages"][-1]["content"])["inputs"]
+            assert "1:2:10;1:2:5" in request_inputs["raw_output"]
+            assert request_inputs["validation_errors"]
+            assert "construction_mode" in payload["messages"][0]["content"]
+            content = plan("construction_mode", ["single_edge", "sparse", "chain"])
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": json.dumps(content)}}],
+            },
+        )
+
+    settings = Settings(
+        _env_file=None,
+        storage_root=tmp_path / "storage",
+        model_api_key="test-key",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        model = OpenAICompatibleAgentModel(settings, client)
+        invalid = await model.agent3_plan_result(
+            {"test_data_plan": {"plan_markdown": "graph plan"}}, {}
+        )
+        assert invalid.candidate is not None
+        assert invalid.validation_errors
+        result = await model.agent3_revise_result(
+            {
+                "test_data_plan": {"plan_markdown": "graph plan"},
+                "raw_output": invalid.raw_output,
+                "validation_errors": invalid.validation_errors,
+            },
+            invalid.candidate,
+        )
+
+    assert calls == 2
+    parsed = SubtaskPlanDraft.model_validate(result.candidate)
+    assert parsed.subtasks[0].runtime_parameters[1].parameters[0].value == "sparse"
 
 
 @pytest.mark.asyncio

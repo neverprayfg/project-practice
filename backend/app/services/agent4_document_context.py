@@ -8,11 +8,16 @@ from typing import Any, Literal
 from app.errors import AppError
 
 FILE_SEPARATOR = "\n\n<<<FILE_SEPARATOR>>>\n\n"
-CONTEXT_FORMAT_VERSION = 5
-CONTEXT_LOADING_METHOD = "strict_recursive_role_json"
+CONTEXT_FORMAT_VERSION = 6
+CONTEXT_LOADING_METHOD = "prebuilt_generator_reference"
+GENERATOR_REFERENCE_FILENAME = "jngen_context/agent4_reference.md"
 ROLE_LIBRARIES = {
     "generator": ("jngen_context",),
     "validator": ("testlib_context",),
+}
+ROLE_LIBRARY_FIELDS = {
+    "generator": {"jngen_context": {"reference"}},
+    "validator": {"testlib_context": {"doc", "example"}},
 }
 
 
@@ -29,7 +34,7 @@ class Agent4DocumentContext:
         documents: list[dict[str, Any]] = []
         role_filenames: dict[str, list[str]] = {}
         for role, root in self.roots.items():
-            filenames = self._available_filenames(root, role)
+            filenames = self._context_filenames(root, role)
             role_filenames[role] = [f"{role}/{filename}" for filename in filenames]
             for filename in filenames:
                 content = (root / filename).read_text(encoding="utf-8").strip()
@@ -65,7 +70,7 @@ class Agent4DocumentContext:
         ):
             raise AppError(
                 "AGENT4_CONTEXT_CONTRACT_INVALID",
-                "阶段五文档上下文不是当前严格递归 JSON 契约。",
+                "阶段五文档上下文不是当前预构建参考文档契约。",
                 stage=5,
             )
         role_contexts = documentation.get("role_contexts")
@@ -78,13 +83,19 @@ class Agent4DocumentContext:
                 stage=5,
             )
         role_context = role_contexts[role]
-        if set(role_context) != set(ROLE_LIBRARIES[role]) or any(
-            not isinstance(library, dict) or set(library) != {"doc", "example"}
-            for library in role_context.values()
+        expected_libraries = ROLE_LIBRARY_FIELDS[role]
+        if set(role_context) != set(expected_libraries) or any(
+            not isinstance(role_context.get(library), dict)
+            or set(role_context[library]) != fields
+            or not all(
+                Agent4DocumentContext._has_text(value)
+                for value in role_context[library].values()
+            )
+            for library, fields in expected_libraries.items()
         ):
             raise AppError(
                 "AGENT4_CONTEXT_CONTRACT_INVALID",
-                f"阶段五 {role} 上下文不符合当前库、doc、example 严格结构。",
+                f"阶段五 {role} 上下文不符合当前库文档结构。",
                 stage=5,
             )
         documents = [
@@ -128,6 +139,35 @@ class Agent4DocumentContext:
         }
 
     def _library_json(self, root: Path, role: str) -> dict[str, Any]:
+        if role == "generator":
+            return self._generator_reference_json(root)
+        return self._validator_library_json(root, role)
+
+    def _generator_reference_json(self, root: Path) -> dict[str, Any]:
+        direct_files = self._visible_files(root)
+        directories = self._visible_directories(root)
+        expected_direct = {"agent4_reference.md"}
+        expected_directories = {"doc", "example"}
+        actual_direct = {path.name for path in direct_files}
+        actual_directories = {path.name for path in directories}
+        if actual_direct != expected_direct or actual_directories != expected_directories:
+            raise AppError(
+                "AGENT4_CONTEXT_LAYOUT_INVALID",
+                "jngen_context 必须包含预构建的 agent4_reference.md 以及 doc、example 源目录。",
+                stage=5,
+                details={
+                    "missing_files": sorted(expected_direct - actual_direct),
+                    "unexpected_files": sorted(actual_direct - expected_direct),
+                    "missing_directories": sorted(expected_directories - actual_directories),
+                    "unexpected_directories": sorted(actual_directories - expected_directories),
+                },
+            )
+        reference = (root / "agent4_reference.md").read_text(encoding="utf-8").strip()
+        if not reference:
+            raise AppError("AGENT4_CONTEXT_EMPTY", "jngen 预构建参考文档为空。", stage=5)
+        return {"reference": reference}
+
+    def _validator_library_json(self, root: Path, role: str) -> dict[str, Any]:
         direct_files = self._visible_files(root)
         directories = self._visible_directories(root)
         actual = {path.name for path in directories}
@@ -217,6 +257,19 @@ class Agent4DocumentContext:
                 stage=5,
             )
         return filenames
+
+    @classmethod
+    def _context_filenames(cls, root: Path, role: str) -> list[str]:
+        if role == "generator":
+            reference = root / GENERATOR_REFERENCE_FILENAME
+            if not reference.is_file():
+                raise AppError(
+                    "AGENT4_CONTEXT_MISSING",
+                    "generator 上下文缺少预构建的 jngen 参考文档。",
+                    stage=5,
+                )
+            return [GENERATOR_REFERENCE_FILENAME]
+        return cls._available_filenames(root, role)
 
     @staticmethod
     def _symbols(content: str) -> list[str]:

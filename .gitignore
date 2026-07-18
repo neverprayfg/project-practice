@@ -21,3 +21,4 @@ backend/.env
 /storage/
 /exports/
 /deploy/state/
+/examples/

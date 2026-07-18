@@ -54,8 +54,8 @@ def create_app(
         verifier,
         agent4_documents,
     )
-    pipeline = PipelineService(storage, projects, agent_graphs, contexts, sandbox)
     datasets = DatasetService(settings, storage, projects, sandbox)
+    pipeline = PipelineService(storage, projects, agent_graphs, contexts, sandbox, datasets)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:

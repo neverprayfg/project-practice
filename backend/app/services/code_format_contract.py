@@ -9,21 +9,18 @@ from app.models import InputFormatContract
 
 
 def build_input_format_contract(context: dict[str, Any]) -> InputFormatContract:
-    """Freeze the stage-three input format before parallel code generation."""
+    """Freeze Agent1's normalized input description before code generation."""
     input_data = context.get("input", {})
-    input_structure = (
-        input_data.get("input_structure", {}) if isinstance(input_data, dict) else {}
-    )
-    template = str(input_structure.get("template") or "").strip()
-    if not template:
+    problem = input_data.get("problem", {}) if isinstance(input_data, dict) else {}
+    template = str(problem.get("input_description") or "").strip()
+    if not template or template == "未提供":
         raise AppError(
             "INPUT_FORMAT_CONTRACT_MISSING",
-            "阶段三没有可用于代码生成的已确认输入格式。",
-            stage=3,
+            "第一阶段没有可用于代码生成的已规范化输入说明。",
+            stage=1,
             status_code=409,
         )
 
-    problem = input_data.get("problem", {}) if isinstance(input_data, dict) else {}
     sample_inputs = [
         str(item["input"])
         for item in problem.get("samples", [])
