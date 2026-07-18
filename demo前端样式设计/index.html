@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#0f6669" />
     <title>TestForge · 竞赛数据工作台</title>
-    <link rel="stylesheet" href="./styles.css" />
+    <link rel="stylesheet" href="./styles.css?v=20260717-auto-run" />
   </head>
   <body>
     <div class="app-shell">
@@ -47,7 +47,7 @@
             <span class="stage-number">2</span><span class="stage-copy"><strong>编译标程</strong><small>Docker 环境检查</small></span><i class="stage-state" data-lucide="circle"></i>
           </button>
           <button class="stage-link" type="button" data-stage="3">
-            <span class="stage-number">3</span><span class="stage-copy"><strong>确认输入结构</strong><small>AI 草稿与问题</small></span><i class="stage-state" data-lucide="circle"></i>
+            <span class="stage-number">3</span><span class="stage-copy"><strong>设计测试数据</strong><small>约束、矩阵与生成大纲</small></span><i class="stage-state" data-lucide="circle"></i>
           </button>
           <button class="stage-link" type="button" data-stage="4">
             <span class="stage-number">4</span><span class="stage-copy"><strong>规划子任务</strong><small>范围、数量与复杂度</small></span><i class="stage-state" data-lucide="circle"></i>
@@ -80,6 +80,7 @@
             <h1 id="pageTitle">创建数据项目</h1>
           </div>
           <div class="topbar-actions">
+            <button class="button button-primary auto-run-button" id="autoRunBtn" type="button" hidden><i data-lucide="wand-sparkles"></i><span>一键生成</span></button>
             <span class="api-status" id="apiStatus"><span class="connection-dot"></span><span>连接中</span></span>
             <button class="icon-button" id="projectHistoryTopbarBtn" type="button" title="项目管理" aria-label="打开项目管理" aria-expanded="false"><i data-lucide="folders"></i></button>
             <button class="icon-button" id="modelSettingsBtn" type="button" title="模型与 API 设置" aria-label="模型与 API 设置"><i data-lucide="settings-2"></i></button>
@@ -153,6 +154,6 @@
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
     <script src="./vendor/lucide.min.js"></script>
-    <script src="./app.js"></script>
+    <script src="./app.js?v=20260718-copy-project-fields"></script>
   </body>
 </html>

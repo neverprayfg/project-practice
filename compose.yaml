@@ -6,7 +6,6 @@ x-backend-build: &backend-build
 
 services:
   docker-api:
-    build: *backend-build
     image: contest-dataset-backend:0.1.0
     user: "0:0"
     command: ["python", "-m", "app.docker_proxy"]
@@ -24,7 +23,6 @@ services:
     restart: unless-stopped
 
   workspace-init:
-    build: *backend-build
     image: contest-dataset-backend:0.1.0
     user: "0:0"
     command: ["sh", "-c", "chown -R 10001:10001 /workspace /exports"]
@@ -54,6 +52,7 @@ services:
       STORAGE_VOLUME: contest_dataset_storage
       RUNNER_COMPILE_IMAGE: contest-dataset-runner-compiler:0.3.0
       RUNNER_EXECUTE_IMAGE: contest-dataset-runner-executor:0.3.0
+      RUNNER_STACK_SOFT_BYTES: ${RUNNER_STACK_SOFT_BYTES:-268435456}
       RUNNER_CONCURRENCY: ${RUNNER_CONCURRENCY:-2}
       RUNNER_BATCH_SIZE: ${RUNNER_BATCH_SIZE:-16}
       MANIFEST_CHECKPOINT_INTERVAL: ${MANIFEST_CHECKPOINT_INTERVAL:-10}

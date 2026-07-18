@@ -9,12 +9,9 @@ from pydantic import ValidationError
 
 from app.errors import AppError
 from app.models import (
-    AGENT4_GRAPH_ID,
-    AGENT4_VERIFIER_REVISION,
+    AGENT4_ARCHITECTURE_ID,
     CodeDraft,
-    CounterexampleLedger,
     GlobalInput,
-    InputStructureDraft,
     ProblemInput,
     ProjectCreate,
     ProjectRecord,
@@ -23,6 +20,7 @@ from app.models import (
     Stage,
     StageStatus,
     SubtaskPlanDraft,
+    TestDataPlanDraft,
 )
 from app.storage import ProjectStorage
 
@@ -48,6 +46,10 @@ class ProjectService:
             solution=SolutionInput(source=payload.solution_code),
         )
         self.storage.initialize(record, input_data)
+        self.storage.write_json(
+            self.storage.project_dir(record.project_id) / "state" / "agent4-architecture.json",
+            {"architecture": AGENT4_ARCHITECTURE_ID},
+        )
         return record
 
     def get(self, project_id: str) -> ProjectRecord:
@@ -61,9 +63,9 @@ class ProjectService:
         return [
             {
                 "project_id": record.project_id,
-                "title": self._history_title(
-                    record.problem_description, record.project_id
-                ),
+                "title": record.project_name
+                or self._history_title(record.problem_description, record.project_id),
+                "project_name": record.project_name,
                 "problem_description": record.problem_description,
                 "difficulty": record.difficulty,
                 "current_stage": int(record.current_stage),
@@ -122,14 +124,52 @@ class ProjectService:
             recovered.append(project_id)
         return recovered
 
+    def prepare_auto_run_resume(self, project_id: str) -> tuple[ProjectRecord, int | None]:
+        """Make the earliest interrupted AI stage the safe auto-run restart point."""
+
+        record = self.get(project_id)
+        interrupted = sorted(
+            stage
+            for stage, state in record.stages.items()
+            if state.status == StageStatus.CHECKING
+        )
+        if not interrupted:
+            return record, None
+
+        recovery_stage = interrupted[0]
+        state = record.stages[recovery_stage]
+        state.status = StageStatus.FAILED
+        state.ai_confirmed = False
+        state.user_confirmed = False
+        state.issues = ["上次一键生成未正常结束，已从此阶段恢复。"]
+        state.updated_at = datetime.now(UTC)
+        record.stage_threads.pop(recovery_stage, None)
+        record.failed_stage_threads.pop(recovery_stage, None)
+        self._invalidate_downstream(record, recovery_stage)
+        record.current_stage = Stage(recovery_stage)
+        record.build_complete = False
+        record.export_ready = False
+        record.generation_complete = False
+        record.generated_subtasks = []
+        if recovery_stage <= Stage.SUBTASK_PLAN:
+            record.code_input_revision = None
+            record.code_subtasks_revision = None
+        record.last_error = {
+            "code": "AUTO_RUN_RESUMED",
+            "message": "一键生成已回收上次中断的阶段并准备继续执行。",
+            "stage": recovery_stage,
+            "details": {"interrupted_stages": interrupted},
+        }
+        record.updated_at = datetime.now(UTC)
+        self.storage.save_record(record)
+        self.storage.invalidate_downstream_artifacts(project_id, recovery_stage)
+        return record, recovery_stage
+
     def invalidate_obsolete_agent4_state(self) -> list[str]:
-        """Discard state from older Agent4 graphs instead of interpreting it."""
+        """Discard state from older Agent4 architectures instead of interpreting it."""
 
         migrated: list[str] = []
-        architecture = {
-            "graph_id": AGENT4_GRAPH_ID,
-            "verifier_revision": AGENT4_VERIFIER_REVISION,
-        }
+        architecture = {"architecture": AGENT4_ARCHITECTURE_ID}
         for project_id in self.storage.project_ids():
             project_dir = self.storage.project_dir(project_id)
             marker_path = project_dir / "state" / "agent4-architecture.json"
@@ -141,51 +181,22 @@ class ProjectService:
                 continue
 
             record = self.get(project_id)
-            structure_path = project_dir / "state" / "input_structure.json"
-            if structure_path.is_file():
-                try:
-                    raw_structure = json.loads(structure_path.read_text(encoding="utf-8"))
-                    current_structure = InputStructureDraft.model_validate(
-                        {
-                            "template": raw_structure.get("template"),
-                            "issues": raw_structure.get("issues", []),
-                        }
-                    )
-                    self.storage.write_json(
-                        structure_path,
-                        current_structure.model_dump(mode="json"),
-                    )
-                except (ValidationError, json.JSONDecodeError, OSError, AttributeError):
-                    structure_path.unlink(missing_ok=True)
-            plan_path = project_dir / "state" / "subtask_plan.json"
-            plan_is_current = False
-            if plan_path.is_file():
-                try:
-                    SubtaskPlanDraft.model_validate_json(plan_path.read_text(encoding="utf-8"))
-                    plan_is_current = True
-                except (ValidationError, OSError):
-                    plan_path.unlink(missing_ok=True)
-
-            self.storage.invalidate_downstream_artifacts(project_id, Stage.SUBTASK_PLAN)
-            self._invalidate_downstream(record, Stage.SUBTASK_PLAN)
-            record.stage_threads.pop(int(Stage.SUBTASK_PLAN), None)
-            record.failed_stage_threads.pop(int(Stage.SUBTASK_PLAN), None)
-            if not plan_is_current and int(record.current_stage) >= int(Stage.SUBTASK_PLAN):
-                stage4 = record.stages[int(Stage.SUBTASK_PLAN)]
-                stage4.status = StageStatus.DRAFT
-                stage4.ai_confirmed = False
-                stage4.user_confirmed = False
-                stage4.issues = ["阶段四计划不符合当前配置格式，请重新运行 AI 检查。"]
-                stage4.updated_at = datetime.now(UTC)
-                record.current_stage = Stage.SUBTASK_PLAN
-                record.subtasks_revision += 1
-            elif (
-                plan_is_current
-                and record.stages[int(Stage.SUBTASK_PLAN)].status == StageStatus.PASSED
-                and int(record.current_stage) >= int(Stage.CODE_DRAFT)
-            ):
-                record.current_stage = Stage.CODE_DRAFT
-
+            # Stage 3 changed from an input-structure template to a test-data
+            # design document.  Old drafts cannot be reinterpreted safely.
+            (project_dir / "state" / "input_structure.json").unlink(missing_ok=True)
+            (project_dir / "state" / "test_data_plan.json").unlink(missing_ok=True)
+            self.storage.invalidate_downstream_artifacts(project_id, Stage.TEST_DATA_PLAN)
+            self._invalidate_downstream(record, Stage.TEST_DATA_PLAN)
+            record.stage_threads.pop(int(Stage.TEST_DATA_PLAN), None)
+            record.failed_stage_threads.pop(int(Stage.TEST_DATA_PLAN), None)
+            if int(record.current_stage) >= int(Stage.TEST_DATA_PLAN):
+                stage3 = record.stages[int(Stage.TEST_DATA_PLAN)]
+                stage3.status = StageStatus.DRAFT
+                stage3.ai_confirmed = False
+                stage3.user_confirmed = False
+                stage3.issues = ["阶段三已重构为测试数据生成方案，请重新运行 AI 检查。"]
+                stage3.updated_at = datetime.now(UTC)
+                record.current_stage = Stage.TEST_DATA_PLAN
             record.workflow_revision += 1
             record.code_input_revision = None
             record.code_subtasks_revision = None
@@ -210,10 +221,7 @@ class ProjectService:
         input_data.solution.source = payload.solution_code
         input_data.solution.compile.status = "pending"
         input_data.solution.compile.log = ""
-        input_data.input_structure.template = ""
-        input_data.input_structure.status = "pending"
         input_data.revision += 1
-        input_data.input_structure.revision = input_data.revision
         self.storage.save_input(project_id, input_data)
         record.input_revision = input_data.revision
         record.workflow_revision += 1
@@ -255,8 +263,6 @@ class ProjectService:
             return current
         validated["issues"] = []
         if stage == Stage.CODE_DRAFT:
-            validated["trial_results"] = []
-        if stage == Stage.CODE_DRAFT:
             validated["input_revision"] = record.input_revision
             validated["subtasks_revision"] = record.subtasks_revision
             validated_model = self.storage.save_code_draft(
@@ -266,9 +272,7 @@ class ProjectService:
         else:
             self.storage.save_draft(project_id, stage, validated)
 
-        if stage == Stage.INPUT_STRUCTURE:
-            self._update_input_structure(record, validated["template"], confirmed=False)
-        elif stage == Stage.SUBTASK_PLAN:
+        if stage == Stage.SUBTASK_PLAN:
             record.subtasks_revision += 1
 
         record.workflow_revision += 1
@@ -298,7 +302,7 @@ class ProjectService:
     @staticmethod
     def _draft_content(stage: int, draft: dict[str, Any]) -> dict[str, Any]:
         fields = {
-            Stage.INPUT_STRUCTURE: ("template",),
+            Stage.TEST_DATA_PLAN: ("plan_markdown",),
             Stage.SUBTASK_PLAN: ("subtasks",),
             Stage.CODE_DRAFT: (
                 "format_contract_id",
@@ -333,21 +337,10 @@ class ProjectService:
             validated["subtasks_revision"] = record.subtasks_revision
             saved = self.storage.save_code_draft(project_id, CodeDraft.model_validate(validated))
             validated = saved.model_dump(mode="json")
-            if confirmed:
-                ledger = CounterexampleLedger.model_validate(
-                    self.storage.load_agent4_ledger(project_id)
-                )
-                ledger.last_valid_candidate_revision = saved.revision_id
-                self.storage.save_agent4_ledger(
-                    project_id, ledger.model_dump(mode="json")
-                )
-                self.storage.save_agent4_last_valid_candidate(project_id, validated)
         else:
             self.storage.save_draft(project_id, stage, validated)
 
-        if stage == Stage.INPUT_STRUCTURE and content_changed:
-            self._update_input_structure(record, validated["template"], confirmed=False)
-        elif stage == Stage.SUBTASK_PLAN and content_changed:
+        if stage == Stage.SUBTASK_PLAN and content_changed:
             record.subtasks_revision += 1
 
         state = record.stages[stage]
@@ -388,13 +381,21 @@ class ProjectService:
         state.status = StageStatus.PASSED
         state.updated_at = datetime.now(UTC)
         record.current_stage = Stage(stage + 1)
-        if stage == Stage.INPUT_STRUCTURE:
-            input_data = self.storage.load_input(project_id)
-            input_data.input_structure.status = "confirmed"
-            self.storage.save_input(project_id, input_data)
-        elif stage == Stage.CODE_DRAFT:
+        if stage == Stage.CODE_DRAFT:
+            release = self.storage.freeze_code_release(
+                project_id,
+                input_revision=record.input_revision,
+                subtasks_revision=record.subtasks_revision,
+            )
             record.code_input_revision = record.input_revision
             record.code_subtasks_revision = record.subtasks_revision
+            if release.revision_id != self.storage.current_revision(project_id):
+                raise AppError(
+                    "CODE_RELEASE_HASH_MISMATCH",
+                    "冻结的发布快照修订号校验失败。",
+                    stage=5,
+                    status_code=409,
+                )
         record.updated_at = datetime.now(UTC)
         self.storage.save_record(record)
         return record
@@ -406,9 +407,9 @@ class ProjectService:
         value.problem.difficulty = current.problem.difficulty
         value.solution.source = current.solution.source
         value.solution.compile = current.solution.compile
-        value.input_structure = current.input_structure
         value.revision = current.revision
         self.storage.save_input(project_id, value)
+        record.project_name = value.project_name
         record.problem_description = value.problem.description
         record.difficulty = value.problem.difficulty
         record.updated_at = datetime.now(UTC)
@@ -427,7 +428,7 @@ class ProjectService:
         record.solution_compiled = compiled
         if compiled:
             if not was_compiled or record.current_stage <= Stage.SOLUTION_COMPILE:
-                record.current_stage = Stage.INPUT_STRUCTURE
+                record.current_stage = Stage.TEST_DATA_PLAN
         else:
             if was_compiled or record.current_stage > Stage.SOLUTION_COMPILE:
                 record.workflow_revision += 1
@@ -497,13 +498,43 @@ class ProjectService:
         record.export_ready = False
         record.generation_complete = False
         record.last_error = error
-        if recovery_stage in (Stage.INPUT_STRUCTURE, Stage.SUBTASK_PLAN, Stage.CODE_DRAFT):
+        if recovery_stage in (Stage.TEST_DATA_PLAN, Stage.SUBTASK_PLAN, Stage.CODE_DRAFT):
             state = record.stages[int(recovery_stage)]
             state.status = StageStatus.DRAFT
             state.ai_confirmed = False
             state.user_confirmed = False
             state.issues = [error["message"]]
             state.updated_at = datetime.now(UTC)
+        record.updated_at = datetime.now(UTC)
+        self.storage.save_record(record)
+        return record
+
+    def mark_interactive_stage_failed(
+        self,
+        project_id: str,
+        stage: int,
+        error: dict[str, Any],
+    ) -> ProjectRecord:
+        self._require_interactive_stage(stage)
+        record = self.get(project_id)
+        state = record.stages[stage]
+        state.status = StageStatus.FAILED
+        state.ai_confirmed = False
+        state.user_confirmed = False
+        state.issues = [str(error.get("message") or "阶段检查失败。")]
+        state.updated_at = datetime.now(UTC)
+        record.stage_threads.pop(stage, None)
+        record.failed_stage_threads.pop(stage, None)
+        self._invalidate_downstream(record, stage)
+        record.current_stage = Stage(stage)
+        record.build_complete = False
+        record.export_ready = False
+        record.generation_complete = False
+        record.generated_subtasks = []
+        if stage <= Stage.SUBTASK_PLAN:
+            record.code_input_revision = None
+            record.code_subtasks_revision = None
+        record.last_error = error
         record.updated_at = datetime.now(UTC)
         self.storage.save_record(record)
         return record
@@ -517,16 +548,16 @@ class ProjectService:
         allow_tag_review: bool = False,
     ) -> dict[str, Any]:
         try:
-            if stage == Stage.INPUT_STRUCTURE:
-                model = InputStructureDraft.model_validate(draft)
+            if stage == Stage.TEST_DATA_PLAN:
+                model = TestDataPlanDraft.model_validate(draft)
                 return model.model_dump(mode="json")
             if stage == Stage.SUBTASK_PLAN:
                 model = SubtaskPlanDraft.model_validate(draft)
-                structure = self.storage.load_draft(project_id, Stage.INPUT_STRUCTURE)
-                if structure is None:
+                test_data_plan = self.storage.load_draft(project_id, Stage.TEST_DATA_PLAN)
+                if test_data_plan is None:
                     raise AppError(
                         "PREREQUISITE_REQUIRED",
-                        "stage 3 input structure is missing",
+                        "stage 3 test-data plan is missing",
                         stage=stage,
                         status_code=409,
                     )
@@ -553,17 +584,6 @@ class ProjectService:
             state.user_confirmed = False
             state.issues = []
             state.updated_at = datetime.now(UTC)
-
-    def _update_input_structure(
-        self, record: ProjectRecord, template: str, *, confirmed: bool
-    ) -> None:
-        input_data = self.storage.load_input(record.project_id)
-        input_data.revision += 1
-        input_data.input_structure.template = template
-        input_data.input_structure.status = "confirmed" if confirmed else "draft"
-        input_data.input_structure.revision = input_data.revision
-        self.storage.save_input(record.project_id, input_data)
-        record.input_revision = input_data.revision
 
     @staticmethod
     def _require_interactive_stage(stage: int) -> None:

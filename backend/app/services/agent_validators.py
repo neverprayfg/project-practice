@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from pydantic import ValidationError
 
-from app.models import GlobalInput, InputStructureDraft, SubtaskPlanDraft
+from app.models import GlobalInput, SubtaskPlanDraft, TestDataPlanDraft
 from app.services.stage4_plan import subtask_plan_issues
 
 
@@ -30,13 +31,29 @@ class Agent1Validator:
 
 
 class Agent2Validator:
-    """Agent2 validates only the human-readable input template."""
+    """Agent2 validates the fixed Markdown layout for the test-data plan."""
 
     def verify(self, candidate: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         try:
-            model = InputStructureDraft.model_validate(candidate)
+            model = TestDataPlanDraft.model_validate(candidate)
         except ValidationError as exc:
-            return candidate, [f"输入结构结果不符合 Schema：{exc}"]
+            return candidate, [f"测试数据生成方案不符合 Schema：{exc}"]
+        plan = model.plan_markdown
+        required_sections = {
+            "constraints": "变量与合规约束",
+            "test-matrix": "核心测试点矩阵",
+            "blueprint-for-generator": "生成器逻辑实现大纲",
+        }
+        invalid: list[str] = []
+        for tag, label in required_sections.items():
+            matches = re.findall(rf"<{tag}>(.*?)</{tag}>", plan, flags=re.DOTALL)
+            if len(matches) != 1 or not matches[0].strip():
+                invalid.append(label)
+        if invalid:
+            return model.model_dump(mode="json", exclude={"issues"}), [
+                "测试数据设计方案的固定标签缺失、重复或内容为空："
+                + "、".join(invalid)
+            ]
         return model.model_dump(mode="json", exclude={"issues"}), []
 
 

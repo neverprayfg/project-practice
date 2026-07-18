@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
-from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
 from app.config import Settings
-from app.models import CodeDraft, Counterexample, SubtaskPlanDraft
+from app.models import CodeDraft, SubtaskPlanDraft
 from app.services.agent4_document_context import (
     CONTEXT_FORMAT_VERSION,
     CONTEXT_LOADING_METHOD,
@@ -41,7 +39,7 @@ def _context_has_text(value: Any) -> bool:
 
 
 class Agent4CandidateVerifier:
-    """Agent4-only deterministic validator and historical counterexample replayer."""
+    """Run the complete deterministic verification suite for an Agent4 template."""
 
     def __init__(
         self,
@@ -58,13 +56,11 @@ class Agent4CandidateVerifier:
         project_id: str,
         candidate: dict[str, Any],
         context: dict[str, Any],
-        counterexamples: list[Counterexample] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         return await self._verify_code(
             project_id,
             candidate,
             context,
-            counterexamples or [],
         )
 
     async def _verify_code(
@@ -72,7 +68,6 @@ class Agent4CandidateVerifier:
         project_id: str,
         candidate: dict[str, Any],
         context: dict[str, Any],
-        counterexamples: list[Counterexample],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         record = self.storage.load_record(project_id)
         model = CodeDraft.model_validate(
@@ -80,25 +75,14 @@ class Agent4CandidateVerifier:
                 **candidate,
                 "input_revision": record.input_revision,
                 "subtasks_revision": record.subtasks_revision,
-                "trial_results": [],
             }
         )
         workspace_id = self.storage.prepare_agent4_verification_workspace(project_id, model)
-        replayable_counterexamples = [
-            item for item in counterexamples if self._replay_signature(item) is not None
-        ]
-        requested_replay_ids = {item.counterexample_id for item in replayable_counterexamples}
-        completed_replay_ids: set[str] = set()
         fully_evaluated_operations: set[str] = set()
 
         def finish(
             verified: dict[str, Any], execution: dict[str, Any]
         ) -> tuple[dict[str, Any], dict[str, Any]]:
-            execution["requested_counterexample_ids"] = sorted(requested_replay_ids)
-            execution["replayed_counterexample_ids"] = sorted(completed_replay_ids)
-            execution["history_replay_complete"] = requested_replay_ids.issubset(
-                completed_replay_ids
-            )
             execution["fully_evaluated_operations"] = sorted(fully_evaluated_operations)
             return verified, execution
 
@@ -110,9 +94,7 @@ class Agent4CandidateVerifier:
             if isinstance(item, dict) and item.get("filename")
         ]
         role_contexts = (
-            documentation.get("role_contexts", {})
-            if isinstance(documentation, dict)
-            else {}
+            documentation.get("role_contexts", {}) if isinstance(documentation, dict) else {}
         )
         raw_generator_libraries = (
             role_contexts.get("generator") if isinstance(role_contexts, dict) else None
@@ -121,14 +103,10 @@ class Agent4CandidateVerifier:
             role_contexts.get("validator") if isinstance(role_contexts, dict) else None
         )
         generator_libraries = (
-            raw_generator_libraries
-            if isinstance(raw_generator_libraries, dict)
-            else {}
+            raw_generator_libraries if isinstance(raw_generator_libraries, dict) else {}
         )
         validator_libraries = (
-            raw_validator_libraries
-            if isinstance(raw_validator_libraries, dict)
-            else {}
+            raw_validator_libraries if isinstance(raw_validator_libraries, dict) else {}
         )
         documentation_ok = bool(
             isinstance(documentation, dict)
@@ -138,17 +116,15 @@ class Agent4CandidateVerifier:
             and isinstance(role_contexts, dict)
             and set(generator_libraries) == {"jngen_context"}
             and set(validator_libraries) == {"testlib_context"}
-            and all(
-                isinstance(library, dict)
-                and set(library) == {"doc", "example"}
-                and _recursive_context_value(library)
-                and _context_has_text(library["doc"])
-                and _context_has_text(library["example"])
-                for library in (
-                    generator_libraries.get("jngen_context"),
-                    validator_libraries.get("testlib_context"),
-                )
-            )
+            and isinstance(generator_libraries.get("jngen_context"), dict)
+            and set(generator_libraries["jngen_context"]) == {"reference"}
+            and _recursive_context_value(generator_libraries["jngen_context"])
+            and _context_has_text(generator_libraries["jngen_context"]["reference"])
+            and isinstance(validator_libraries.get("testlib_context"), dict)
+            and set(validator_libraries["testlib_context"]) == {"doc", "example"}
+            and _recursive_context_value(validator_libraries["testlib_context"])
+            and _context_has_text(validator_libraries["testlib_context"]["doc"])
+            and _context_has_text(validator_libraries["testlib_context"]["example"])
             and bool(documents)
             and len(filenames) == documentation.get("document_count")
             and len(filenames) == len(set(filenames))
@@ -181,8 +157,7 @@ class Agent4CandidateVerifier:
             else None
         )
         format_contract_ok = bool(
-            expected_format_contract_id
-            and model.format_contract_id == expected_format_contract_id
+            expected_format_contract_id and model.format_contract_id == expected_format_contract_id
         )
         checks: list[dict[str, Any]] = [
             {
@@ -200,7 +175,7 @@ class Agent4CandidateVerifier:
                 else None,
                 "document_count": len(filenames),
                 "role_contexts_valid": bool(role_contexts),
-            }
+            },
         ]
         fully_evaluated_operations.add("input_format_contract")
         if not format_contract_ok:
@@ -242,9 +217,7 @@ class Agent4CandidateVerifier:
                     ],
                 },
             )
-        checks.append(
-            {"operation": "generator_library_usage", "ok": True, "level": "static"}
-        )
+        checks.append({"operation": "generator_library_usage", "ok": True, "level": "static"})
         input_format_contract = context.get("input_format_contract", {})
         sample_inputs = (
             input_format_contract.get("reference_sample_inputs", [])
@@ -294,13 +267,24 @@ class Agent4CandidateVerifier:
                 self._failed("；".join(parameter_issues), checks, "generation_plan"),
             )
         checks.append({"operation": "runtime_parameters", "ok": True, "level": "static"})
-        required_parameters = {
+        required_parameters = {"generation_profile"} | {
             parameter.name
             for subtask in plan.subtasks
             for profile in subtask.runtime_parameters
             for parameter in profile.parameters
         }
-        usage_issues = generator_usage_issues(model.generator_code, required_parameters)
+        construction_modes = {
+            str(parameter.value)
+            for subtask in plan.subtasks
+            for runtime in subtask.runtime_parameters
+            for parameter in runtime.parameters
+            if parameter.name == "construction_mode"
+        }
+        usage_issues = generator_usage_issues(
+            model.generator_code,
+            required_parameters,
+            require_constructive_output=bool(construction_modes.difference({"fixed"})),
+        )
         fully_evaluated_operations.add("generator_runtime_parameters")
         if usage_issues:
             return finish(
@@ -320,32 +304,10 @@ class Agent4CandidateVerifier:
                     ],
                 },
             )
-        checks.append(
-            {"operation": "generator_runtime_parameters", "ok": True, "level": "static"}
-        )
+        checks.append({"operation": "generator_runtime_parameters", "ok": True, "level": "static"})
         roles = ("solution", "generator", "validator")
-        compile_started = perf_counter()
-        try:
-            compiled_results = await asyncio.gather(
-                *(self.sandbox.compile(workspace_id, role) for role in roles)
-            )
-        except Exception:
-            self._append_timing(
-                project_id,
-                context,
-                "compile",
-                compile_started,
-                status="error",
-                metadata={"roles": list(roles)},
-            )
-            raise
-        self._append_timing(
-            project_id,
-            context,
-            "compile",
-            compile_started,
-            status="ok" if all(result.ok for result in compiled_results) else "failed",
-            metadata={"roles": list(roles)},
+        compiled_results = await asyncio.gather(
+            *(self.sandbox.compile(workspace_id, role) for role in roles)
         )
         fully_evaluated_operations.add("compile")
         for role, result in zip(roles, compiled_results, strict=True):
@@ -370,9 +332,23 @@ class Agent4CandidateVerifier:
 
         generation_jobs: list[GenerationJob] = []
         job_details: dict[str, tuple[int, int, int, str]] = {}
+        non_fixed_cases: set[tuple[int, int]] = set()
         for subtask in plan.subtasks:
             for profile in subtask.runtime_parameters:
-                for seed_offset in range(self.settings.agent_trial_seeds_per_subtask):
+                construction_mode = next(
+                    (
+                        str(parameter.value)
+                        for parameter in profile.parameters
+                        if parameter.name == "construction_mode"
+                    ),
+                    "fixed",
+                )
+                if construction_mode != "fixed":
+                    non_fixed_cases.add((subtask.id, profile.case_id))
+                trial_count = self.settings.agent_trial_seeds_per_subtask
+                if construction_mode != "fixed":
+                    trial_count = max(2, trial_count)
+                for seed_offset in range(trial_count):
                     seed = subtask.id * 1_000_003 + profile.case_id * 101 + seed_offset
                     preview_id = uuid4().hex[:12]
                     input_relative = f"preview/{preview_id}.in"
@@ -393,38 +369,6 @@ class Agent4CandidateVerifier:
                         output_relative,
                     )
 
-        jobs_by_signature = {self._job_signature(job): job for job in generation_jobs}
-        replay_ids_by_input: dict[str, set[str]] = {}
-        for counterexample in replayable_counterexamples:
-            signature = self._replay_signature(counterexample)
-            if signature is None:  # Kept explicit for type narrowing.
-                continue
-            subtask_id, case_id, seed, runtime_arguments_json = signature
-            runtime_arguments = json.loads(runtime_arguments_json)
-            job = jobs_by_signature.get(signature)
-            if job is None:
-                preview_id = uuid4().hex[:12]
-                input_relative = f"preview/{preview_id}.in"
-                output_relative = f"preview/{preview_id}.out"
-                job = GenerationJob(
-                    subtask_id,
-                    seed,
-                    input_relative,
-                    case_id=case_id,
-                    runtime_arguments=runtime_arguments,
-                )
-                generation_jobs.append(job)
-                job_details[input_relative] = (
-                    subtask_id,
-                    case_id,
-                    seed,
-                    output_relative,
-                )
-                jobs_by_signature[signature] = job
-            replay_ids_by_input.setdefault(job.output_relative, set()).add(
-                counterexample.counterexample_id
-            )
-
         smoke_paths: set[str] = set()
         for subtask in plan.subtasks:
             first = next(job for job in generation_jobs if job.subtask_id == subtask.id)
@@ -436,6 +380,7 @@ class Agent4CandidateVerifier:
                 [job for job in generation_jobs if job.output_relative not in smoke_paths],
             ),
         )
+        trial_contents: dict[tuple[int, int], list[str]] = {}
         for level, jobs in phases:
             if not jobs:
                 continue
@@ -447,8 +392,7 @@ class Agent4CandidateVerifier:
                 checks,
                 level,
                 context,
-                replay_ids_by_input,
-                completed_replay_ids,
+                trial_contents,
             )
             if failure is not None:
                 message, category = failure
@@ -457,9 +401,34 @@ class Agent4CandidateVerifier:
                     self._failed(message, checks, category, level),
                 )
 
-        verified = model.model_copy(update={"trial_results": checks})
+        for subtask_id, case_id in sorted(non_fixed_cases):
+            contents = trial_contents.get((subtask_id, case_id), [])
+            if len(contents) >= 2 and len(set(contents)) > 1:
+                continue
+            checks.append(
+                {
+                    "operation": "construction_diversity",
+                    "role": "generator",
+                    "target_file": "generator.cpp",
+                    "ok": False,
+                    "subtask_id": subtask_id,
+                    "case_id": case_id,
+                    "observed_distinct_outputs": len(set(contents)),
+                }
+            )
+            return finish(
+                model.model_dump(mode="json", exclude={"issues"}),
+                self._failed(
+                    f"子任务 {subtask_id} 测试点 {case_id} 使用非 fixed 构造模式，"
+                    "但不同 seed 生成了完全相同的输入。",
+                    checks,
+                    "generation",
+                    "complete",
+                ),
+            )
+
         return finish(
-            verified.model_dump(mode="json", exclude={"issues"}),
+            model.model_dump(mode="json", exclude={"issues"}),
             {
                 "ok": True,
                 "failure_category": None,
@@ -478,38 +447,13 @@ class Agent4CandidateVerifier:
         checks: list[dict[str, Any]],
         level: str,
         context: dict[str, Any],
-        replay_ids_by_input: dict[str, set[str]],
-        completed_replay_ids: set[str],
+        trial_contents: dict[tuple[int, int], list[str]],
     ) -> tuple[str, str] | None:
-        generation_started = perf_counter()
-        try:
-            generated_batches = await asyncio.gather(
-                *(
-                    self.sandbox.generate_batch(workspace_id, chunk)
-                    for chunk in self._chunks(generation_jobs)
-                )
+        generated_batches = await asyncio.gather(
+            *(
+                self.sandbox.generate_batch(workspace_id, chunk)
+                for chunk in self._chunks(generation_jobs)
             )
-        except Exception:
-            self._append_timing(
-                project_id,
-                context,
-                "trial_generation",
-                generation_started,
-                status="error",
-                metadata={"level": level, "jobs": len(generation_jobs)},
-            )
-            raise
-        self._append_timing(
-            project_id,
-            context,
-            "trial_generation",
-            generation_started,
-            status=(
-                "ok"
-                if all(outcome.result.ok for batch in generated_batches for outcome in batch)
-                else "failed"
-            ),
-            metadata={"level": level, "jobs": len(generation_jobs)},
         )
         generated_outcomes = {
             outcome.output_relative: outcome for batch in generated_batches for outcome in batch
@@ -518,6 +462,8 @@ class Agent4CandidateVerifier:
         for job in generation_jobs:
             subtask_id, case_id, seed, output_relative = job_details[job.output_relative]
             generated = generated_outcomes[job.output_relative].result
+            content = self._preview_content(workspace_id, job.output_relative)
+            trial_contents.setdefault((subtask_id, case_id), []).append(content)
             checks.append(
                 {
                     "operation": "generate",
@@ -527,7 +473,7 @@ class Agent4CandidateVerifier:
                     "seed": seed,
                     "runtime_arguments": job.runtime_arguments,
                     "result": generated.model_dump(mode="json"),
-                    "content": self._preview_content(workspace_id, job.output_relative),
+                    "content": content,
                 }
             )
             if not generated.ok:
@@ -535,39 +481,11 @@ class Agent4CandidateVerifier:
                 return f"子任务 {subtask_id} 测试点 {case_id} 试生成失败。", category
             validation_jobs.append(ValidationJob(job.output_relative, output_relative))
 
-        validation_started = perf_counter()
-        try:
-            validated_batches = await asyncio.gather(
-                *(
-                    self.sandbox.validate_solve_batch(workspace_id, chunk)
-                    for chunk in self._chunks(validation_jobs)
-                )
+        validated_batches = await asyncio.gather(
+            *(
+                self.sandbox.validate_solve_batch(workspace_id, chunk)
+                for chunk in self._chunks(validation_jobs)
             )
-        except Exception:
-            self._append_timing(
-                project_id,
-                context,
-                "validation",
-                validation_started,
-                status="error",
-                metadata={"level": level, "jobs": len(validation_jobs)},
-            )
-            raise
-        self._append_timing(
-            project_id,
-            context,
-            "validation",
-            validation_started,
-            status=(
-                "ok"
-                if all(
-                    outcome.validation.ok and outcome.solution is not None and outcome.solution.ok
-                    for batch in validated_batches
-                    for outcome in batch
-                )
-                else "failed"
-            ),
-            metadata={"level": level, "jobs": len(validation_jobs)},
         )
         validated_outcomes = {
             outcome.input_relative: outcome for batch in validated_batches for outcome in batch
@@ -609,48 +527,7 @@ class Agent4CandidateVerifier:
             if not outcome.solution.ok:
                 category = "timeout" if outcome.solution.timed_out else "solution"
                 return f"标程无法处理子任务 {subtask_id} 测试点 {case_id}。", category
-            completed_replay_ids.update(replay_ids_by_input.get(job.input_relative, set()))
         return None
-
-    @staticmethod
-    def _job_signature(job: GenerationJob) -> tuple[int, int, int, str]:
-        return (
-            job.subtask_id,
-            job.case_id,
-            job.seed,
-            json.dumps(
-                job.runtime_arguments,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-        )
-
-    @staticmethod
-    def _replay_signature(
-        counterexample: Counterexample,
-    ) -> tuple[int, int, int, str] | None:
-        reproduction = counterexample.reproduction
-        subtask_id = reproduction.get("subtask_id")
-        case_id = reproduction.get("case_id")
-        seed = reproduction.get("seed")
-        runtime_arguments = reproduction.get("runtime_arguments")
-        if not all(isinstance(value, int) for value in (subtask_id, case_id, seed)):
-            return None
-        if not isinstance(runtime_arguments, dict):
-            return None
-        serialized = {str(key): str(value) for key, value in runtime_arguments.items()}
-        return (
-            subtask_id,
-            case_id,
-            seed,
-            json.dumps(
-                serialized,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-        )
 
     def _failed(
         self,
@@ -689,28 +566,3 @@ class Agent4CandidateVerifier:
         head = content[: limit // 2]
         tail = content[-(limit // 2) :]
         return f"{head}\n...<truncated {len(content) - limit} chars>...\n{tail}"
-
-    def _append_timing(
-        self,
-        project_id: str,
-        context: dict[str, Any],
-        segment: str,
-        started: float,
-        *,
-        status: str,
-        metadata: dict[str, Any],
-    ) -> None:
-        timing = context.get("_agent4_timing")
-        if not isinstance(timing, dict) or not isinstance(timing.get("run_id"), str):
-            return
-        entry: dict[str, Any] = {
-            "run_id": timing["run_id"],
-            "segment": segment,
-            "duration_ms": round((perf_counter() - started) * 1000, 3),
-            "status": status,
-            "metadata": metadata,
-        }
-        round_index = timing.get("round")
-        if isinstance(round_index, int):
-            entry["round"] = round_index
-        self.storage.append_agent4_timing(project_id, entry)

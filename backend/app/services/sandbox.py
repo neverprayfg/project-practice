@@ -263,6 +263,13 @@ class DockerSandbox:
                 volumes={self.settings.storage_volume: {"bind": "/workspace", "mode": "rw"}},
                 tmpfs={"/tmp": "rw,noexec,nosuid,size=64m"},
                 mem_limit=self.settings.runner_memory,
+                ulimits=[
+                    docker.types.Ulimit(
+                        name="stack",
+                        soft=self.settings.runner_stack_soft_bytes,
+                        hard=-1,
+                    )
+                ],
                 nano_cpus=self.settings.runner_nano_cpus,
                 pids_limit=128,
                 cap_drop=["ALL"],

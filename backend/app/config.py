@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     runner_compile_image: str = "contest-dataset-runner-compiler:0.3.0"
     runner_execute_image: str = "contest-dataset-runner-executor:0.3.0"
     runner_memory: str = "512m"
+    runner_stack_soft_bytes: int = 256 * 1024 * 1024
     runner_nano_cpus: int = 1_000_000_000
     runner_timeout_seconds: int = 30
     runner_concurrency: int = Field(default=2, ge=1, le=8)

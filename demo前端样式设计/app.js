@@ -1,7 +1,7 @@
 const STAGES = [
   "创建项目",
   "编译标程",
-  "确认输入结构",
+  "测试数据方案",
   "规划子任务",
   "编写代码草稿",
   "批量生成数据",
@@ -10,6 +10,11 @@ const STAGES = [
 ];
 
 const COMPLEXITIES = ["O(1)", "O(log n)", "O(n)", "O(n log n)", "O(n²)", "O(n³)"];
+const GENERATION_CATEGORIES = {
+  rules_format: "合规性构建",
+  anti_algorithm: "算法过滤与压测",
+  boundary_edge: "边界与鲁棒性",
+};
 const API_BASE = ["3000", "5173", "5500"].includes(window.location.port)
   ? "http://localhost:8000"
   : "";
@@ -30,15 +35,18 @@ const state = {
   apiMode: "",
   modelConfig: null,
   modelSettingsBusy: false,
-  busy: false,
-  busyLabel: "",
+  projectTasks: new Map(),
+  projectActiveTask: false,
+  pendingProjectCreations: 0,
   error: null,
   compileResult: null,
   preview: null,
   previewHistory: [],
   buildResult: null,
+  autoRunResult: null,
   expandedSubtasks: new Set([0]),
   dirtyStages: new Set(),
+  stageInteractions: { "3": null, "4": null, "5": null },
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -60,7 +68,7 @@ function cloneJson(value) {
 function draftContent(stage, draft) {
   if (stage === 3) {
     return {
-      template: String(draft?.template || "").trim(),
+      plan_markdown: String(draft?.plan_markdown || "").trim(),
     };
   }
   if (stage === 4) {
@@ -69,9 +77,12 @@ function draftContent(stage, draft) {
         id: Number(subtask.id),
         test_count: Number(subtask.test_count || 0),
         expected_complexity: String(subtask.expected_complexity || "").trim(),
-        special_cases: Array.isArray(subtask.special_cases) ? subtask.special_cases.map((item) => ({
+        generation_profiles: Array.isArray(subtask.generation_profiles) ? subtask.generation_profiles.map((item) => ({
+          id: String(item.id || "").trim(),
+          category: String(item.category || "").trim(),
           count: Number(item.count || 0),
-          description: String(item.description || "").trim(),
+          goal: String(item.goal || "").trim(),
+          parameter_names: Array.isArray(item.parameter_names) ? item.parameter_names.map((name) => String(name).trim()) : [],
         })) : [],
         runtime_parameters: Array.isArray(subtask.runtime_parameters)
           ? cloneJson(subtask.runtime_parameters)
@@ -138,8 +149,8 @@ function errorMessage(error) {
     PROJECT_BUSY: "项目正在执行另一项任务，请稍后重试。",
     COMPILE_FAILED: "代码编译失败，请查看日志并修改代码。",
     INVALID_DRAFT: "草稿格式校验未通过，请查看下方错误详情。",
-    INCOMPLETE_AI_DRAFT: "AI 未生成输入结构模板，当前没有可供修改的完整草稿。",
-    INVALID_SUBTASK_RANGES: "子任务的数据范围字段与已确认的输入结构不一致。",
+    INCOMPLETE_AI_DRAFT: "AI 未生成测试数据生成方案，当前没有可供修改的完整草稿。",
+    INVALID_SUBTASK_RANGES: "子任务的数据范围字段与已确认的测试数据生成方案不一致。",
     INVALID_SUBTASK: "所选子任务不存在，请刷新项目后重新选择。",
     CONFIRMATION_REQUIRED: "需要先通过 AI 检查，才能由用户确认。",
     CONFIRMATION_PENDING: "当前候选正在等待确认；请先确认或保存修改后重新运行。",
@@ -157,10 +168,6 @@ function errorMessage(error) {
     JNGEN_DOCUMENT_SELECTION_INCOMPLETE: "文档检索未明确结束，请重新运行 Agent4。",
     JNGEN_DOCUMENT_SELECTION_INVALID: "文档选择包含无效或重复文件，请重新运行 Agent4。",
     JNGEN_DOCUMENT_CONTEXT_TOO_LARGE: "所选文档过多，请重新运行 Agent4 进行更精简的选择。",
-    STRUCTURE_TAG_REVIEW_REQUIRED: "阶段 3 结构标签尚未确认或存在冲突，请返回复核。",
-    STRUCTURE_TAG_DOCUMENT_BUDGET_EXCEEDED: "标签所需 jngen 文档超过上下文预算，请复核标签或调整预算。",
-    INVALID_STRUCTURE_TAGS: "阶段 3 结构标签不在目录中、不受支持或存在冲突。",
-    INVALID_SUBTASK_TAGS: "子任务结构细化标签无效或与已确认标签冲突。",
     STALE_STAGE: "该阶段已不是当前活动阶段，请刷新项目状态。",
     INVALID_REQUEST: "配置内容不符合要求，请检查必填项和字段格式。",
   };
@@ -169,7 +176,7 @@ function errorMessage(error) {
 
 function displayedError() {
   if (state.error) return state.error;
-  if (state.busy) return null;
+  if (currentProjectBusy()) return null;
   const lastError = state.project?.last_error;
   if (!lastError || Number(lastError.stage) !== state.activeStage) return null;
   return { message: lastError.message, payload: lastError };
@@ -180,36 +187,59 @@ function validationEntries(error = displayedError()) {
   const details = Array.isArray(raw) ? raw : Array.isArray(raw?.validation_errors) ? raw.validation_errors : [];
   return details.map((detail) => {
     const loc = (detail.loc || []).filter((part) => !["body", "draft"].includes(String(part)));
-    const label = loc[0] === "template"
-      ? "输入结构模板"
+    const label = loc[0] === "plan_markdown"
+      ? "测试数据生成方案"
       : loc.length ? loc.join(" → ") : "草稿";
     let message = detail.msg || "内容不符合要求";
-    if (loc[0] === "template" && detail.type === "missing") message = "AI 返回结果中缺少输入结构模板。";
+    if (loc[0] === "plan_markdown" && detail.type === "missing") message = "AI 返回结果中缺少测试数据生成方案。";
     else if (detail.type === "missing") message = "此项为必填项。";
     else if (["string_too_short", "too_short"].includes(detail.type)) message = "内容为空或数量不足。";
     return { loc, label, message };
   });
 }
 
+function projectBusy(projectId = state.projectId) {
+  if (!projectId) return false;
+  return state.projectTasks.has(projectId)
+    || (projectId === state.projectId && state.projectActiveTask);
+}
+
+function currentProjectBusy() {
+  return projectBusy(state.projectId);
+}
+
+function currentBusyLabel(fallback = "处理中") {
+  return state.projectTasks.get(state.projectId) || fallback;
+}
+
 async function runMutation(label, operation, successMessage = "操作完成") {
-  if (state.busy) return;
-  state.busy = true;
-  state.busyLabel = label;
+  const projectId = state.projectId;
+  if (!projectId || projectBusy(projectId)) return;
+  state.projectTasks.set(projectId, label);
+  state.projectActiveTask = true;
   state.error = null;
   render();
   try {
-    await operation();
-    showToast(successMessage);
+    await operation(projectId);
+    if (state.projectId === projectId) showToast(successMessage);
+    else showToast(`项目「${projectDisplayNameById(projectId)}」任务已完成`);
   } catch (error) {
-    state.error = error;
-    showToast(errorMessage(error), "error");
-    if (state.projectId) await refreshProject({ silent: true, keepError: true });
-    const recovery = Number(error?.payload?.details?.recovery_stage || error?.payload?.stage);
-    if ([4, 5, 7].includes(recovery)) state.activeStage = recovery;
+    if (state.projectId === projectId) {
+      state.error = error;
+      showToast(errorMessage(error), "error");
+      await refreshProject({ silent: true, keepError: true, projectId });
+      const recovery = Number(error?.payload?.details?.recovery_stage || error?.payload?.stage);
+      if ([4, 5, 7].includes(recovery)) state.activeStage = recovery;
+    } else {
+      showToast(`项目「${projectDisplayNameById(projectId)}」任务失败：${errorMessage(error)}`, "error");
+    }
   } finally {
-    state.busy = false;
-    state.busyLabel = "";
-    render();
+    state.projectTasks.delete(projectId);
+    if (state.projectId === projectId) {
+      state.projectActiveTask = false;
+      render();
+    }
+    await loadProjectHistory({ silent: true });
   }
 }
 
@@ -219,12 +249,19 @@ function projectName() {
 }
 
 function projectDisplayName(project, maxLength = 48) {
+  const savedName = String(project?.project_name || project?.title || "").trim();
+  if (savedName) return savedName.length > maxLength ? `${savedName.slice(0, maxLength)}…` : savedName;
   const firstLine = String(project?.problem_description || "")
     .split("\n")
     .map((line) => line.replace(/^#+\s*/, "").trim())
     .find(Boolean);
   if (!firstLine) return `项目 ${String(project?.project_id || "").slice(0, 8)}`;
   return firstLine.length > maxLength ? `${firstLine.slice(0, maxLength)}…` : firstLine;
+}
+
+function projectDisplayNameById(projectId) {
+  const project = state.projects.find((item) => item.project_id === projectId);
+  return projectDisplayName(project || { project_id: projectId }, 24);
 }
 
 function projectStageLabel(project) {
@@ -316,16 +353,17 @@ function renderProjectHistory() {
   list.innerHTML = state.projects.map((project) => {
     const current = project.project_id === state.projectId;
     const deleting = state.deletingProjectId === project.project_id;
+    const running = Boolean(project.active_task) || state.projectTasks.has(project.project_id);
     return `<article class="project-history-row${current ? " current" : ""}">
       <button class="project-history-main" type="button" data-open-project="${project.project_id}" title="打开 ${escapeHtml(projectDisplayName(project))}" ${current ? 'aria-current="true"' : ""} ${deleting ? "disabled" : ""}>
-        <span class="project-history-icon">${icon(project.export_ready ? "badge-check" : "folder")}</span>
+        <span class="project-history-icon">${icon(running ? "loader-circle" : project.export_ready ? "badge-check" : "folder", running ? "spinner" : "")}</span>
         <span class="project-history-copy">
           <span class="project-history-title"><span class="project-history-name">${escapeHtml(projectDisplayName(project))}</span>${current ? '<span class="current-project-label">当前</span>' : ""}</span>
-          <span class="project-history-meta"><span>${escapeHtml(projectStageLabel(project))}</span><span>更新于 ${escapeHtml(formatProjectTime(project.updated_at))}</span><span>${escapeHtml(project.difficulty)}</span></span>
+          <span class="project-history-meta"><span>${running ? "任务运行中 · " : ""}${escapeHtml(projectStageLabel(project))}</span><span>更新于 ${escapeHtml(formatProjectTime(project.updated_at))}</span><span>${escapeHtml(project.difficulty)}</span></span>
         </span>
         ${icon("chevron-right", "project-history-chevron")}
       </button>
-      <button class="icon-button project-delete-button" type="button" data-delete-project="${project.project_id}" title="删除项目" aria-label="删除 ${escapeHtml(projectDisplayName(project))}" ${deleting ? "disabled" : ""}>${deleting ? icon("loader-circle", "spinner") : icon("trash-2")}</button>
+      <button class="icon-button project-delete-button" type="button" data-delete-project="${project.project_id}" title="${running ? "项目任务运行中，暂不能删除" : "删除项目"}" aria-label="删除 ${escapeHtml(projectDisplayName(project))}" ${deleting || running ? "disabled" : ""}>${deleting ? icon("loader-circle", "spinner") : icon("trash-2")}</button>
     </article>`;
   }).join("");
   hydrateIcons();
@@ -337,15 +375,15 @@ function errorNotice() {
   const detail = error?.payload?.details;
   const detailText = typeof detail === "string" ? detail : detail?.stderr || "";
   const entries = validationEntries(error);
-  const missingTemplate = entries.some((entry) => entry.loc[0] === "template");
-  return `<div class="notice error"><span>${icon("circle-alert")}<span><strong>${escapeHtml(errorMessage(error))}</strong>${detailText ? `<br><small>${escapeHtml(String(detailText).slice(0, 600))}</small>` : ""}${entries.length ? `<ul class="validation-error-list">${entries.map((entry) => `<li><strong>${escapeHtml(entry.label)}：</strong>${escapeHtml(entry.message)}</li>`).join("")}</ul>` : ""}${missingTemplate ? `<small class="error-recommendation">请重新运行 AI 分析；也可以先在输入结构文本框中补充内容，再交由 AI 检查。</small>` : ""}</span></span></div>`;
+  const missingPlan = entries.some((entry) => entry.loc[0] === "plan_markdown");
+  return `<div class="notice error"><span>${icon("circle-alert")}<span><strong>${escapeHtml(errorMessage(error))}</strong>${detailText ? `<br><small>${escapeHtml(String(detailText).slice(0, 600))}</small>` : ""}${entries.length ? `<ul class="validation-error-list">${entries.map((entry) => `<li><strong>${escapeHtml(entry.label)}：</strong>${escapeHtml(entry.message)}</li>`).join("")}</ul>` : ""}${missingPlan ? `<small class="error-recommendation">请重新运行 AI 分析；也可以先在测试数据方案文本框中补充内容，再交由 AI 检查。</small>` : ""}</span></span></div>`;
 }
 
 function applyValidationMarkers() {
   const entries = validationEntries();
   for (const entry of entries) {
-    if (entry.loc[0] !== "template") continue;
-    const control = $("#inputStructureTemplate");
+    if (entry.loc[0] !== "plan_markdown") continue;
+    const control = $("#testDataPlanMarkdown");
     control?.classList.add("invalid");
     control?.setAttribute("aria-invalid", "true");
     control?.setAttribute("title", entry.message);
@@ -359,6 +397,12 @@ function render() {
   $("#projectLabel").textContent = projectName();
   $("#stageLabel").textContent = `阶段 ${state.activeStage} · ${STAGES[state.activeStage - 1]}`;
   $("#pageTitle").textContent = pageTitle(state.activeStage);
+  const autoRunButton = $("#autoRunBtn");
+  autoRunButton.hidden = !state.project;
+  autoRunButton.disabled = currentProjectBusy() || !state.apiOnline;
+  autoRunButton.innerHTML = currentProjectBusy() && currentBusyLabel() === "全流程自动运行中"
+    ? busyButton("全流程自动运行中")
+    : `${icon("wand-sparkles")}<span>一键生成</span>`;
   const renderer = STAGE_RENDERERS[state.activeStage] || renderStage1;
   $("#stageContent").innerHTML = `${errorNotice()}${renderer()}`;
   bindStage(state.activeStage);
@@ -370,7 +414,7 @@ function pageTitle(stage) {
   return [
     "创建数据项目",
     "标程编译检查",
-    "输入结构确认",
+    "测试数据方案确认",
     "子任务与测试点规划",
     "生成器与校验器草稿",
     "批量生成输入数据",
@@ -380,15 +424,15 @@ function pageTitle(stage) {
 }
 
 function busyButton(label = "处理中") {
-  return `${icon("loader-circle", "spinner")}<span>${escapeHtml(state.busyLabel || label)}</span>`;
+  return `${icon("loader-circle", "spinner")}<span>${escapeHtml(currentBusyLabel(label))}</span>`;
 }
 
 function renderStage1() {
   if (state.project) {
     return `<div class="page-intro"><div><h2>项目输入</h2><p>项目已创建。题目描述与难度仅用于当前项目，其中难度不会发送给 AI。</p></div><span class="badge success">${icon("check")}已保存</span></div>
       <section class="work-surface"><div class="surface-body form-stack">
-        <label class="field"><span>题目描述</span><textarea class="text-area problem" disabled>${escapeHtml(state.project.problem_description)}</textarea></label>
-        <div class="form-grid"><label class="field"><span>难度等级</span><input class="text-input" value="${escapeHtml(state.project.difficulty)}" disabled></label><label class="field"><span>项目编号</span><input class="text-input" value="${escapeHtml(state.project.project_id)}" disabled></label></div>
+        <label class="field"><span>题目描述</span><textarea class="text-area problem" disabled>${escapeHtml(state.project.problem_description)}</textarea><div class="upload-actions"><button class="button button-secondary" data-copy-project-field="problem_description" data-copy-label="题目描述" type="button">${icon("copy")}复制题目描述</button></div></label>
+        <div class="form-grid"><label class="field"><span>难度等级</span><input class="text-input" value="${escapeHtml(state.project.difficulty)}" disabled></label><label class="field"><span>项目编号</span><input class="text-input" value="${escapeHtml(state.project.project_id)}" disabled><div class="upload-actions"><button class="button button-secondary" data-copy-project-field="project_id" data-copy-label="项目编号" type="button">${icon("copy")}复制项目编号</button></div></label></div>
       </div></section>
       <div class="action-bar"><span class="save-state">${icon("check-circle-2")}阶段 1 已完成</span><div class="form-actions"><button class="button button-primary" id="goCurrentBtn" type="button">前往当前阶段${icon("arrow-right")}</button></div></div>`;
   }
@@ -399,7 +443,7 @@ function renderStage1() {
       <label class="field"><span class="required">C++ 标程代码</span><textarea id="solutionCode" class="code-editor" spellcheck="false" placeholder="#include <bits/stdc++.h>\nusing namespace std;\n\nint main() {\n  return 0;\n}"></textarea><div class="upload-actions"><input class="sr-only" id="solutionFile" type="file" accept=".cpp,.cc,.cxx,text/x-c++src"><button class="button button-secondary" data-upload="solutionFile" type="button">${icon("upload")}上传 .cpp 文件</button><span class="file-name" id="solutionFileName">代码将在 Docker 中编译</span></div></label>
       <label class="field"><span class="required">难度等级</span><select id="difficulty" class="select-input"><option value="">请选择</option><option>入门</option><option>普及-</option><option>普及/提高-</option><option>提高+/省选-</option><option>省选/NOI-</option><option>NOI/NOI+/CTSC</option></select><small>用于 Agent1 规范化输入和后续子任务规划。</small></label>
     </div></section>
-    <div class="action-bar"><span class="save-state">${icon("shield-check")}创建后将自动执行标程编译</span><div class="form-actions"><button class="button button-primary" id="createProjectBtn" type="button" ${state.busy ? "disabled" : ""}>${state.busy ? busyButton() : `${icon("play")}创建并编译`}</button></div></div>`;
+    <div class="action-bar"><span class="save-state">${icon("shield-check")}${state.pendingProjectCreations ? `${state.pendingProjectCreations} 个项目正在后台创建；可继续创建新项目` : "可仅创建并编译，也可自动运行至最终导出"}</span><div class="form-actions"><button class="button button-secondary" id="createProjectBtn" type="button">${icon("play")}创建并编译</button><button class="button button-primary" id="createAllBtn" type="button">${icon("wand-sparkles")}一键生成全部</button></div></div>`;
 }
 
 function renderStage2() {
@@ -409,10 +453,10 @@ function renderStage2() {
   const result = state.compileResult || failure?.details || null;
   const log = result ? [result.stdout, result.stderr].filter(Boolean).join("\n") || `进程退出码：${result.exit_code ?? "-"}` : "尚无编译日志。";
   return `<div class="page-intro"><div><h2>Docker 编译</h2><p>标程代码在受限容器中编译。修改代码后重新编译会使后续确认状态失效。</p></div><span class="badge ${compiled ? "success" : failure ? "error" : "warning"}">${icon(compiled ? "check-circle-2" : failure ? "circle-x" : "clock-3")}${compiled ? "编译通过" : failure ? "编译失败" : "等待编译"}</span></div>
-    ${compiled ? `<div class="notice"><span>${icon("check-circle-2")}标程已通过编译，可以继续分析输入结构。</span></div>` : ""}
+    ${compiled ? `<div class="notice"><span>${icon("check-circle-2")}标程已通过编译，可以继续设计测试数据方案。</span></div>` : ""}
     <section class="work-surface"><div class="section-heading"><div><h3>solution.cpp</h3><p>保存并重新编译后，阶段 3 至 5 需要重新确认</p></div></div><textarea id="solutionEditor" class="code-editor" spellcheck="false">${escapeHtml(state.solutionCode)}</textarea></section>
     <section class="work-surface" style="margin-top:16px"><div class="section-heading" style="padding:12px 16px"><div><h3>编译日志</h3></div><span class="badge ${compiled ? "success" : failure ? "error" : ""}">exit ${escapeHtml(result?.exit_code ?? "-")}</span></div><pre class="log-output">${escapeHtml(log)}</pre></section>
-    <div class="action-bar"><span class="save-state" data-solution-save-state>${state.dirtySolution ? `${icon("save")}标程已修改，保存后将重置后续阶段` : compiled ? `${icon("check-circle-2")}编译检查已通过` : `${icon("info")}修正所有编译错误后继续`}</span><div class="form-actions"><button class="button button-secondary" id="compileBtn" type="button" ${state.busy ? "disabled" : ""}>${state.busy ? busyButton("编译中") : `${icon("hammer")}${state.dirtySolution ? "保存并编译" : "重新编译"}`}</button><button class="button button-primary" id="nextStageBtn" type="button" ${compiled ? "" : "disabled"}>进入输入结构${icon("arrow-right")}</button></div></div>`;
+    <div class="action-bar"><span class="save-state" data-solution-save-state>${state.dirtySolution ? `${icon("save")}标程已修改，保存后将重置后续阶段` : compiled ? `${icon("check-circle-2")}编译检查已通过` : `${icon("info")}修正所有编译错误后继续`}</span><div class="form-actions"><button class="button button-secondary" id="compileBtn" type="button" ${currentProjectBusy() ? "disabled" : ""}>${currentProjectBusy() ? busyButton("编译中") : `${icon("hammer")}${state.dirtySolution ? "保存并编译" : "重新编译"}`}</button><button class="button button-primary" id="nextStageBtn" type="button" ${compiled ? "" : "disabled"}>进入测试数据方案${icon("arrow-right")}</button></div></div>`;
 }
 
 function confirmationBand(stage) {
@@ -425,6 +469,17 @@ function confirmationBand(stage) {
   return `<div class="confirmation-band" data-confirmation-band="${stage}"><span>${icon("info")}仅内容发生修改时需要重新进行 AI 检查；检查通过并经用户确认后进入下一阶段。</span><div class="confirmation-actions"><span class="status-chip ${aiConfirmed ? "success" : failed ? "error" : "pending"}">${icon(aiConfirmed ? "badge-check" : failed ? "circle-x" : checking ? "loader-circle" : "clock-3", checking ? "spinner" : "")}AI 检查：${aiConfirmed ? "已通过" : failed ? "未通过" : checking ? "检查中" : "待检查"}</span><span class="status-chip ${userConfirmed ? "success" : "pending"}">${icon(userConfirmed ? "badge-check" : "user-round-check")}用户确认：${userConfirmed ? "已确认" : "待确认"}</span></div></div>`;
 }
 
+function recoverySummary(stage) {
+  const summary = state.project?.recovery_summaries?.[String(stage)];
+  if (!summary) return "";
+  const status = summary.status === "passed" ? "已恢复并通过" : summary.status === "failed" ? "恢复已停止" : "正在恢复";
+  const tone = summary.status === "passed" ? "success" : summary.status === "failed" ? "error" : "info";
+  const detail = summary.last_error_summary
+    ? `<p>${escapeHtml(summary.last_error_summary)}</p>`
+    : "";
+  return `<div class="notice recovery-summary ${tone}"><span>${icon(summary.status === "passed" ? "badge-check" : summary.status === "failed" ? "circle-alert" : "loader-circle", summary.status === "running" ? "spinner" : "")}<span><strong>${escapeHtml(status)}：第 ${escapeHtml(summary.generation_round)} 轮生成，累计 ${escapeHtml(summary.repair_attempts)} 次修复</strong><br><small>恢复运行 ID：${escapeHtml(summary.run_id)}</small>${detail}</span></span></div>`;
+}
+
 function stageIssueValues(draft, stage) {
   const draftIssues = Array.isArray(draft?.issues) ? draft.issues : [];
   const stateIssues = state.project?.stages?.[String(stage)]?.issues || [];
@@ -433,7 +488,7 @@ function stageIssueValues(draft, stage) {
   const issueTranslations = {
     "draft does not match the stage schema": "草稿字段不完整或格式不正确。",
     "AI did not return any input fields": "AI 未生成任何输入字段。",
-    "AI did not return an input structure template": "AI 未生成输入结构模板。",
+    "AI did not return an input structure template": "AI 未生成测试数据生成方案。",
     "Candidate does not guarantee exactly one pair; corrected to use rejection sampling ensuring uniqueness.": "当前生成器不能保证答案对唯一，已改用拒绝采样确保唯一性。",
     "The validator uses readSpace() between array elements, which may reject valid inputs with multiple spaces or tabs. It should not assume exactly one space separator; readInt automatically skips whitespace. Consider removing readSpace calls or replacing with a single inf.readInts call.": "validator 在数组元素之间使用 readSpace()，会严格要求单个空格；若题目允许多个空格或制表符，应移除 readSpace() 或改用 inf.readInts 读取。",
   };
@@ -450,17 +505,43 @@ function stageIssues(draft, stage) {
   return `<div class="issues-box"><div class="column-title"><span>问题清单</span><span class="badge ${issues.length ? "warning" : "success"}">${issues.length ? `${issues.length} 个待处理问题` : "无待处理问题"}</span></div><label class="field"><textarea id="issuesInput" class="text-area" rows="3" aria-label="问题清单" readonly>${escapeHtml(issues.length ? issues.join("\n") : "无")}</textarea><small>问题清单由 AI 和确定性检查生成，不作为用户实质修改内容。</small></label></div>`;
 }
 
+function stageInstructionPanel(stage) {
+  const response = state.stageInteractions[String(stage)];
+  const active = Number(state.project?.current_stage) === stage;
+  const checking = state.project?.stages?.[String(stage)]?.status === "checking";
+  const disabled = currentProjectBusy() || checking || !active;
+  const responseLabel = response?.action === "revise" ? "已修改当前产物" : "AI 回答";
+  return `<section class="work-surface stage-instruction-panel">
+    <div class="section-heading"><div><h3>询问 AI 或提出修改意见</h3><p>每次仅处理当前输入，不保存历史提问；修改请求会重新检查当前阶段产物。</p></div>${response ? `<span class="badge ${response.action === "revise" ? "success" : "info"}">${escapeHtml(responseLabel)}</span>` : ""}</div>
+    <div class="stage-instruction-form"><textarea id="stageInstructionInput" class="text-area" rows="3" placeholder="例如：为什么需要这个测试点？或：请增加最大边界下的测试策略。" ${disabled ? "disabled" : ""}></textarea><button class="button button-secondary" id="stageInstructionBtn" type="button" ${disabled ? "disabled" : ""}>${currentProjectBusy() ? busyButton("AI 处理中") : `${icon("send")}发送给 AI`}</button></div>
+    ${response ? `<div class="stage-instruction-response"><strong>${escapeHtml(responseLabel)}</strong><p>${escapeHtml(response.answer)}</p></div>` : ""}
+    ${active ? "" : `<p class="helper-text">该阶段已结束；如需修改，请先通过流程操作回退到本阶段。</p>`}
+  </section>`;
+}
+
 function renderStage3() {
   if (!state.project || !canOpenStage(3)) return lockedEmpty(3);
   const draft = state.drafts["3"];
-  const template = draft?.template || "";
+  const planMarkdown = draft?.plan_markdown || "";
   const info = state.project.stages?.["3"] || {};
-  return `${confirmationBand(3)}<div class="page-intro"><div><h2>输入结构模板</h2><p>AI 综合题目描述与标程读取逻辑生成非结构化文本，统一变量名称并说明读取顺序、类型和依赖关系；用户可直接审核和修改。</p></div><span class="badge info">确认后保存为 Template</span></div>
-    <section class="work-surface"><div class="surface-body">
-      <label class="field"><span class="required">输入结构描述</span><textarea id="inputStructureTemplate" class="text-area structure-template" placeholder="运行 AI 分析后将在此生成输入结构模板；也可以先手动填写。">${escapeHtml(template)}</textarea><small>该文本确认后将作为阶段 4 的只读模板；需要修改时必须返回本阶段重新确认。</small></label>
-      ${stageIssues(draft, 3)}
-    </div></section>
-    ${interactiveActionBar(3, Boolean(template.trim()), info)}`;
+  const sections = [
+    ["constraints", "变量与合规约束", "sliders-horizontal"],
+    ["test-matrix", "核心测试点矩阵", "table-2"],
+    ["blueprint-for-generator", "生成器逻辑大纲", "workflow"],
+  ].map(([tag, title, sectionIcon]) => {
+    const content = extractPlanSection(planMarkdown, tag);
+    return `<article class="plan-section"><header><div><span class="plan-section-icon">${icon(sectionIcon)}</span><div><h3>${title}</h3><small>&lt;${tag}&gt;</small></div></div><button class="button button-secondary small" type="button" data-copy-plan-section="${tag}" ${content ? "" : "disabled"}>${icon("copy")}复制</button></header><pre>${escapeHtml(content || "运行 AI 检查后将在此显示。")}</pre></article>`;
+  }).join("");
+  return `${confirmationBand(3)}${recoverySummary(3)}<div class="page-intro"><div><h2>测试数据设计方案</h2><p>AI 基于题面和标程设计变量约束、测试点矩阵与生成器大纲。结果只读，可分区复制。</p></div><span class="badge info">确认后供后续阶段使用</span></div>
+    <div class="plan-section-grid">${sections}</div>
+    <section class="work-surface stage3-issues"><div class="surface-body">${stageIssues(draft, 3)}</div></section>
+    ${stageInstructionPanel(3)}
+    ${readonlyStageActionBar(3, Boolean(planMarkdown.trim()), info)}`;
+}
+
+function extractPlanSection(planMarkdown, tag) {
+  const matches = [...String(planMarkdown || "").matchAll(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, "g"))];
+  return matches.length === 1 ? matches[0][1].trim() : "";
 }
 
 function defaultSubtaskPlan() {
@@ -471,7 +552,16 @@ function defaultSubtaskPlan() {
 }
 
 function emptySubtask(id, source = null) {
-  const value = source ? cloneJson(source) : { test_count: 10, expected_complexity: "O(n)", special_cases: [], runtime_parameters: [] };
+  const value = source ? cloneJson(source) : {
+    test_count: 10,
+    expected_complexity: "O(n)",
+    generation_profiles: [
+      { id: "format_valid", category: "rules_format", count: 2, goal: "普通合法输入与严格格式", parameter_names: [] },
+      { id: "complexity_stress", category: "anti_algorithm", count: 5, goal: "满规模数据过滤错误复杂度", parameter_names: [] },
+      { id: "boundary_extreme", category: "boundary_edge", count: 3, goal: "最小、最大和极端边界", parameter_names: [] },
+    ],
+    runtime_parameters: [],
+  };
   return { ...value, id };
 }
 
@@ -488,22 +578,26 @@ function complexityControl(value, index) {
 
 function renderSubtask(subtask, index, totalSubtasks) {
   const expanded = state.expandedSubtasks.has(index);
-  const specialTotal = subtask.special_cases.reduce((sum, item) => sum + Number(item.count || 0), 0);
-  const normalCount = Number(subtask.test_count || 0) - specialTotal;
-  const specials = subtask.special_cases.map((item, specialIndex) => `<div class="special-row">
-      <input class="number-input" type="number" min="1" step="1" data-special-count="${specialIndex}" data-subtask="${index}" value="${escapeHtml(item.count)}" aria-label="特殊测试点数量">
-      <input class="text-input" data-special-description="${specialIndex}" data-subtask="${index}" value="${escapeHtml(item.description)}" placeholder="描述数值、关系、分布、结构或顺序特征" aria-label="特殊测试点描述">
-      <button class="icon-button small" data-remove-special="${specialIndex}" data-subtask="${index}" type="button" title="删除特殊测试点" aria-label="删除特殊测试点">${icon("trash-2")}</button>
+  const profileTotal = subtask.generation_profiles.reduce((sum, item) => sum + Number(item.count || 0), 0);
+  const remainingCount = Number(subtask.test_count || 0) - profileTotal;
+  const profiles = subtask.generation_profiles.map((item, profileIndex) => `<div class="profile-row">
+      <select class="select-input" data-profile-category="${profileIndex}" data-subtask="${index}" aria-label="生成目标分类">${Object.entries(GENERATION_CATEGORIES).map(([value, label]) => `<option value="${value}" ${item.category === value ? "selected" : ""}>${label}</option>`).join("")}</select>
+      <input class="text-input" data-profile-id="${profileIndex}" data-subtask="${index}" value="${escapeHtml(item.id)}" placeholder="profile_id" aria-label="生成策略 ID">
+      <input class="number-input" type="number" min="1" step="1" data-profile-count="${profileIndex}" data-subtask="${index}" value="${escapeHtml(item.count)}" aria-label="生成策略测试点数量">
+      <input class="text-input" data-profile-goal="${profileIndex}" data-subtask="${index}" value="${escapeHtml(item.goal)}" placeholder="说明要过滤的问题或覆盖的边界" aria-label="生成策略目标">
+      <input class="text-input" data-profile-parameters="${profileIndex}" data-subtask="${index}" value="${escapeHtml((item.parameter_names || []).join(", "))}" placeholder="关联参数名，逗号分隔" aria-label="生成策略参数名">
+      <button class="icon-button small" data-remove-profile="${profileIndex}" data-subtask="${index}" type="button" title="删除生成策略" aria-label="删除生成策略">${icon("trash-2")}</button>
     </div>`).join("");
 
   return `<article class="subtask-editor" data-subtask-editor="${index}">
     <header class="subtask-summary"><div class="subtask-title"><button class="icon-button small" data-toggle-subtask="${index}" type="button" title="${expanded ? "收起" : "展开"}" aria-label="${expanded ? "收起" : "展开"}生成计划">${icon(expanded ? "chevron-down" : "chevron-right")}</button><h3>子任务 ${subtask.id}</h3><span class="badge info">${escapeHtml(subtask.expected_complexity || "未设置")}</span></div><div class="subtask-tools"><span class="badge">${subtask.test_count} 个测试点</span><button class="icon-button small" data-remove-subtask="${index}" type="button" title="删除子任务" aria-label="删除子任务" ${totalSubtasks > 1 ? "" : "disabled"}>${icon("trash-2")}</button></div></header>
     <div class="subtask-body" ${expanded ? "" : "hidden"}>
-      <section class="subtask-column form-stack"><h4 class="column-title">数量与复杂度</h4><label class="field"><span class="required">测试点总数</span><input class="number-input" type="number" min="1" step="1" data-plan-key="test-count" data-subtask="${index}" value="${escapeHtml(subtask.test_count)}"></label><label class="field"><span class="required">期望通过的算法复杂度</span>${complexityControl(subtask.expected_complexity, index)}</label></section>
-      <section class="subtask-column"><h4 class="column-title"><span>非规模性特殊测试点</span><button class="link-button" data-add-special="${index}" type="button">${icon("plus")}添加一项</button></h4><div class="special-list">${specials || `<p class="helper-text">当前没有特殊测试点，全部测试点按普通规模生成。</p>`}</div></section>
-      <section class="subtask-column constraints-column"><h4 class="column-title"><span>逐测试点运行时参数</span><span class="badge">JSON</span></h4><textarea class="text-area constraint-editor" data-plan-key="runtime-parameters" data-subtask="${index}" placeholder='[{"case_id":1,"parameters":[{"name":"n_max","value":10,"category":"size"}]}]'>${escapeHtml(JSON.stringify(subtask.runtime_parameters || [], null, 2))}</textarea><p class="helper-text">case_id 必须覆盖 1..测试点总数；参数会作为白名单命令行选项传给 generator。</p></section>
+      <section class="subtask-column form-stack"><h4 class="column-title">数量与复杂度</h4><label class="field"><span class="required">测试点总数</span><input class="number-input" type="number" min="3" step="1" data-plan-key="test-count" data-subtask="${index}" value="${escapeHtml(subtask.test_count)}"><small>至少 3 个，以覆盖三类生成目标。</small></label><label class="field"><span class="required">期望通过的算法复杂度</span>${complexityControl(subtask.expected_complexity, index)}</label></section>
+      <section class="subtask-column"><h4 class="column-title">三类生成目标</h4><p class="helper-text">每个子任务必须覆盖合规性、算法过滤、边界鲁棒性三类目标。</p></section>
+      <section class="subtask-column constraints-column"><h4 class="column-title"><span>生成策略 Profiles</span><button class="link-button" data-add-profile="${index}" type="button">${icon("plus")}添加策略</button></h4><div class="profile-list">${profiles}</div></section>
+      <section class="subtask-column constraints-column"><h4 class="column-title"><span>逐测试点运行时参数</span><span class="badge">仅 runner 使用</span></h4><textarea class="text-area constraint-editor" data-plan-key="runtime-parameters" data-subtask="${index}" placeholder='[{"case_id":1,"generation_profile_id":"format_valid","parameters":[{"name":"n_max","value":10,"category":"size"}]}]'>${escapeHtml(JSON.stringify(subtask.runtime_parameters || [], null, 2))}</textarea><p class="helper-text">case_id 必须覆盖 1..测试点总数，并引用一个 profile ID；实际 JSON 不传给 Agent4。</p></section>
     </div>
-    <div class="count-summary" ${expanded ? "" : "hidden"}><div><span>特殊测试点</span><strong data-special-total>${specialTotal}</strong></div><div><span>测试点总数</span><strong data-test-total>${subtask.test_count}</strong></div><div class="${normalCount < 0 ? "invalid-count" : ""}" data-normal-box><span>普通规模测试点</span><strong data-normal-total>${normalCount}</strong></div></div>
+    <div class="count-summary" ${expanded ? "" : "hidden"}><div><span>Profile 已分配</span><strong data-profile-total>${profileTotal}</strong></div><div><span>测试点总数</span><strong data-test-total>${subtask.test_count}</strong></div><div class="${remainingCount !== 0 ? "invalid-count" : ""}" data-profile-remaining-box><span>待分配/超出</span><strong data-profile-remaining>${remainingCount}</strong></div></div>
   </article>`;
 }
 
@@ -512,12 +606,13 @@ function renderStage4() {
   if (!state.drafts["4"]) state.drafts["4"] = defaultSubtaskPlan();
   const draft = state.drafts["4"];
   const info = state.project.stages?.["4"] || {};
-  const template = state.drafts["3"]?.template || "";
-  return `${confirmationBand(4)}<div class="page-intro"><div><h2>模板与生成计划</h2><p>Agent3 初次只生成一个配置；用户可按需要复制或删除配置来调整子任务数量。</p></div></div>
+  const planMarkdown = state.drafts["3"]?.plan_markdown || "";
+  return `${confirmationBand(4)}${recoverySummary(4)}<div class="page-intro"><div><h2>测试方案与生成计划</h2><p>Agent3 从阶段 3 已确认方案中推导子任务数量并每次重新生成完整配置；用户仍可手动调整。</p></div></div>
     <div class="stage4-layout">
-      <aside class="template-reference"><div class="section-heading"><div><h3>输入结构 Template</h3><p>阶段 3 已确认版本</p></div><span class="badge success">只读</span></div><textarea class="template-view" readonly aria-label="已确认输入结构模板">${escapeHtml(template)}</textarea><p class="helper-text">如需修改，请返回阶段 3，重新运行 AI 检查并确认。</p></aside>
-      <section class="stage4-planner"><div class="section-heading"><div><h3>子任务生成配置</h3><p>AI 初次生成 1 个；后续数量由用户决定</p></div><div class="subtask-tools"><span class="badge">${draft.subtasks.length} 个子任务</span><button class="link-button" id="addSubtaskBtn" type="button">${icon("copy-plus")}复制配置</button></div></div><div class="subtask-list" id="subtaskList">${draft.subtasks.length ? draft.subtasks.map((subtask, index) => renderSubtask(subtask, index, draft.subtasks.length)).join("") : `<div class="planner-empty">${icon("list-plus")}<strong>等待 Agent3 规划</strong><span>运行 AI 检查会自动生成第一个配置，也可以手动添加。</span></div>`}</div><div class="planner-issues">${stageIssues(draft, 4)}</div></section>
+      <aside class="template-reference"><div class="section-heading"><div><h3>测试数据生成方案</h3><p>阶段 3 已确认版本</p></div><span class="badge success">只读</span></div><textarea class="template-view" readonly aria-label="已确认测试数据生成方案">${escapeHtml(planMarkdown)}</textarea><p class="helper-text">如需修改，请返回阶段 3，重新运行 AI 检查并确认。</p></aside>
+      <section class="stage4-planner"><div class="section-heading"><div><h3>子任务生成配置</h3><p>AI 根据阶段 3 方案推导任意数量的子任务</p></div><div class="subtask-tools"><span class="badge">${draft.subtasks.length} 个子任务</span><button class="link-button" id="addSubtaskBtn" type="button">${icon("copy-plus")}复制配置</button></div></div><div class="subtask-list" id="subtaskList">${draft.subtasks.length ? draft.subtasks.map((subtask, index) => renderSubtask(subtask, index, draft.subtasks.length)).join("") : `<div class="planner-empty">${icon("list-plus")}<strong>等待 Agent3 规划</strong><span>运行 AI 检查会根据已确认方案生成完整子任务集合。</span></div>`}</div><div class="planner-issues">${stageIssues(draft, 4)}</div></section>
     </div>
+    ${stageInstructionPanel(4)}
     ${interactiveActionBar(4, draft.subtasks.length > 0, info)}`;
 }
 
@@ -528,16 +623,17 @@ function renderStage5() {
   const hasBoth = Boolean(draft.generator_code && draft.validator_code);
   const preview = state.preview;
   const subtasks = state.drafts["4"]?.subtasks || [];
-  return `${confirmationBand(5)}<div class="page-intro"><div><h2>代码草稿</h2><p>Agent4 会按输入中的全部结构加载 jngen 专题文档，再生成 generator 与 validator；随后分级执行静态检查、冒烟测试和完整验证。</p></div><span class="badge ${hasBoth ? "info" : "warning"}">${hasBoth ? `revision ${escapeHtml(draft.revision_id || "draft")}` : "等待生成"}</span></div>
+  return `${confirmationBand(5)}${recoverySummary(5)}<div class="page-intro"><div><h2>代码模板</h2><p>Agent4 维护一份可覆盖的 generator 与 validator；失败时只替换归属文件并重跑全部检查，确认后冻结带哈希的发布快照。</p></div><span class="badge ${hasBoth ? "info" : "warning"}">${hasBoth ? `revision ${escapeHtml(draft.revision_id || "draft")}` : "等待生成"}</span></div>
     <div class="code-grid">
       <section class="work-surface code-pane"><div class="section-heading"><div><h3>generator.cpp</h3><p>testlib / jngen</p></div></div><textarea id="generatorCode" class="code-editor" spellcheck="false" placeholder="运行 AI 生成 generator.cpp">${escapeHtml(draft.generator_code)}</textarea></section>
       <section class="work-surface code-pane"><div class="section-heading"><div><h3>validator.cpp</h3><p>testlib strict validation</p></div></div><textarea id="validatorCode" class="code-editor" spellcheck="false" placeholder="运行 AI 生成 validator.cpp">${escapeHtml(draft.validator_code)}</textarea></section>
     </div>
     <div class="preview-layout">
-      <section class="work-surface preview-controls form-stack"><div><h3 style="margin:0;font-size:15px">种子试运行</h3><p class="helper-text">选择子任务和测试点；对应的数据与规模限制会通过命令行传给 generator。</p></div><label class="field"><span>子任务</span><select id="previewSubtask" class="select-input">${subtasks.map((item) => `<option value="${item.id}">子任务 ${item.id}</option>`).join("")}</select></label><label class="field"><span>测试点</span><input id="previewCase" class="number-input" type="number" min="1" step="1" value="${preview?.case_id ?? 1}"></label><label class="field"><span>种子</span><input id="previewSeed" class="number-input" type="number" step="1" value="${preview?.seed ?? 42}"></label><button class="button button-secondary" id="previewBtn" type="button" ${hasBoth && !state.busy ? "" : "disabled"}>${icon("play")}编译并试运行</button><ul class="preview-history">${state.previewHistory.map((item) => `<li><span>子任务 ${item.subtaskId} · 测试点 ${item.caseId} · seed ${item.seed}</span><strong>${item.ok ? "通过" : "失败"}</strong></li>`).join("")}</ul></section>
+      <section class="work-surface preview-controls form-stack"><div><h3 style="margin:0;font-size:15px">种子试运行</h3><p class="helper-text">选择子任务和测试点；对应的数据与规模限制会通过命令行传给 generator。</p></div><label class="field"><span>子任务</span><select id="previewSubtask" class="select-input">${subtasks.map((item) => `<option value="${item.id}">子任务 ${item.id}</option>`).join("")}</select></label><label class="field"><span>测试点</span><input id="previewCase" class="number-input" type="number" min="1" step="1" value="${preview?.case_id ?? 1}"></label><label class="field"><span>种子</span><input id="previewSeed" class="number-input" type="number" step="1" value="${preview?.seed ?? 42}"></label><button class="button button-secondary" id="previewBtn" type="button" ${hasBoth && !currentProjectBusy() ? "" : "disabled"}>${icon("play")}编译并试运行</button><ul class="preview-history">${state.previewHistory.map((item) => `<li><span>子任务 ${item.subtaskId} · 测试点 ${item.caseId} · seed ${item.seed}</span><strong>${item.ok ? "通过" : "失败"}</strong></li>`).join("")}</ul></section>
       <section class="work-surface preview-output"><div class="section-heading" style="margin-bottom:12px"><div><h3>输入数据预览</h3><p>${preview ? `seed ${escapeHtml(preview.seed)} · validator ${preview.validator?.ok ? "通过" : "未通过"}` : "尚未运行"}</p></div>${preview ? `<span class="badge ${preview.validator?.ok ? "success" : "error"}">${preview.validator?.ok ? "合法输入" : "校验失败"}</span>` : ""}</div><pre>${escapeHtml(preview?.content || "运行生成器后在此查看输入数据。")}</pre></section>
     </div>
     <section class="work-surface" style="margin-top:16px"><div class="surface-body">${stageIssues(draft, 5)}</div></section>
+    ${stageInstructionPanel(5)}
     ${interactiveActionBar(5, hasBoth, info)}`;
 }
 
@@ -554,7 +650,7 @@ function renderStage6() {
   return `<div class="page-intro"><div><h2>批量生成</h2><p>选择全部或部分子任务，在 Docker 容器中编译 generator 并批量生成输入数据。</p></div><span class="badge ${complete ? "success" : "info"}">${complete ? `${icon("check")}已生成` : `${icon("container")}受限容器`}</span></div>
     <section class="work-surface"><div class="section-heading" style="padding:12px 16px"><div><h3>生成范围</h3><p>每次执行会建立一个新批次，并替换上一批数据</p></div><label class="select-all"><input id="selectAllSubtasks" type="checkbox" checked>全选</label></div><div class="subtask-selection">${choices}</div></section>
     <section class="work-surface" style="margin-top:16px"><div class="surface-body form-grid"><label class="field"><span>基础种子</span><input id="baseSeed" class="number-input" type="number" step="1" value="1"><small>各测试点会结合子任务号与内部编号派生独立种子。</small></label><div class="field"><span>计划规模</span><div class="notice" style="margin:0;min-height:74px"><span>${icon("file-stack")}<strong>全部子任务共 ${total} 个输入文件</strong></span></div></div></div></section>
-    <div class="action-bar"><span class="save-state">${complete ? `${icon("check-circle-2")}已生成所选子任务，可进入独立验证` : `${icon("info")}本阶段只生成 .in，验证与 .out 在阶段 7 执行`}</span><div class="form-actions">${complete ? `<button class="button button-secondary" id="generateBtn" type="button" ${state.busy ? "disabled" : ""}>${icon("rotate-cw")}重新生成所选项</button><button class="button button-primary" id="nextStageBtn" type="button">进入验证${icon("arrow-right")}</button>` : `<button class="button button-primary" id="generateBtn" type="button" ${state.busy ? "disabled" : ""}>${state.busy ? busyButton("批量生成中") : `${icon("play")}生成所选子任务`}</button>`}</div></div>`;
+    <div class="action-bar"><span class="save-state">${complete ? `${icon("check-circle-2")}已生成所选子任务，可进入独立验证` : `${icon("info")}本阶段只生成 .in，验证与 .out 在阶段 7 执行`}</span><div class="form-actions">${complete ? `<button class="button button-secondary" id="generateBtn" type="button" ${currentProjectBusy() ? "disabled" : ""}>${icon("rotate-cw")}重新生成所选项</button><button class="button button-primary" id="nextStageBtn" type="button">进入验证${icon("arrow-right")}</button>` : `<button class="button button-primary" id="generateBtn" type="button" ${currentProjectBusy() ? "disabled" : ""}>${currentProjectBusy() ? busyButton("批量生成中") : `${icon("play")}生成所选子任务`}</button>`}</div></div>`;
 }
 
 function generatedFiles() {
@@ -577,7 +673,7 @@ function renderStage7() {
   return `<div class="page-intro"><div><h2>合法性与标准输出</h2><p>validator 逐个检查阶段 6 生成的输入，随后运行标程生成同名 .out；失败信息会反馈给 Agent4 修复。</p></div><span class="badge ${complete ? "success" : "info"}">${icon(complete ? "badge-check" : "shield-check")}${complete ? "全部通过" : "等待验证"}</span></div>
     ${failure ? `<div class="notice error"><span>${icon("circle-alert")}<span><strong>${escapeHtml(failure.message || "验证或标程运行失败")}</strong><br><small>恢复阶段：${escapeHtml(failure.details?.recovery_stage || failure.stage || "-")}</small></span></span></div>` : `<div class="notice"><span>${icon(complete ? "check-circle-2" : "info")}${complete ? "全部输入均通过 validator，标程已生成配对输出。" : "阶段 6 已完成；开始验证后将逐个处理当前批次。"}</span></div>`}
     <section class="work-surface"><div class="section-heading" style="padding:12px 16px"><div><h3>生成结果</h3><p>命名规则：子任务号_内部编号.in/out，编号均无前置零</p></div><span class="badge ${complete ? "success" : "warning"}">${complete ? `${files.length / 2} 对文件` : "未完成"}</span></div><div class="surface-body"><ul class="file-list">${files.slice(0, 30).map((file) => `<li>${icon(file.endsWith(".in") ? "file-input" : "file-output")}<span>${escapeHtml(file)}</span></li>`).join("")}</ul>${files.length > 30 ? `<p class="helper-text">另有 ${files.length - 30} 个文件未在预览中展开。</p>` : ""}</div></section>
-    <div class="action-bar"><span class="save-state">${complete ? `${icon("check-circle-2")}阶段 7 已完成` : `${icon("info")}本阶段不会重新生成输入数据`}</span><div class="form-actions">${complete ? `<button class="button button-primary" id="nextStageBtn" type="button">进入导出${icon("arrow-right")}</button>` : `<button class="button button-primary" id="validateBtn" type="button" ${state.busy ? "disabled" : ""}>${state.busy ? busyButton("验证中") : `${icon("shield-check")}验证并生成输出`}</button>`}</div></div>`;
+    <div class="action-bar"><span class="save-state">${complete ? `${icon("check-circle-2")}阶段 7 已完成` : `${icon("info")}本阶段不会重新生成输入数据`}</span><div class="form-actions">${complete ? `<button class="button button-primary" id="nextStageBtn" type="button">进入导出${icon("arrow-right")}</button>` : `<button class="button button-primary" id="validateBtn" type="button" ${currentProjectBusy() ? "disabled" : ""}>${currentProjectBusy() ? busyButton("验证中") : `${icon("shield-check")}验证并生成输出`}</button>`}</div></div>`;
 }
 
 function renderStage8() {
@@ -586,7 +682,7 @@ function renderStage8() {
   return `<div class="page-intro"><div><h2>最终数据包</h2><p>zip 只包含生成器、校验器和配对输入输出数据，不包含标程、报告或项目元数据。</p></div><span class="badge success">${icon("package-check")}可导出</span></div>
     <div class="notice"><span>${icon("check-circle-2")}数据包已就绪，共 ${files.length} 个文件。</span></div>
     <section class="work-surface"><div class="section-heading" style="padding:12px 16px"><div><h3>dataset.zip</h3><p>固定导出内容</p></div><span class="badge">${files.length} 个文件</span></div><div class="surface-body"><ul class="file-list">${files.slice(0, 32).map((file) => `<li>${icon(file.endsWith(".cpp") ? "file-code-2" : file.endsWith(".in") ? "file-input" : "file-output")}<span>${escapeHtml(file)}</span></li>`).join("")}</ul>${files.length > 32 ? `<p class="helper-text">另有 ${files.length - 32} 个数据文件包含在 zip 中。</p>` : ""}</div></section>
-    <div class="action-bar"><span class="save-state">${icon("shield-check")}导出内容已按固定规则检查</span><div class="form-actions"><button class="button button-primary" id="exportBtn" type="button" ${state.busy ? "disabled" : ""}>${state.busy ? busyButton("准备下载") : `${icon("download")}下载 dataset.zip`}</button></div></div>`;
+    <div class="action-bar"><span class="save-state">${icon("shield-check")}导出内容已按固定规则检查</span><div class="form-actions"><button class="button button-primary" id="exportBtn" type="button" ${currentProjectBusy() ? "disabled" : ""}>${currentProjectBusy() ? busyButton("准备下载") : `${icon("download")}下载 dataset.zip`}</button></div></div>`;
 }
 
 function lockedEmpty(stage) {
@@ -596,9 +692,23 @@ function lockedEmpty(stage) {
 function interactiveActionBar(stage, canSave, info) {
   const dirty = state.dirtyStages.has(stage);
   const checking = info.status === "checking" && !dirty;
-  const blocked = state.busy || checking;
+  const blocked = currentProjectBusy() || checking;
   const alreadyPassed = info.status === "passed" && !dirty;
   return `<div class="action-bar"><span class="save-state" data-draft-save-state>${alreadyPassed ? `${icon("check-circle-2")}AI 与用户已共同确认` : checking ? `${icon("loader-circle", "spinner")}AI 正在检查，完成后刷新状态` : dirty ? `${icon("save")}内容已修改，保存后将回退并锁定后续阶段` : `${icon("check-circle-2")}内容未修改，无需重新检查`}</span><div class="form-actions"><button class="button button-secondary" id="saveDraftBtn" type="button" ${canSave && dirty && !blocked ? "" : "disabled"}>${icon("save")}保存草稿</button><button class="button button-secondary" id="runAiBtn" type="button" ${blocked || alreadyPassed ? "disabled" : ""}>${blocked ? busyButton("AI 检查中") : `${icon("play")}运行 AI 检查`}</button><button class="button button-primary" id="confirmBtn" type="button" ${info.ai_confirmed && !info.user_confirmed && !dirty && !blocked ? "" : "disabled"}>确认并继续${icon("arrow-right")}</button></div></div>`;
+}
+
+function readonlyStageActionBar(stage, hasContent, info) {
+  const checking = info.status === "checking";
+  const blocked = currentProjectBusy() || checking;
+  const alreadyPassed = info.status === "passed";
+  const status = alreadyPassed
+    ? `${icon("check-circle-2")}AI 与用户已共同确认`
+    : checking
+      ? `${icon("loader-circle", "spinner")}AI 正在重新生成方案`
+      : hasContent
+        ? `${icon("refresh-cw")} 重新运行将覆盖当前只读方案`
+        : `${icon("info")}运行 AI 检查以生成方案`;
+  return `<div class="action-bar"><span class="save-state">${status}</span><div class="form-actions"><button class="button button-secondary" id="runAiBtn" type="button" ${blocked || alreadyPassed ? "disabled" : ""}>${blocked ? busyButton("AI 检查中") : `${icon("play")}${hasContent ? "重新生成" : "运行 AI 检查"}`}</button><button class="button button-primary" id="confirmBtn" type="button" ${info.ai_confirmed && !info.user_confirmed && !blocked ? "" : "disabled"}>确认并继续${icon("arrow-right")}</button></div></div>`;
 }
 
 const STAGE_RENDERERS = {
@@ -618,17 +728,6 @@ function readIssues() {
   return value.split("\n").map((item) => item.trim()).filter(Boolean);
 }
 
-function readStructureDraft() {
-  return {
-    template: $("#inputStructureTemplate")?.value.trim() || "",
-    issues: readIssues(),
-  };
-}
-
-function validateStructure(draft) {
-  if (!draft.template) throw new Error("输入结构模板不能为空，请先运行 AI 分析或手动填写。");
-}
-
 function readPlanDraft() {
   const current = state.drafts["4"] || defaultSubtaskPlan();
   const subtasks = current.subtasks.map((subtask, index) => {
@@ -637,11 +736,14 @@ function readPlanDraft() {
     const complexity = complexitySelect?.value === "other"
       ? $(`[data-plan-key="custom-complexity"][data-subtask="${index}"]`)?.value.trim()
       : complexitySelect?.value;
-    const specialCases = $$(`[data-special-count][data-subtask="${index}"]`).map((input) => {
-      const specialIndex = input.dataset.specialCount;
+    const generationProfiles = $$(`[data-profile-count][data-subtask="${index}"]`).map((input) => {
+      const profileIndex = input.dataset.profileCount;
       return {
+        id: $(`[data-profile-id="${profileIndex}"][data-subtask="${index}"]`)?.value.trim() || "",
+        category: $(`[data-profile-category="${profileIndex}"][data-subtask="${index}"]`)?.value || "",
         count: Number(input.value),
-        description: $(`[data-special-description="${specialIndex}"][data-subtask="${index}"]`)?.value.trim() || "",
+        goal: $(`[data-profile-goal="${profileIndex}"][data-subtask="${index}"]`)?.value.trim() || "",
+        parameter_names: ($(`[data-profile-parameters="${profileIndex}"][data-subtask="${index}"]`)?.value || "").split(",").map((name) => name.trim()).filter(Boolean),
       };
     });
     const runtimeText = $(`[data-plan-key="runtime-parameters"][data-subtask="${index}"]`)?.value.trim() || "[]";
@@ -651,7 +753,7 @@ function readPlanDraft() {
     } catch {
       throw new Error(`子任务 ${subtask.id} 的运行时参数不是合法 JSON。`);
     }
-    return { id: subtask.id, test_count: testCount, expected_complexity: complexity || "", special_cases: specialCases, runtime_parameters: runtimeParameters };
+    return { id: subtask.id, test_count: testCount, expected_complexity: complexity || "", generation_profiles: generationProfiles, runtime_parameters: runtimeParameters };
   });
   return { subtasks, issues: readIssues() };
 }
@@ -660,15 +762,30 @@ function validatePlan(draft) {
   if (!draft.subtasks.length) throw new Error("阶段四至少需要一个子任务配置。");
   for (const [index, subtask] of draft.subtasks.entries()) {
     if (Number(subtask.id) !== index + 1) throw new Error("子任务编号必须从 1 开始连续排列。");
-    if (!Number.isInteger(subtask.test_count) || subtask.test_count <= 0) throw new Error(`子任务 ${subtask.id} 的测试点总数必须为正整数。`);
+    if (!Number.isInteger(subtask.test_count) || subtask.test_count < 3) throw new Error(`子任务 ${subtask.id} 的测试点总数必须至少为 3。`);
     if (!subtask.expected_complexity) throw new Error(`子任务 ${subtask.id} 缺少期望复杂度。`);
     if (!Array.isArray(subtask.runtime_parameters) || subtask.runtime_parameters.length !== subtask.test_count) throw new Error(`子任务 ${subtask.id} 必须为每个测试点提供一组运行时参数。`);
-    let specialTotal = 0;
-    for (const item of subtask.special_cases) {
-      if (!Number.isInteger(item.count) || item.count <= 0 || !item.description) throw new Error(`子任务 ${subtask.id} 的特殊测试点需要填写正整数数量与完整描述。`);
-      specialTotal += item.count;
+    const categories = new Set();
+    const profileIds = new Set();
+    let profileTotal = 0;
+    for (const item of subtask.generation_profiles) {
+      if (!/^[a-z][a-z0-9_]*$/.test(item.id) || profileIds.has(item.id)) throw new Error(`子任务 ${subtask.id} 的 profile ID 必须唯一且使用小写字母、数字和下划线。`);
+      if (!GENERATION_CATEGORIES[item.category]) throw new Error(`子任务 ${subtask.id} 包含无效的生成目标分类。`);
+      if (!Number.isInteger(item.count) || item.count <= 0 || !item.goal) throw new Error(`子任务 ${subtask.id} 的生成策略需要填写正整数数量与完整目标。`);
+      profileIds.add(item.id);
+      categories.add(item.category);
+      profileTotal += item.count;
     }
-    if (specialTotal > subtask.test_count) throw new Error(`子任务 ${subtask.id} 的特殊测试点数量超过测试点总数。`);
+    if (categories.size !== 3) throw new Error(`子任务 ${subtask.id} 必须覆盖合规性、算法过滤和边界鲁棒性三类目标。`);
+    if (profileTotal !== subtask.test_count) throw new Error(`子任务 ${subtask.id} 的 profile 数量之和必须等于测试点总数。`);
+    const assignments = new Map([...profileIds].map((id) => [id, 0]));
+    for (const item of subtask.runtime_parameters) {
+      if (!assignments.has(item.generation_profile_id)) throw new Error(`子任务 ${subtask.id} 的测试点 ${item.case_id} 引用了不存在的 profile。`);
+      assignments.set(item.generation_profile_id, assignments.get(item.generation_profile_id) + 1);
+    }
+    for (const profile of subtask.generation_profiles) {
+      if (assignments.get(profile.id) !== profile.count) throw new Error(`子任务 ${subtask.id} 的 profile ${profile.id} 分配数量与 count 不一致。`);
+    }
   }
 }
 
@@ -686,36 +803,80 @@ function validateCodeDraft(draft) {
   if (!draft.generator_code || !draft.validator_code) throw new Error("generator.cpp 与 validator.cpp 均不能为空。");
 }
 
-async function saveDraft(stage, draft) {
-  const response = await api(`/api/projects/${state.projectId}/stages/${stage}/draft`, {
+async function saveDraft(projectId, stage, draft) {
+  const response = await api(`/api/projects/${projectId}/stages/${stage}/draft`, {
     method: "PUT",
     body: JSON.stringify({ draft }),
   });
-  state.drafts[String(stage)] = response.draft;
-  state.dirtyStages.delete(stage);
-  await refreshProject({ silent: true });
-  state.activeStage = Number(state.project.current_stage);
+  if (state.projectId === projectId) {
+    state.drafts[String(stage)] = response.draft;
+    state.stageInteractions[String(stage)] = null;
+    state.dirtyStages.delete(stage);
+    await refreshProject({ silent: true, projectId });
+    state.activeStage = Number(state.project.current_stage);
+  }
 }
 
-async function runAiStage(stage) {
-  const response = await api(`/api/projects/${state.projectId}/stages/${stage}/run`, {
+async function runAiStage(projectId, stage) {
+  const response = await api(`/api/projects/${projectId}/stages/${stage}/run`, {
     method: "POST",
     body: JSON.stringify({}),
   });
-  state.drafts[String(stage)] = response.draft;
-  state.dirtyStages.delete(stage);
-  await refreshProject({ silent: true });
+  if (state.projectId === projectId) {
+    state.drafts[String(stage)] = response.draft;
+    state.stageInteractions[String(stage)] = null;
+    state.dirtyStages.delete(stage);
+    await refreshProject({ silent: true, projectId });
+  }
 }
 
-async function confirmStage(stage) {
-  const project = await api(`/api/projects/${state.projectId}/stages/${stage}/confirm`, {
+async function sendStageInstruction(projectId, stage, instruction) {
+  const response = await api(`/api/projects/${projectId}/stages/${stage}/run`, {
+    method: "POST",
+    body: JSON.stringify({ user_instruction: instruction }),
+  });
+  if (state.projectId === projectId) {
+    state.stageInteractions[String(stage)] = response.interaction;
+    if (response.interaction?.action === "revise") {
+      state.drafts[String(stage)] = response.draft;
+      state.dirtyStages.delete(stage);
+      await refreshProject({ silent: true, projectId });
+    }
+  }
+  return response;
+}
+
+async function confirmStage(projectId, stage) {
+  const project = await api(`/api/projects/${projectId}/stages/${stage}/confirm`, {
     method: "POST",
     body: JSON.stringify({ confirmed: true }),
   });
-  state.project = project;
-  state.dirtyStages.delete(stage);
-  state.activeStage = stage + 1;
-  await refreshProject({ silent: true });
+  if (state.projectId === projectId) {
+    state.project = project;
+    state.dirtyStages.delete(stage);
+    state.activeStage = stage + 1;
+    await refreshProject({ silent: true, projectId });
+  }
+}
+
+function bindStageInstruction(stage, readDraft = null, validateDraft = null) {
+  $("#stageInstructionBtn")?.addEventListener("click", () => {
+    const instruction = $("#stageInstructionInput")?.value.trim() || "";
+    if (!instruction) {
+      showToast("请输入问题或修改意见。", "error");
+      return;
+    }
+    runMutation("AI 处理中", async (projectId) => {
+      if (readDraft) {
+        const draft = readDraft();
+        if (draftContentChanged(stage, draft)) {
+          if (validateDraft) validateDraft(draft);
+          await saveDraft(projectId, stage, draft);
+        }
+      }
+      await sendStageInstruction(projectId, stage, instruction);
+    }, "AI 已完成本次回答或修改");
+  });
 }
 
 function syncInteractiveControls(stage, readDraft) {
@@ -723,7 +884,7 @@ function syncInteractiveControls(stage, readDraft) {
   const dirty = updateDraftDirtyState(stage, draft);
   const info = state.project?.stages?.[String(stage)] || {};
   const checking = info.status === "checking" && !dirty;
-  const blocked = state.busy || checking;
+  const blocked = currentProjectBusy() || checking;
   const saveButton = $("#saveDraftBtn");
   const runAiButton = $("#runAiBtn");
   const confirmButton = $("#confirmBtn");
@@ -761,22 +922,23 @@ function bindInteractiveStage(stage, readDraft, validateDraft, contentSelector) 
   $("#saveDraftBtn")?.addEventListener("click", () => {
     const draft = readDraft();
     try { validateDraft(draft); } catch (error) { showToast(error.message, "error"); return; }
-    runMutation("保存中", () => saveDraft(stage, draft), "内容修改已保存，请重新进行 AI 检查");
+    runMutation("保存中", (projectId) => saveDraft(projectId, stage, draft), "内容修改已保存，请重新进行 AI 检查");
   });
 
   $("#runAiBtn")?.addEventListener("click", () => {
     const draft = readDraft();
     const hasDraft = stage === 3
-      ? Boolean(draft.template)
+      ? Boolean(draft.plan_markdown)
       : stage === 4
         ? Boolean(draft.subtasks.length)
         : Boolean(draft.generator_code && draft.validator_code);
     if (hasDraft) {
       try { validateDraft(draft); } catch (error) { showToast(error.message, "error"); return; }
+      if (!window.confirm("将开始新的恢复运行并覆盖当前可用草稿；历史失败记录仍会保留。是否继续？")) return;
     }
-    runMutation("AI 检查中", async () => {
-      if (hasDraft && draftContentChanged(stage, draft)) await saveDraft(stage, draft);
-      await runAiStage(stage);
+    runMutation("AI 检查中", async (projectId) => {
+      if (hasDraft && draftContentChanged(stage, draft)) await saveDraft(projectId, stage, draft);
+      await runAiStage(projectId, stage);
     }, "AI 检查已完成，请核对结果与确认状态");
   });
 
@@ -785,7 +947,7 @@ function bindInteractiveStage(stage, readDraft, validateDraft, contentSelector) 
       showToast("内容已修改，请先保存并重新进行 AI 检查。", "error");
       return;
     }
-    runMutation("确认中", () => confirmStage(stage), `阶段 ${stage} 已由 AI 与用户共同确认`);
+    runMutation("确认中", (projectId) => confirmStage(projectId, stage), `阶段 ${stage} 已由 AI 与用户共同确认`);
   });
 }
 
@@ -803,12 +965,25 @@ function bindStage(stage) {
 }
 
 function bindStage1() {
+  $$('[data-copy-project-field]').forEach((button) => {
+    button.addEventListener("click", async () => {
+      const value = state.project?.[button.dataset.copyProjectField];
+      if (!value) return;
+      try {
+        await navigator.clipboard.writeText(String(value));
+        showToast(`${button.dataset.copyLabel}已复制`);
+      } catch {
+        showToast("复制失败，请检查浏览器剪贴板权限。", "error");
+      }
+    });
+  });
   $$('[data-upload]').forEach((button) => {
     button.addEventListener("click", () => $(`#${button.dataset.upload}`).click());
   });
   $("#problemFile")?.addEventListener("change", (event) => loadFileInto(event.target, "#problemDescription", "#problemFileName"));
   $("#solutionFile")?.addEventListener("change", (event) => loadFileInto(event.target, "#solutionCode", "#solutionFileName"));
-  $("#createProjectBtn")?.addEventListener("click", createProject);
+  $("#createProjectBtn")?.addEventListener("click", () => createProject(false));
+  $("#createAllBtn")?.addEventListener("click", () => createProject(true));
 }
 
 async function loadFileInto(input, targetSelector, nameSelector) {
@@ -818,7 +993,7 @@ async function loadFileInto(input, targetSelector, nameSelector) {
   $(nameSelector).textContent = file.name;
 }
 
-function createProject() {
+function createProject(autoRun = false) {
   const problem = $("#problemDescription").value.trim();
   const solution = $("#solutionCode").value.trim();
   const difficulty = $("#difficulty").value;
@@ -826,23 +1001,91 @@ function createProject() {
     showToast("题目描述、C++ 标程和难度等级均为必填项。", "error");
     return;
   }
-  runMutation("创建并编译中", async () => {
-    const project = await api("/api/projects", {
+  $("#problemDescription").value = "";
+  $("#solutionCode").value = "";
+  $("#difficulty").value = "";
+  state.pendingProjectCreations += 1;
+  updatePendingCreationStatus();
+  showToast("项目已提交后台创建，可继续创建其他项目");
+  void runProjectCreation({ problem, solution, difficulty }, autoRun);
+}
+
+function updatePendingCreationStatus() {
+  if (state.project || state.activeStage !== 1) return;
+  const status = $(".action-bar .save-state");
+  if (!status) return;
+  status.innerHTML = state.pendingProjectCreations
+    ? `${icon("loader-circle", "spinner")}${state.pendingProjectCreations} 个项目正在后台创建；可继续创建新项目`
+    : `${icon("shield-check")}可仅创建并编译，也可自动运行至最终导出`;
+  hydrateIcons();
+}
+
+async function runProjectCreation(payload, autoRun) {
+  let project = null;
+  const taskLabel = autoRun ? "全流程自动运行中" : "创建并编译中";
+  try {
+    project = await api("/api/projects", {
       method: "POST",
-      body: JSON.stringify({ problem_description: problem, solution_code: solution, difficulty }),
+      body: JSON.stringify({
+        problem_description: payload.problem,
+        solution_code: payload.solution,
+        difficulty: payload.difficulty,
+      }),
     });
-    state.projectId = project.project_id;
-    state.project = project;
-    state.solutionCode = solution;
-    localStorage.setItem("testforge.projectId", state.projectId);
-    const response = await api(`/api/projects/${state.projectId}/solution/compile`, { method: "POST" });
-    state.project = response.project;
-    state.compileResult = response.result;
-    await refreshProject({ silent: true });
+    state.projectTasks.set(project.project_id, taskLabel);
     await loadProjectHistory({ silent: true });
-    state.activeStage = state.project.solution_compiled ? 3 : 2;
-    if (!state.project.solution_compiled) throw Object.assign(new Error("solution compilation failed"), { payload: state.project.last_error });
-  }, "项目已创建，标程编译通过");
+    if (autoRun) {
+      await api(`/api/projects/${project.project_id}/auto-run`, {
+        method: "POST",
+        body: JSON.stringify({ base_seed: 1 }),
+      });
+    } else {
+      const response = await api(`/api/projects/${project.project_id}/solution/compile`, {
+        method: "POST",
+      });
+      if (!response.result.ok) {
+        throw Object.assign(new Error("solution compilation failed"), {
+          payload: response.project.last_error,
+        });
+      }
+    }
+    showToast(`项目「${projectDisplayName(project, 24)}」${autoRun ? "已完成一键生成" : "已创建并通过编译"}`);
+  } catch (error) {
+    const prefix = project ? `项目「${projectDisplayName(project, 24)}」` : "项目创建";
+    showToast(`${prefix}失败：${errorMessage(error)}`, "error");
+  } finally {
+    if (project) {
+      state.projectTasks.delete(project.project_id);
+      if (state.projectId === project.project_id) {
+        state.projectActiveTask = false;
+        await refreshProject({ silent: true, projectId: project.project_id });
+        render();
+      }
+    }
+    state.pendingProjectCreations -= 1;
+    await loadProjectHistory({ silent: true });
+    updatePendingCreationStatus();
+  }
+}
+
+function runAutoPipeline() {
+  if (!state.projectId || currentProjectBusy()) return;
+  if (hasUnsavedChanges()) {
+    showToast("请先保存当前修改，再运行一键生成。", "error");
+    return;
+  }
+  runMutation("全流程自动运行中", async (projectId) => {
+    const result = await api(`/api/projects/${projectId}/auto-run`, {
+      method: "POST",
+      body: JSON.stringify({ base_seed: 1 }),
+    });
+    if (state.projectId === projectId) {
+      state.autoRunResult = result;
+      state.project = result.project;
+      await refreshProject({ silent: true, projectId });
+      state.activeStage = 8;
+    }
+  }, "全部阶段已自动完成，数据包可以下载");
 }
 
 function bindStage2() {
@@ -857,7 +1100,7 @@ function bindStage2() {
         : `${icon("check-circle-2")}内容未修改，重新编译不会回退流程`;
       hydrateIcons();
     }
-    if (compileButton && !state.busy) {
+    if (compileButton && !currentProjectBusy()) {
       compileButton.innerHTML = `${icon("hammer")}${state.dirtySolution ? "保存并编译" : "重新编译"}`;
       hydrateIcons();
     }
@@ -865,20 +1108,38 @@ function bindStage2() {
   $("#compileBtn")?.addEventListener("click", () => {
     const solution = $("#solutionEditor").value.trim();
     if (!solution) { showToast("C++ 标程不能为空。", "error"); return; }
-    runMutation("编译中", async () => {
-      await api(`/api/projects/${state.projectId}/solution`, { method: "PUT", body: JSON.stringify({ solution_code: solution }) });
-      state.solutionCode = solution;
-      const response = await api(`/api/projects/${state.projectId}/solution/compile`, { method: "POST" });
-      state.project = response.project;
-      state.compileResult = response.result;
-      await refreshProject({ silent: true });
+    runMutation("编译中", async (projectId) => {
+      await api(`/api/projects/${projectId}/solution`, { method: "PUT", body: JSON.stringify({ solution_code: solution }) });
+      const response = await api(`/api/projects/${projectId}/solution/compile`, { method: "POST" });
+      if (state.projectId === projectId) {
+        state.solutionCode = solution;
+        state.project = response.project;
+        state.compileResult = response.result;
+        await refreshProject({ silent: true, projectId });
+      }
       if (!response.result.ok) throw Object.assign(new Error("solution compilation failed"), { payload: response.project.last_error });
     }, "标程编译通过");
   });
 }
 
 function bindStage3() {
-  bindInteractiveStage(3, readStructureDraft, validateStructure, "#inputStructureTemplate");
+  bindStageInstruction(3);
+  $$('[data-copy-plan-section]').forEach((button) => button.addEventListener("click", async () => {
+    const content = extractPlanSection(state.drafts["3"]?.plan_markdown, button.dataset.copyPlanSection);
+    if (!content) return;
+    try {
+      await navigator.clipboard.writeText(content);
+      showToast("该部分已复制");
+    } catch {
+      showToast("复制失败，请检查浏览器剪贴板权限。", "error");
+    }
+  }));
+  $("#runAiBtn")?.addEventListener("click", () => {
+    runMutation("AI 检查中", (projectId) => runAiStage(projectId, 3), "AI 已重新生成测试数据设计方案");
+  });
+  $("#confirmBtn")?.addEventListener("click", () => {
+    runMutation("确认中", (projectId) => confirmStage(projectId, 3), "阶段 3 已由 AI 与用户共同确认");
+  });
 }
 
 function preservePlanAndRender(mutator) {
@@ -889,16 +1150,17 @@ function preservePlanAndRender(mutator) {
 }
 
 function bindStage4() {
-  bindInteractiveStage(4, readPlanDraft, validatePlan, "[data-plan-key], [data-special-count], [data-special-description]");
+  bindInteractiveStage(4, readPlanDraft, validatePlan, "[data-plan-key], [data-profile-id], [data-profile-category], [data-profile-count], [data-profile-goal], [data-profile-parameters]");
+  bindStageInstruction(4, readPlanDraft, validatePlan);
   $$('[data-toggle-subtask]').forEach((button) => button.addEventListener("click", () => preservePlanAndRender(() => {
     const index = Number(button.dataset.toggleSubtask);
     if (state.expandedSubtasks.has(index)) state.expandedSubtasks.delete(index); else state.expandedSubtasks.add(index);
   })));
-  $$('[data-add-special]').forEach((button) => button.addEventListener("click", () => preservePlanAndRender((draft) => {
-    draft.subtasks[Number(button.dataset.addSpecial)].special_cases.push({ count: 1, description: "" });
+  $$('[data-add-profile]').forEach((button) => button.addEventListener("click", () => preservePlanAndRender((draft) => {
+    draft.subtasks[Number(button.dataset.addProfile)].generation_profiles.push({ id: "new_profile", category: "rules_format", count: 1, goal: "", parameter_names: [] });
   })));
-  $$('[data-remove-special]').forEach((button) => button.addEventListener("click", () => preservePlanAndRender((draft) => {
-    draft.subtasks[Number(button.dataset.subtask)].special_cases.splice(Number(button.dataset.removeSpecial), 1);
+  $$('[data-remove-profile]').forEach((button) => button.addEventListener("click", () => preservePlanAndRender((draft) => {
+    draft.subtasks[Number(button.dataset.subtask)].generation_profiles.splice(Number(button.dataset.removeProfile), 1);
   })));
   $("#addSubtaskBtn")?.addEventListener("click", () => preservePlanAndRender((draft) => {
     const source = draft.subtasks.at(-1) || null;
@@ -923,16 +1185,17 @@ function updateCountSummaries() {
   $$('[data-subtask-editor]').forEach((editor) => {
     const index = editor.dataset.subtaskEditor;
     const total = Number($(`[data-plan-key="test-count"][data-subtask="${index}"]`)?.value || 0);
-    const special = $$(`[data-special-count][data-subtask="${index}"]`).reduce((sum, input) => sum + Number(input.value || 0), 0);
-    $("[data-special-total]", editor).textContent = String(special);
+    const assigned = $$(`[data-profile-count][data-subtask="${index}"]`).reduce((sum, input) => sum + Number(input.value || 0), 0);
+    $("[data-profile-total]", editor).textContent = String(assigned);
     $("[data-test-total]", editor).textContent = String(total);
-    $("[data-normal-total]", editor).textContent = String(total - special);
-    $("[data-normal-box]", editor).classList.toggle("invalid-count", total - special < 0);
+    $("[data-profile-remaining]", editor).textContent = String(total - assigned);
+    $("[data-profile-remaining-box]", editor).classList.toggle("invalid-count", total - assigned !== 0);
   });
 }
 
 function bindStage5() {
   bindInteractiveStage(5, readCodeDraft, validateCodeDraft, "#generatorCode, #validatorCode");
+  bindStageInstruction(5, readCodeDraft, validateCodeDraft);
   $("#previewBtn")?.addEventListener("click", () => {
     const draft = readCodeDraft();
     const seed = Number($("#previewSeed").value);
@@ -941,12 +1204,14 @@ function bindStage5() {
     try { validateCodeDraft(draft); } catch (error) { showToast(error.message, "error"); return; }
     if (!Number.isInteger(seed)) { showToast("种子必须为整数。", "error"); return; }
     if (!Number.isInteger(caseId) || caseId <= 0) { showToast("测试点必须为正整数。", "error"); return; }
-    runMutation("试运行中", async () => {
-      if (draftContentChanged(5, draft)) await saveDraft(5, draft);
-      const preview = await api(`/api/projects/${state.projectId}/preview`, { method: "POST", body: JSON.stringify({ subtask_id: subtaskId, case_id: caseId, seed }) });
-      state.preview = { ...preview, subtaskId };
-      state.previewHistory.unshift({ seed, subtaskId, caseId, ok: preview.validator?.ok });
-      state.previewHistory = state.previewHistory.slice(0, 5);
+    runMutation("试运行中", async (projectId) => {
+      if (draftContentChanged(5, draft)) await saveDraft(projectId, 5, draft);
+      const preview = await api(`/api/projects/${projectId}/preview`, { method: "POST", body: JSON.stringify({ subtask_id: subtaskId, case_id: caseId, seed }) });
+      if (state.projectId === projectId) {
+        state.preview = { ...preview, subtaskId };
+        state.previewHistory.unshift({ seed, subtaskId, caseId, ok: preview.validator?.ok });
+        state.previewHistory = state.previewHistory.slice(0, 5);
+      }
     }, `种子 ${seed} 试运行完成`);
   });
 }
@@ -955,10 +1220,13 @@ function totalTests() {
   return (state.drafts["4"]?.subtasks || []).reduce((sum, item) => sum + Number(item.test_count || 0), 0);
 }
 
-async function generateDataset(baseSeed, selectedSubtaskIds) {
-  state.buildResult = await api(`/api/projects/${state.projectId}/generate`, { method: "POST", body: JSON.stringify({ base_seed: baseSeed, selected_subtask_ids: selectedSubtaskIds }) });
-  await refreshProject({ silent: true });
-  state.activeStage = 7;
+async function generateDataset(projectId, baseSeed, selectedSubtaskIds) {
+  const result = await api(`/api/projects/${projectId}/generate`, { method: "POST", body: JSON.stringify({ base_seed: baseSeed, selected_subtask_ids: selectedSubtaskIds }) });
+  if (state.projectId === projectId) {
+    state.buildResult = result;
+    await refreshProject({ silent: true, projectId });
+    state.activeStage = 7;
+  }
 }
 
 function bindStage6() {
@@ -977,23 +1245,29 @@ function bindStage6() {
     if (!Number.isInteger(seed)) { showToast("基础种子必须为整数。", "error"); return; }
     const selected = checkboxes.filter((item) => item.checked).map((item) => Number(item.value));
     if (!selected.length) { showToast("请至少选择一个子任务。", "error"); return; }
-    runMutation("批量生成中", () => generateDataset(seed, selected), "所选子任务的输入数据已生成");
+    runMutation("批量生成中", (projectId) => generateDataset(projectId, seed, selected), "所选子任务的输入数据已生成");
   });
 }
 
 function bindStage7() {
-  $("#validateBtn")?.addEventListener("click", () => runMutation("验证中", async () => {
-    state.buildResult = await api(`/api/projects/${state.projectId}/validate`, {
+  $("#validateBtn")?.addEventListener("click", () => {
+    const selectedSubtaskIds = state.project.generated_subtasks || null;
+    runMutation("验证中", async (projectId) => {
+      const result = await api(`/api/projects/${projectId}/validate`, {
       method: "POST",
-      body: JSON.stringify({ selected_subtask_ids: state.project.generated_subtasks || null }),
+        body: JSON.stringify({ selected_subtask_ids: selectedSubtaskIds }),
     });
-    await refreshProject({ silent: true });
-  }, "输入校验通过，标准输出已生成"));
+      if (state.projectId === projectId) {
+        state.buildResult = result;
+        await refreshProject({ silent: true, projectId });
+      }
+    }, "输入校验通过，标准输出已生成");
+  });
 }
 
 function bindStage8() {
-  $("#exportBtn")?.addEventListener("click", () => runMutation("准备下载", async () => {
-    const response = await fetch(`${API_BASE}/api/projects/${state.projectId}/export`);
+  $("#exportBtn")?.addEventListener("click", () => runMutation("准备下载", async (projectId) => {
+    const response = await fetch(`${API_BASE}/api/projects/${projectId}/export`);
     if (!response.ok) {
       const body = await response.json();
       throw Object.assign(new Error(body.message), { payload: body });
@@ -1002,7 +1276,7 @@ function bindStage8() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `${state.projectId}-dataset.zip`;
+    link.download = `${projectId}-dataset.zip`;
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -1057,6 +1331,7 @@ function clearProjectWorkspace({ removeStoredId = true } = {}) {
   Object.assign(state, {
     projectId: null,
     project: null,
+    projectActiveTask: false,
     drafts: { "3": null, "4": null, "5": null },
     draftBaselines: { "3": null, "4": null, "5": null },
     solutionCode: "",
@@ -1068,8 +1343,10 @@ function clearProjectWorkspace({ removeStoredId = true } = {}) {
     preview: null,
     previewHistory: [],
     buildResult: null,
+    autoRunResult: null,
     expandedSubtasks: new Set([0]),
     dirtyStages: new Set(),
+    stageInteractions: { "3": null, "4": null, "5": null },
   });
 }
 
@@ -1078,7 +1355,9 @@ async function fetchProjectWorkspace(projectId) {
     api(`/api/projects/${projectId}`),
     api(`/api/projects/${projectId}/solution`),
   ]);
+  if (state.projectId !== projectId) return false;
   state.project = projectResponse.project;
+  state.projectActiveTask = Boolean(projectResponse.active_task) || state.projectTasks.has(projectId);
   state.drafts = projectResponse.drafts;
   state.draftBaselines = Object.fromEntries([3, 4, 5].map((stage) => {
     const baseline = cloneJson(projectResponse.drafts[String(stage)]);
@@ -1090,18 +1369,21 @@ async function fetchProjectWorkspace(projectId) {
   state.solutionBaseline = solutionResponse.solution_code;
   state.dirtySolution = false;
   state.error = null;
+  return true;
 }
 
-async function refreshProject({ silent = false, keepError = false } = {}) {
-  if (!state.projectId) return;
+async function refreshProject({ silent = false, keepError = false, projectId = state.projectId } = {}) {
+  if (!projectId || state.projectId !== projectId) return;
   try {
-    await fetchProjectWorkspace(state.projectId);
+    const applied = await fetchProjectWorkspace(projectId);
+    if (!applied || state.projectId !== projectId) return;
     if (!canOpenStage(state.activeStage)) {
       state.activeStage = Number(state.project.current_stage);
     }
     if (!keepError) state.error = null;
     if (!silent) showToast("项目状态已刷新");
   } catch (error) {
+    if (state.projectId !== projectId) return;
     if (error.status === 404) {
       clearProjectWorkspace();
     } else {
@@ -1153,39 +1435,37 @@ async function switchProject(projectId) {
     setProjectPanelOpen(false);
     return;
   }
-  if (state.busy || !confirmProjectNavigation("当前修改尚未保存。切换项目将放弃这些修改，是否继续？")) return;
+  if (!confirmProjectNavigation("当前修改尚未保存。切换项目将放弃这些修改，是否继续？")) return;
   const previousId = state.projectId;
-  state.busy = true;
-  state.busyLabel = "加载项目中";
-  state.error = null;
+  clearProjectWorkspace();
+  state.projectId = projectId;
+  localStorage.setItem("testforge.projectId", projectId);
   render();
   try {
-    clearProjectWorkspace();
-    state.projectId = projectId;
-    localStorage.setItem("testforge.projectId", projectId);
-    await fetchProjectWorkspace(projectId);
+    const applied = await fetchProjectWorkspace(projectId);
+    if (!applied) return;
     state.activeStage = Number(state.project.current_stage);
     setProjectPanelOpen(false);
     showToast(`已切换到「${projectDisplayName(state.project, 24)}」`);
   } catch (error) {
+    if (state.projectId !== projectId) return;
     clearProjectWorkspace();
     if (previousId) {
       state.projectId = previousId;
       localStorage.setItem("testforge.projectId", previousId);
-      await refreshProject({ silent: true });
+      await refreshProject({ silent: true, projectId: previousId });
     }
     showToast(errorMessage(error), "error");
     await loadProjectHistory({ silent: true });
   } finally {
-    state.busy = false;
-    state.busyLabel = "";
-    render();
+    if (state.projectId === projectId || state.projectId === previousId) render();
   }
 }
 
 async function deleteProject(projectId) {
-  if (state.busy || state.deletingProjectId) return;
+  if (state.deletingProjectId || projectBusy(projectId)) return;
   const project = state.projects.find((item) => item.project_id === projectId);
+  if (project?.active_task) return;
   const name = projectDisplayName(project, 28);
   if (projectId === state.projectId && !confirmProjectNavigation("当前修改尚未保存。删除项目会永久丢失这些修改，是否继续？")) return;
   if (!window.confirm(`确定永久删除项目「${name}」吗？项目数据、运行记录和导出文件都将被移除，此操作无法撤销。`)) return;
@@ -1347,7 +1627,7 @@ async function saveModelSettings(event) {
 }
 
 function resetForNewProject() {
-  if (state.busy || !confirmProjectNavigation("当前修改尚未保存。新建项目会保留当前项目，但未保存的修改将丢失，是否继续？")) return;
+  if (!confirmProjectNavigation("当前修改尚未保存。新建项目会保留当前项目，但未保存的修改将丢失，是否继续？")) return;
   clearProjectWorkspace();
   setProjectPanelOpen(false);
   render();
@@ -1378,6 +1658,7 @@ async function init() {
     if (projectButton) switchProject(projectButton.dataset.openProject);
   });
   $("#modelSettingsBtn").addEventListener("click", openModelSettings);
+  $("#autoRunBtn").addEventListener("click", runAutoPipeline);
   $("#modelSettingsForm").addEventListener("submit", saveModelSettings);
   $("#testModelConnectionBtn").addEventListener("click", testModelConnection);
   $("#closeModelSettingsBtn").addEventListener("click", () => $("#modelSettingsDialog").close());

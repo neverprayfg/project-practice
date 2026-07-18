@@ -18,6 +18,18 @@ from pydantic import (
 )
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+ProjectName = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=40),
+]
+UserInstruction = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=4000),
+]
+GeneratorAuditIssue = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=4000),
+]
 RuntimeString = Annotated[
     str,
     StringConstraints(
@@ -29,19 +41,26 @@ RuntimeString = Annotated[
 ]
 RuntimeScalar = StrictBool | StrictInt | StrictFloat | RuntimeString
 FormatContractId = Annotated[str, StringConstraints(pattern=r"^format_[0-9a-f]{24}$")]
-StructureTagId = Annotated[
+GenerationProfileId = Annotated[
     str,
     StringConstraints(
         strip_whitespace=True,
         min_length=1,
-        max_length=64,
-        pattern=r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$",
+        max_length=32,
+        pattern=r"^[a-z][a-z0-9_]*$",
     ),
 ]
-Agent4VerifierRevision = Literal["agent4-verifier-v12-code-gates-only"]
-AGENT4_VERIFIER_REVISION: Agent4VerifierRevision = "agent4-verifier-v12-code-gates-only"
-AGENT4_CACHE_FORMAT_VERSION = 1
-AGENT4_GRAPH_ID = "agent4-v15"
+AGENT4_ARCHITECTURE_ID = "agent4-profiled-working-template-v3-stage3-test-data-plan"
+
+
+def _runtime_scalar_type(value: RuntimeScalar) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    return "string"
 
 
 class StrictModel(BaseModel):
@@ -51,7 +70,7 @@ class StrictModel(BaseModel):
 class Stage(IntEnum):
     CREATE = 1
     SOLUTION_COMPILE = 2
-    INPUT_STRUCTURE = 3
+    TEST_DATA_PLAN = 3
     SUBTASK_PLAN = 4
     CODE_DRAFT = 5
     BUILD = 6
@@ -69,7 +88,7 @@ class StageStatus(StrEnum):
 
 class TaskType(StrEnum):
     INPUT_NORMALIZATION = "input_normalization"
-    INPUT_STRUCTURE = "input_structure"
+    TEST_DATA_PLAN = "test_data_plan"
     SUBTASK_PLAN = "subtask_plan"
 
 
@@ -148,6 +167,7 @@ class ProblemInput(StrictModel):
 class InputNormalizationDraft(StrictModel):
     """Agent1 may enrich parsed problem fields but cannot echo authoritative input."""
 
+    project_name: ProjectName
     input_description: NonEmptyText
     output_description: NonEmptyText
     samples: list[ProblemSample] = Field(default_factory=list)
@@ -165,6 +185,8 @@ class SolutionInput(StrictModel):
 
 
 class InputStructureState(StrictModel):
+    """Legacy persisted field retained only to read projects created before Stage 3."""
+
     template: str = ""
     status: Literal["pending", "draft", "confirmed"] = "pending"
     revision: int = Field(default=0, ge=0)
@@ -173,7 +195,11 @@ class InputStructureState(StrictModel):
 class GlobalInput(StrictModel):
     problem: ProblemInput
     solution: SolutionInput
-    input_structure: InputStructureState = Field(default_factory=InputStructureState)
+    project_name: str = ""
+    input_structure: InputStructureState = Field(
+        default_factory=InputStructureState,
+        exclude=True,
+    )
     revision: int = Field(default=1, ge=1)
 
 
@@ -191,8 +217,95 @@ class StageState(StrictModel):
         return self
 
 
+class StageRecoverySummary(StrictModel):
+    run_id: str
+    stage: int = Field(ge=1, le=8)
+    status: Literal["running", "passed", "failed"] = "running"
+    generation_round: int = Field(default=0, ge=0)
+    repair_attempts: int = Field(default=0, ge=0)
+    last_error_summary: str = ""
+    started_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    finished_at: datetime | None = None
+
+
+class RecoveryFailureClass(StrEnum):
+    RESPONSE_CONTRACT = "response_contract"
+    BUSINESS_CONTRACT = "business_contract"
+    DETERMINISTIC_EXECUTION = "deterministic_execution"
+    ENVIRONMENT = "environment"
+    AUTHORIZATION = "authorization"
+
+
+class RecoveryError(StrictModel):
+    source: Literal["json", "pydantic", "validator", "compiler", "runner", "system"]
+    location: list[str | int] = Field(default_factory=list)
+    message: NonEmptyText
+    code: NonEmptyText
+
+
+class RawCandidate(StrictModel):
+    operation: str = ""
+    raw_output: str = ""
+    candidate: dict[str, Any] | None = None
+    validation_errors: list[RecoveryError] = Field(default_factory=list)
+    response_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class RecoveryValidationResult(StrictModel):
+    passed: bool
+    failure_class: RecoveryFailureClass | None = None
+    repairable: bool = False
+    candidate: dict[str, Any] | None = None
+    raw_output: str = ""
+    errors: list[RecoveryError] = Field(default_factory=list)
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
+    response_metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def failure_has_class_and_pass_has_candidate(self) -> RecoveryValidationResult:
+        if self.passed and self.candidate is None:
+            raise ValueError("passed recovery validation requires a candidate")
+        if not self.passed and self.failure_class is None:
+            raise ValueError("failed recovery validation requires a failure class")
+        return self
+
+
+class RecoveryMutationGrant(StrictModel):
+    stage: int = Field(ge=1, le=8)
+    artifact: NonEmptyText
+    paths: list[NonEmptyText] = Field(min_length=1)
+
+
+class RecoveryPlan(StrictModel):
+    observed_stage: int = Field(ge=1, le=8)
+    root_stage: int = Field(ge=1, le=8)
+    failure_class: RecoveryFailureClass
+    evidence: list[NonEmptyText] = Field(default_factory=list)
+    context_requirements: list[NonEmptyText] = Field(default_factory=list)
+    write_grants: list[RecoveryMutationGrant] = Field(default_factory=list)
+    protected_fields: list[NonEmptyText] = Field(default_factory=list)
+    revalidate_from_stage: int = Field(ge=1, le=8)
+    invalidate_downstream_from_stage: int | None = Field(default=None, ge=1, le=8)
+    requires_user_authorization: bool = False
+    confidence: float = Field(ge=0, le=1)
+
+    def allows_stage(self, stage: int) -> bool:
+        return not self.requires_user_authorization and any(
+            grant.stage == stage for grant in self.write_grants
+        )
+
+
+class RecoveryOutcome(StrictModel):
+    status: Literal["passed", "failed", "exhausted"]
+    candidate: dict[str, Any] | None = None
+    summary: StageRecoverySummary
+    validation: RecoveryValidationResult | None = None
+    recovery_plan: RecoveryPlan | None = None
+
+
 class ProjectRecord(StrictModel):
     project_id: str
+    project_name: str = ""
     problem_description: str
     difficulty: str
     current_stage: Stage = Stage.SOLUTION_COMPILE
@@ -209,6 +322,7 @@ class ProjectRecord(StrictModel):
     stages: dict[int, StageState] = Field(
         default_factory=lambda: {stage: StageState() for stage in (3, 4, 5)}
     )
+    recovery_summaries: dict[int, StageRecoverySummary] = Field(default_factory=dict)
     build_complete: bool = False
     export_ready: bool = False
     last_error: dict[str, Any] | None = None
@@ -216,14 +330,25 @@ class ProjectRecord(StrictModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
-class InputStructureDraft(StrictModel):
-    template: NonEmptyText
+class TestDataPlanDraft(StrictModel):
+    """The human-reviewable Stage 3 test-data design document."""
+
+    plan_markdown: NonEmptyText
     issues: list[str] = Field(default_factory=list)
 
 
-class SpecialCase(StrictModel):
+class GenerationProfile(StrictModel):
+    id: GenerationProfileId
+    category: Literal["rules_format", "anti_algorithm", "boundary_edge"]
     count: int = Field(gt=0)
-    description: NonEmptyText
+    goal: NonEmptyText
+    parameter_names: list[GenerationProfileId] = Field(default_factory=list, max_length=23)
+
+    @model_validator(mode="after")
+    def parameter_names_are_unique(self) -> GenerationProfile:
+        if len(self.parameter_names) != len(set(self.parameter_names)):
+            raise ValueError("generation profile parameter names must be unique")
+        return self
 
 
 class RuntimeParameter(StrictModel):
@@ -251,7 +376,8 @@ class RuntimeParameter(StrictModel):
 
 class TestPointRuntimeParameters(StrictModel):
     case_id: int = Field(gt=0)
-    parameters: list[RuntimeParameter] = Field(min_length=1, max_length=24)
+    generation_profile_id: GenerationProfileId
+    parameters: list[RuntimeParameter] = Field(min_length=1, max_length=23)
 
     @model_validator(mode="after")
     def parameter_names_are_unique_and_reserved_names_are_rejected(
@@ -260,7 +386,7 @@ class TestPointRuntimeParameters(StrictModel):
         names = [parameter.name for parameter in self.parameters]
         if len(names) != len(set(names)):
             raise ValueError("runtime parameter names must be unique within a test point")
-        reserved = {"seed", "subtask", "case"}.intersection(names)
+        reserved = {"seed", "subtask", "case", "generation_profile"}.intersection(names)
         if reserved:
             raise ValueError("runtime parameter names cannot shadow runner arguments")
         return self
@@ -268,19 +394,52 @@ class TestPointRuntimeParameters(StrictModel):
 
 class Subtask(StrictModel):
     id: int = Field(gt=0)
-    test_count: int = Field(gt=0)
+    test_count: int = Field(ge=3)
     expected_complexity: NonEmptyText
-    special_cases: list[SpecialCase] = Field(default_factory=list)
+    generation_profiles: list[GenerationProfile] = Field(min_length=3)
     runtime_parameters: list[TestPointRuntimeParameters] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def special_count_fits_total(self) -> Subtask:
-        if sum(item.count for item in self.special_cases) > self.test_count:
-            raise ValueError("special case count exceeds the subtask test count")
+    def generation_contract_is_complete(self) -> Subtask:
+        profile_ids = [profile.id for profile in self.generation_profiles]
+        if len(profile_ids) != len(set(profile_ids)):
+            raise ValueError("generation profile ids must be unique")
+        categories = {profile.category for profile in self.generation_profiles}
+        required_categories = {"rules_format", "anti_algorithm", "boundary_edge"}
+        if categories != required_categories:
+            raise ValueError("generation profiles must cover all three generation categories")
+        if sum(profile.count for profile in self.generation_profiles) != self.test_count:
+            raise ValueError("generation profile counts must exactly match test_count")
         if self.runtime_parameters:
             case_ids = [profile.case_id for profile in self.runtime_parameters]
             if case_ids != list(range(1, self.test_count + 1)):
                 raise ValueError("runtime parameter case ids must exactly match 1..test_count")
+            profiles_by_id = {profile.id: profile for profile in self.generation_profiles}
+            observed_counts = {profile_id: 0 for profile_id in profiles_by_id}
+            expected_schema: dict[str, tuple[str, str]] | None = None
+            for runtime in self.runtime_parameters:
+                if runtime.generation_profile_id not in profiles_by_id:
+                    raise ValueError("runtime parameters reference an unknown generation profile")
+                observed_counts[runtime.generation_profile_id] += 1
+                schema = {
+                    parameter.name: (parameter.category, _runtime_scalar_type(parameter.value))
+                    for parameter in runtime.parameters
+                }
+                if expected_schema is None:
+                    expected_schema = schema
+                elif schema != expected_schema:
+                    raise ValueError(
+                        "all test points in a subtask must share one runtime parameter schema"
+                    )
+            expected_counts = {profile.id: profile.count for profile in self.generation_profiles}
+            if observed_counts != expected_counts:
+                raise ValueError("runtime generation profile assignments must match profile counts")
+            schema_names = set(expected_schema or {})
+            for profile in self.generation_profiles:
+                if not set(profile.parameter_names).issubset(schema_names):
+                    raise ValueError(
+                        f"generation profile {profile.id} references an unknown runtime parameter"
+                    )
         return self
 
 
@@ -293,6 +452,47 @@ class SubtaskPlanDraft(StrictModel):
         ids = [subtask.id for subtask in self.subtasks]
         if ids != list(range(1, len(self.subtasks) + 1)):
             raise ValueError("subtask ids must be contiguous and ordered from 1")
+        return self
+
+
+class GeneratorConstructionStrategy(StrictModel):
+    subtask_id: int = Field(gt=0)
+    generation_profile_id: GenerationProfileId
+    profile_category: Literal["rules_format", "anti_algorithm", "boundary_edge"]
+    construction_mode: GenerationProfileId
+    goal: NonEmptyText
+    runtime_parameters: list[GenerationProfileId] = Field(min_length=1, max_length=23)
+    input_invariants: list[NonEmptyText] = Field(min_length=1)
+    construction_steps: list[NonEmptyText] = Field(min_length=1)
+    post_checks: list[NonEmptyText] = Field(min_length=1)
+    seed_policy: Literal["fixed", "diverse"]
+    variation_dimensions: list[NonEmptyText] = Field(default_factory=list)
+    complexity_target: NonEmptyText
+
+    @model_validator(mode="after")
+    def runtime_parameters_are_unique(self) -> GeneratorConstructionStrategy:
+        if len(self.runtime_parameters) != len(set(self.runtime_parameters)):
+            raise ValueError("generator strategy runtime parameters must be unique")
+        return self
+
+
+class GeneratorAnalysisDraft(StrictModel):
+    input_constraints: list[NonEmptyText] = Field(min_length=1)
+    solution_branch_risks: list[NonEmptyText] = Field(min_length=1)
+    overflow_and_resource_guards: list[NonEmptyText] = Field(min_length=1)
+    strategies: list[GeneratorConstructionStrategy] = Field(default_factory=list)
+
+
+class GeneratorAuditDraft(StrictModel):
+    passed: bool
+    issues: list[GeneratorAuditIssue] = Field(default_factory=list, max_length=8)
+
+    @model_validator(mode="after")
+    def result_matches_issues(self) -> GeneratorAuditDraft:
+        if self.passed and self.issues:
+            raise ValueError("a passed generator audit cannot contain issues")
+        if not self.passed and not self.issues:
+            raise ValueError("a failed generator audit must contain issues")
         return self
 
 
@@ -323,172 +523,6 @@ class InputFormatContract(StrictModel):
     )
 
 
-class DefectIdentity(StrictModel):
-    category: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
-    target_file: Annotated[
-        str,
-        StringConstraints(strip_whitespace=True, min_length=1, max_length=128),
-    ]
-    constraint_id: Annotated[
-        str,
-        StringConstraints(strip_whitespace=True, min_length=1, max_length=160),
-    ]
-    subtask: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
-    test_point: Annotated[
-        str,
-        StringConstraints(strip_whitespace=True, min_length=1, max_length=64),
-    ]
-    error_code: Annotated[
-        str,
-        StringConstraints(
-            strip_whitespace=True,
-            min_length=1,
-            max_length=64,
-            pattern=r"^[A-Z0-9_]+$",
-        ),
-    ]
-
-
-class Defect(StrictModel):
-    defect_id: Annotated[
-        str,
-        StringConstraints(pattern=r"^defect_[0-9a-f]{20}$"),
-    ]
-    identity: DefectIdentity
-    severity: Literal["blocker", "warning"] = "blocker"
-    validation_level: Literal[
-        "contract",
-        "static",
-        "compile",
-        "smoke",
-        "complete",
-        "semantic",
-    ]
-    message: NonEmptyText
-    evidence: dict[str, Any] = Field(default_factory=dict)
-
-
-class CounterexampleRepair(StrictModel):
-    candidate_revision: NonEmptyText
-    patch_scope: list[str] = Field(default_factory=list)
-    outcome: Literal["accepted", "rolled_back", "still_open", "regressed"]
-    reason: NonEmptyText
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
-
-
-class Counterexample(StrictModel):
-    counterexample_id: Annotated[
-        str,
-        StringConstraints(pattern=r"^case_[0-9a-f]{20}$"),
-    ]
-    defect: Defect
-    status: Literal["open", "closed", "regressed"] = "open"
-    reproduction: dict[str, Any] = Field(default_factory=dict)
-    first_seen_revision: NonEmptyText
-    last_seen_revision: NonEmptyText
-    repair_history: list[CounterexampleRepair] = Field(default_factory=list)
-
-
-class CounterexampleLedger(StrictModel):
-    verifier_revision: Agent4VerifierRevision
-    counterexamples: list[Counterexample] = Field(default_factory=list)
-    last_valid_candidate_revision: str | None = None
-
-
-class AgentDecisionEvent(StrictModel):
-    run_id: NonEmptyText
-    candidate_revision: NonEmptyText
-    target_defect_id: str | None = None
-    model_call_type: Literal[
-        "generator_generation",
-        "validator_generation",
-        "semantic_audit",
-        "targeted_recheck",
-        "repair",
-        "none",
-    ] = "none"
-    modified_files: list[str] = Field(default_factory=list)
-    before: dict[str, Any] = Field(default_factory=dict)
-    after: dict[str, Any] = Field(default_factory=dict)
-    progress: bool = False
-    decision: Literal["accepted", "rolled_back", "stopped", "observed"]
-    reason: NonEmptyText
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
-
-
-class ReportedDefect(StrictModel):
-    identity: DefectIdentity
-    severity: Literal["blocker", "warning"] = "blocker"
-    validation_level: Literal["semantic"] = "semantic"
-    message: NonEmptyText
-    evidence: dict[str, Any] = Field(default_factory=dict)
-
-
-class SemanticAudit(StrictModel):
-    defects: list[ReportedDefect] = Field(default_factory=list)
-
-
-class TargetedDefectEvidence(StrictModel):
-    target_file: Literal["generator.cpp", "validator.cpp"]
-    code_snippet: Annotated[
-        str,
-        StringConstraints(strip_whitespace=True, min_length=12, max_length=4000),
-    ]
-    rationale: Annotated[
-        str,
-        StringConstraints(strip_whitespace=True, min_length=1, max_length=1000),
-    ]
-
-
-class TargetedDefectCheck(StrictModel):
-    defect_id: NonEmptyText
-    still_present: bool
-    message: NonEmptyText
-    evidence: TargetedDefectEvidence | None = None
-
-    @model_validator(mode="after")
-    def persistence_requires_current_source_evidence(self) -> TargetedDefectCheck:
-        if self.still_present and self.evidence is None:
-            raise ValueError("still-present semantic defect requires source evidence")
-        return self
-
-
-class CodeRepairPatch(StrictModel):
-    target_defect_id: NonEmptyText
-    rationale: Annotated[
-        str,
-        StringConstraints(strip_whitespace=True, min_length=1, max_length=1000),
-    ]
-    generator_code: str | None = None
-    validator_code: str | None = None
-
-    @model_validator(mode="after")
-    def patch_changes_at_least_one_field(self) -> CodeRepairPatch:
-        if self.generator_code is None and self.validator_code is None:
-            raise ValueError("repair patch must change at least one field")
-        if self.generator_code is not None and not self.generator_code.strip():
-            raise ValueError("generator patch cannot be blank")
-        if self.validator_code is not None and not self.validator_code.strip():
-            raise ValueError("validator patch cannot be blank")
-        if self.generator_code is not None and self.validator_code is not None:
-            raise ValueError("one repair call cannot return both generator and validator code")
-        return self
-
-
-class GeneratorGenerationSubmission(StrictModel):
-    """Generator-only wire contract for one Agent4 model call."""
-
-    format_contract_id: FormatContractId
-    generator_code: NonEmptyText
-
-
-class ValidatorGenerationSubmission(StrictModel):
-    """Validator-only wire contract for one Agent4 model call."""
-
-    format_contract_id: FormatContractId
-    validator_code: NonEmptyText
-
-
 class CodeDraft(StrictModel):
     format_contract_id: FormatContractId
     generator_code: NonEmptyText
@@ -496,22 +530,21 @@ class CodeDraft(StrictModel):
     revision_id: str | None = None
     input_revision: int | None = Field(default=None, ge=1)
     subtasks_revision: int | None = Field(default=None, ge=1)
-    trial_results: list[dict[str, Any]] = Field(default_factory=list)
     issues: list[str] = Field(default_factory=list)
 
-class Agent4VerificationCacheEntry(StrictModel):
-    candidate: CodeDraft
-    execution: dict[str, Any]
-    replayed_counterexamples: list[str] = Field(default_factory=list)
-    gates: list[str] = Field(default_factory=list)
-    role_digests: dict[Literal["solution", "generator", "validator"], NonEmptyText]
-    environment_fingerprint: NonEmptyText
 
-
-class Agent4VerificationCache(StrictModel):
-    format_version: Literal[1]
-    verifier_revision: Agent4VerifierRevision
-    candidates: dict[str, Agent4VerificationCacheEntry] = Field(default_factory=dict)
+class CodeRelease(StrictModel):
+    architecture: Literal[
+        "agent4-profiled-working-template-v3-stage3-test-data-plan"
+    ] = AGENT4_ARCHITECTURE_ID
+    format_contract_id: FormatContractId
+    revision_id: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{16}$")]
+    input_revision: int = Field(ge=1)
+    subtasks_revision: int = Field(ge=1)
+    generator_sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+    validator_sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+    content_sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+    frozen_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class WorkflowOutput(StrictModel):
@@ -526,12 +559,30 @@ class WorkflowOutput(StrictModel):
         return self
 
 
+class StageInstructionDecision(StrictModel):
+    action: Literal["answer", "revise"]
+    answer: UserInstruction
+    target: Literal["none", "current_artifact", "generator", "validator", "both"]
+
+    @model_validator(mode="after")
+    def action_matches_target(self) -> StageInstructionDecision:
+        if self.action == "answer" and self.target != "none":
+            raise ValueError("answer action must use the none target")
+        if self.action == "revise" and self.target == "none":
+            raise ValueError("revise action must select a target")
+        return self
+
+
 class DraftUpdate(StrictModel):
     draft: dict[str, Any]
 
 
 class StageRunRequest(StrictModel):
-    pass
+    user_instruction: UserInstruction | None = None
+
+
+class AutoRunRequest(StrictModel):
+    base_seed: int = 1
 
 
 class UserConfirmation(StrictModel):

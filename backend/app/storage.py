@@ -16,23 +16,21 @@ from pydantic import ValidationError
 
 from app.errors import AppError
 from app.models import (
-    AGENT4_CACHE_FORMAT_VERSION,
-    AGENT4_VERIFIER_REVISION,
-    Agent4VerificationCache,
     CodeDraft,
-    CounterexampleLedger,
+    CodeRelease,
     GlobalInput,
-    InputStructureDraft,
     ProblemInput,
     ProjectRecord,
     SolutionInput,
+    StageRecoverySummary,
     SubtaskPlanDraft,
+    TestDataPlanDraft,
 )
 from app.services.code_candidate import candidate_revision
 
 PROJECT_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 STAGE_FILES = {
-    3: "input_structure.json",
+    3: "test_data_plan.json",
     4: "subtask_plan.json",
     5: "code_review.json",
 }
@@ -62,9 +60,7 @@ class ProjectStorage:
         project_dir = self.project_dir(project_id)
         if not (project_dir / "project.json").is_file():
             raise AppError("PROJECT_NOT_FOUND", "project does not exist", status_code=404)
-        workspace_id = hashlib.sha256(
-            f"agent4-verification:{project_id}".encode()
-        ).hexdigest()[:32]
+        workspace_id = hashlib.sha256(f"agent4-verification:{project_id}".encode()).hexdigest()[:32]
         shutil.rmtree(project_dir)
         shutil.rmtree(self.project_dir(workspace_id), ignore_errors=True)
 
@@ -82,7 +78,6 @@ class ProjectStorage:
             "bin",
         ):
             (project_dir / directory).mkdir(parents=True, exist_ok=True)
-        (project_dir / "state" / "code-revisions").mkdir(parents=True, exist_ok=True)
         self._ensure_code_projection(project_dir)
         self.write_text(project_dir / "source" / "solution.cpp", input_data.solution.source)
         self.save_input(record.project_id, input_data)
@@ -94,18 +89,13 @@ class ProjectStorage:
             return GlobalInput.model_validate_json(path.read_text(encoding="utf-8"))
         record = self.load_record(project_id)
         solution = self.project_dir(project_id) / "source" / "solution.cpp"
-        structure = self.load_draft(project_id, 3)
         return GlobalInput(
             problem=ProblemInput(
                 description=record.problem_description,
                 difficulty=record.difficulty,
             ),
             solution=SolutionInput(source=solution.read_text(encoding="utf-8")),
-            input_structure={
-                "template": (structure or {}).get("template", ""),
-                "status": "confirmed" if record.stages[3].status.value == "passed" else "draft",
-                "revision": record.input_revision,
-            },
+            project_name=record.project_name,
             revision=record.input_revision,
         )
 
@@ -123,6 +113,160 @@ class ProjectStorage:
         path = self.project_dir(record.project_id) / "project.json"
         self.write_json(path, record.model_dump(mode="json"))
 
+    def start_recovery_run(
+        self,
+        project_id: str,
+        *,
+        stage: int,
+        agent_role: str,
+    ) -> StageRecoverySummary:
+        run_id = uuid4().hex
+        summary = StageRecoverySummary(run_id=run_id, stage=stage)
+        run_dir = self.project_dir(project_id) / "logs" / "agent-recovery" / run_id
+        self.write_json(
+            run_dir / "manifest.json",
+            {
+                **summary.model_dump(mode="json"),
+                "agent_role": agent_role,
+                "events": 0,
+            },
+        )
+        record = self.load_record(project_id)
+        record.recovery_summaries[stage] = summary
+        record.updated_at = datetime.now(UTC)
+        self.save_record(record)
+        return summary
+
+    def append_recovery_event(
+        self,
+        project_id: str,
+        run_id: str,
+        event: dict[str, Any],
+    ) -> None:
+        run_dir = self.project_dir(project_id) / "logs" / "agent-recovery" / run_id
+        manifest_path = run_dir / "manifest.json"
+        if not manifest_path.is_file():
+            raise AppError("RECOVERY_RUN_NOT_FOUND", "恢复运行记录不存在。", status_code=500)
+        operation = str(event.get("operation") or "event")
+        generation_round = int(event.get("generation_round") or 0)
+        repair_attempt = int(event.get("repair_attempt") or 0)
+        suffix = f"repair-{repair_attempt:02d}" if repair_attempt else "generate"
+        filename = f"{operation}-{suffix}.json"
+        event_path = run_dir / f"round-{generation_round:02d}" / filename
+        if event_path.exists():
+            event_path = event_path.with_name(f"{event_path.stem}-{uuid4().hex[:8]}.json")
+        payload = {
+            **event,
+            "raw_output": self._bounded_recovery_text(event.get("raw_output")),
+            "timestamp": datetime.now(UTC).isoformat(),
+        }
+        self.write_json(event_path, payload)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["events"] = int(manifest.get("events") or 0) + 1
+        if operation == "repair":
+            manifest["repair_calls"] = int(manifest.get("repair_calls") or 0) + 1
+        self.write_json(manifest_path, manifest)
+        record = self.load_record(project_id)
+        current = record.recovery_summaries.get(int(event.get("stage") or 0))
+        if current is not None and current.run_id == run_id:
+            errors = event.get("validation_errors")
+            last_error = ""
+            if isinstance(errors, list):
+                last_error = "；".join(
+                    str(item.get("message") or "")
+                    for item in errors
+                    if isinstance(item, dict) and item.get("message")
+                )[:1000]
+            record.recovery_summaries[current.stage] = current.model_copy(
+                update={
+                    "generation_round": generation_round,
+                    "repair_attempts": int(manifest.get("repair_calls") or 0),
+                    "last_error_summary": last_error,
+                }
+            )
+            record.updated_at = datetime.now(UTC)
+            self.save_record(record)
+
+    def finish_recovery_run(
+        self,
+        project_id: str,
+        summary: StageRecoverySummary,
+    ) -> StageRecoverySummary:
+        finished = summary.model_copy(
+            update={"finished_at": summary.finished_at or datetime.now(UTC)}
+        )
+        run_dir = self.project_dir(project_id) / "logs" / "agent-recovery" / finished.run_id
+        manifest_path = run_dir / "manifest.json"
+        manifest = (
+            json.loads(manifest_path.read_text(encoding="utf-8"))
+            if manifest_path.is_file()
+            else {}
+        )
+        self.write_json(manifest_path, {**manifest, **finished.model_dump(mode="json")})
+        record = self.load_record(project_id)
+        record.recovery_summaries[finished.stage] = finished
+        record.updated_at = datetime.now(UTC)
+        self.save_record(record)
+        return finished
+
+    def resume_recovery_run(
+        self,
+        project_id: str,
+        summary: StageRecoverySummary,
+        *,
+        agent_role: str,
+    ) -> StageRecoverySummary:
+        resumed = summary.model_copy(
+            update={"status": "running", "finished_at": None}
+        )
+        run_dir = self.project_dir(project_id) / "logs" / "agent-recovery" / resumed.run_id
+        manifest_path = run_dir / "manifest.json"
+        if not manifest_path.is_file():
+            return self.start_recovery_run(
+                project_id,
+                stage=resumed.stage,
+                agent_role=agent_role,
+            )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.write_json(manifest_path, {**manifest, **resumed.model_dump(mode="json")})
+        record = self.load_record(project_id)
+        record.recovery_summaries[resumed.stage] = resumed
+        record.updated_at = datetime.now(UTC)
+        self.save_record(record)
+        return resumed
+
+    def load_recovery_manifest(self, project_id: str, run_id: str) -> dict[str, Any]:
+        if not re.fullmatch(r"[0-9a-f]{32}", run_id):
+            raise AppError("RECOVERY_RUN_NOT_FOUND", "恢复运行记录不存在。", status_code=404)
+        path = self.project_dir(project_id) / "logs" / "agent-recovery" / run_id / "manifest.json"
+        if not path.is_file():
+            raise AppError("RECOVERY_RUN_NOT_FOUND", "恢复运行记录不存在。", status_code=404)
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+
+    def clear_working_draft(self, project_id: str, stage: int) -> None:
+        project_dir = self.project_dir(project_id)
+        if stage == 3:
+            (project_dir / "state" / STAGE_FILES[3]).unlink(missing_ok=True)
+            (project_dir / "state" / STAGE_FILES[4]).unlink(missing_ok=True)
+            self._discard_working_template(project_dir)
+        elif stage == 4:
+            (project_dir / "state" / STAGE_FILES[4]).unlink(missing_ok=True)
+            self._discard_working_template(project_dir)
+        elif stage == 5:
+            self._discard_working_template(project_dir)
+        else:
+            raise AppError("INVALID_STAGE", "只能清空阶段 3、4 或 5 的工作草稿。", stage=stage)
+        self._ensure_code_projection(project_dir)
+
+    @staticmethod
+    def _bounded_recovery_text(value: Any) -> str:
+        text = value if isinstance(value, str) else ""
+        limit = 40_000
+        if len(text) <= limit:
+            return text
+        return f"{text[:20_000]}\n...<truncated {len(text) - limit} chars>...\n{text[-20_000:]}"
+
     def load_draft(self, project_id: str, stage: int) -> dict[str, Any] | None:
         filename = STAGE_FILES.get(stage)
         if filename is None:
@@ -137,7 +281,7 @@ class ProjectStorage:
             return None
         value = json.loads(path.read_text(encoding="utf-8"))
         if stage == 3:
-            return InputStructureDraft.model_validate(value).model_dump(mode="json")
+            return TestDataPlanDraft.model_validate(value).model_dump(mode="json")
         if stage == 4:
             return SubtaskPlanDraft.model_validate(value).model_dump(mode="json")
         try:
@@ -165,27 +309,24 @@ class ProjectStorage:
             with suppress(FileNotFoundError):
                 (project_dir / "state" / filename).unlink()
 
-        if stage < 5:
-            with suppress(FileNotFoundError):
-                (project_dir / "state" / "current-code").unlink()
-            shutil.rmtree(project_dir / "state" / "code-revisions", ignore_errors=True)
-            (project_dir / "state" / "code-revisions").mkdir(parents=True, exist_ok=True)
-            self._ensure_code_projection(project_dir)
-
-        for filename in (
-            "batch.json",
-        ):
-            with suppress(FileNotFoundError):
-                (project_dir / "state" / filename).unlink()
-
-        if stage < 5:
+        if stage <= 5:
+            if stage < 5:
+                self._discard_working_template(project_dir)
+                shutil.rmtree(project_dir / "state" / "code-revisions", ignore_errors=True)
+                shutil.rmtree(project_dir / "state" / "released-code", ignore_errors=True)
             for filename in (
                 "agent4-ledger.json",
                 "agent4-cache.json",
                 "agent4-last-valid-candidate.json",
             ):
-                with suppress(FileNotFoundError):
-                    (project_dir / "state" / filename).unlink()
+                (project_dir / "state" / filename).unlink(missing_ok=True)
+            for filename in ("agent4-decisions.jsonl", "agent4-timings.jsonl"):
+                (project_dir / "logs" / filename).unlink(missing_ok=True)
+            self._ensure_code_projection(project_dir)
+
+        for filename in ("batch.json",):
+            with suppress(FileNotFoundError):
+                (project_dir / "state" / filename).unlink()
 
         for directory in ("preview", "data", "bin", "export"):
             self.clear_directory(project_id, directory)
@@ -194,46 +335,175 @@ class ProjectStorage:
         digest = candidate_revision(draft)
         saved = draft.model_copy(update={"revision_id": digest})
         project_dir = self.project_dir(project_id)
-        revisions = project_dir / "state" / "code-revisions"
-        revisions.mkdir(parents=True, exist_ok=True)
-        revision_dir = revisions / digest
-        if not revision_dir.exists():
-            temporary = revisions / f".{digest}.{uuid4().hex}"
-            try:
-                self.write_text(
-                    temporary / "generated" / "generator.cpp",
-                    saved.generator_code,
-                )
-                self.write_text(
-                    temporary / "generated" / "validator.cpp",
-                    saved.validator_code,
-                )
-                self.write_json(temporary / STAGE_FILES[5], saved.model_dump(mode="json"))
-                os.replace(temporary, revision_dir)
-            except Exception:
-                shutil.rmtree(temporary, ignore_errors=True)
-                raise
-        self._ensure_code_projection(project_dir)
+        temporary = project_dir / "state" / f".working-code.{uuid4().hex}"
+        self.write_text(temporary / "generated" / "generator.cpp", saved.generator_code)
+        self.write_text(temporary / "generated" / "validator.cpp", saved.validator_code)
+        self.write_json(temporary / STAGE_FILES[5], saved.model_dump(mode="json"))
         current = project_dir / "state" / "current-code"
         temporary_link = project_dir / "state" / f".current-code.{uuid4().hex}"
+        previous = self._owned_projection_target(project_dir, current)
         try:
-            temporary_link.symlink_to(
-                Path("code-revisions") / digest,
-                target_is_directory=True,
-            )
+            temporary_link.symlink_to(temporary.name, target_is_directory=True)
             os.replace(temporary_link, current)
+            self._set_code_projection(project_dir, Path("state/current-code/generated"))
         finally:
             with suppress(FileNotFoundError):
                 temporary_link.unlink()
+        if previous is not None and previous != temporary:
+            shutil.rmtree(previous, ignore_errors=True)
         return saved
+
+    def freeze_code_release(
+        self,
+        project_id: str,
+        *,
+        input_revision: int,
+        subtasks_revision: int,
+    ) -> CodeRelease:
+        draft_raw = self.load_draft(project_id, 5)
+        if draft_raw is None:
+            raise AppError("PREREQUISITE_REQUIRED", "缺少阶段五工作模板。", stage=5)
+        draft = CodeDraft.model_validate(draft_raw)
+        if (
+            draft.input_revision != input_revision
+            or draft.subtasks_revision != subtasks_revision
+            or draft.revision_id is None
+        ):
+            raise AppError(
+                "STALE_CODE",
+                "当前工作模板不是基于最新 INPUT 和 SUBTASKS 生成的。",
+                stage=5,
+                status_code=409,
+            )
+        generator_sha256 = hashlib.sha256(draft.generator_code.encode("utf-8")).hexdigest()
+        validator_sha256 = hashlib.sha256(draft.validator_code.encode("utf-8")).hexdigest()
+        content_sha256 = hashlib.sha256(
+            draft.generator_code.encode("utf-8") + b"\0" + draft.validator_code.encode("utf-8")
+        ).hexdigest()
+        release = CodeRelease(
+            format_contract_id=draft.format_contract_id,
+            revision_id=draft.revision_id,
+            input_revision=input_revision,
+            subtasks_revision=subtasks_revision,
+            generator_sha256=generator_sha256,
+            validator_sha256=validator_sha256,
+            content_sha256=content_sha256,
+        )
+        project_dir = self.project_dir(project_id)
+        release_dir = project_dir / "state" / "released-code"
+        existing = self.load_code_release(project_id)
+        if existing is not None and existing.content_sha256 == release.content_sha256:
+            self._set_code_projection(project_dir, Path("state/released-code/generated"))
+            return existing
+        temporary = project_dir / "state" / f".released-code.{uuid4().hex}"
+        archived: Path | None = None
+        try:
+            self.write_text(
+                temporary / "generated" / "generator.cpp",
+                draft.generator_code,
+            )
+            self.write_text(
+                temporary / "generated" / "validator.cpp",
+                draft.validator_code,
+            )
+            self.write_json(temporary / STAGE_FILES[5], draft.model_dump(mode="json"))
+            self.write_json(temporary / "release.json", release.model_dump(mode="json"))
+            if existing is not None:
+                history = project_dir / "state" / "released-code-history"
+                history.mkdir(parents=True, exist_ok=True)
+                archived = history / existing.revision_id
+                if archived.exists():
+                    archived = history / f"{existing.revision_id}-{uuid4().hex[:8]}"
+                os.replace(release_dir, archived)
+            os.replace(temporary, release_dir)
+        except Exception:
+            shutil.rmtree(temporary, ignore_errors=True)
+            if archived is not None and archived.exists() and not release_dir.exists():
+                os.replace(archived, release_dir)
+            raise
+        self._set_code_projection(project_dir, Path("state/released-code/generated"))
+        return release
+
+    def load_code_release(self, project_id: str) -> CodeRelease | None:
+        path = self.project_dir(project_id) / "state" / "released-code" / "release.json"
+        if not path.is_file():
+            return None
+        try:
+            return CodeRelease.model_validate_json(path.read_text(encoding="utf-8"))
+        except ValidationError as exc:
+            raise AppError(
+                "CODE_RELEASE_INVALID",
+                "冻结的阶段五发布快照元数据无效。",
+                stage=5,
+                status_code=409,
+            ) from exc
+
+    def verify_code_release(self, project_id: str) -> CodeRelease:
+        release = self.load_code_release(project_id)
+        if release is None:
+            raise AppError("PREREQUISITE_REQUIRED", "缺少已确认的代码发布快照。", stage=5)
+        root = self.project_dir(project_id) / "state" / "released-code" / "generated"
+        generator = root / "generator.cpp"
+        validator = root / "validator.cpp"
+        if not generator.is_file() or not validator.is_file():
+            raise AppError("CODE_RELEASE_INVALID", "冻结的代码发布快照不完整。", stage=5)
+        generator_sha256 = hashlib.sha256(generator.read_bytes()).hexdigest()
+        validator_sha256 = hashlib.sha256(validator.read_bytes()).hexdigest()
+        content_sha256 = hashlib.sha256(
+            generator.read_bytes() + b"\0" + validator.read_bytes()
+        ).hexdigest()
+        if (
+            generator_sha256 != release.generator_sha256
+            or validator_sha256 != release.validator_sha256
+            or content_sha256 != release.content_sha256
+        ):
+            raise AppError(
+                "CODE_RELEASE_HASH_MISMATCH",
+                "冻结的代码发布快照内容哈希不匹配。",
+                stage=5,
+                status_code=409,
+            )
+        self._set_code_projection(
+            self.project_dir(project_id),
+            Path("state/released-code/generated"),
+        )
+        return release
+
+    @staticmethod
+    def _owned_projection_target(project_dir: Path, link: Path) -> Path | None:
+        if not link.is_symlink():
+            return None
+        target = Path(os.readlink(link))
+        if target.is_absolute() or target.parent != Path("."):
+            return None
+        return project_dir / "state" / target
+
+    @classmethod
+    def _discard_working_template(cls, project_dir: Path) -> None:
+        current = project_dir / "state" / "current-code"
+        target = cls._owned_projection_target(project_dir, current)
+        with suppress(FileNotFoundError):
+            current.unlink()
+        if target is not None:
+            shutil.rmtree(target, ignore_errors=True)
+        for path in (project_dir / "state").glob(".working-code.*"):
+            shutil.rmtree(path, ignore_errors=True)
 
     @staticmethod
     def _ensure_code_projection(project_dir: Path) -> None:
-        """Expose one immutable code bundle through the stable generated path."""
+        target = (
+            Path("state/released-code/generated")
+            if (project_dir / "state" / "released-code" / "release.json").is_file()
+            else Path("state/current-code/generated")
+        )
+        ProjectStorage._set_code_projection(project_dir, target)
+
+    @staticmethod
+    def _set_code_projection(project_dir: Path, target: Path) -> None:
+        """Atomically point the runner at the working template or frozen release."""
 
         generated = project_dir / "generated"
-        expected = Path("state") / "current-code" / "generated"
-        if generated.is_symlink() and Path(os.readlink(generated)) == expected:
+        if generated.is_symlink() and Path(os.readlink(generated)) == target:
             return
         if generated.is_symlink() or generated.is_file():
             generated.unlink()
@@ -241,7 +511,7 @@ class ProjectStorage:
             shutil.rmtree(generated)
         temporary = project_dir / f".generated.{uuid4().hex}"
         try:
-            temporary.symlink_to(expected, target_is_directory=True)
+            temporary.symlink_to(target, target_is_directory=True)
             os.replace(temporary, generated)
         finally:
             with suppress(FileNotFoundError):
@@ -281,89 +551,8 @@ class ProjectStorage:
         return workspace_id
 
     def current_revision(self, project_id: str) -> str | None:
-        draft = self.load_draft(project_id, 5)
-        return None if draft is None else draft.get("revision_id")
-
-    def load_agent4_ledger(self, project_id: str) -> dict[str, Any]:
-        path = self.project_dir(project_id) / "state" / "agent4-ledger.json"
-        if not path.is_file():
-            return CounterexampleLedger(
-                verifier_revision=AGENT4_VERIFIER_REVISION
-            ).model_dump(mode="json")
-        try:
-            return CounterexampleLedger.model_validate_json(
-                path.read_text(encoding="utf-8")
-            ).model_dump(mode="json")
-        except ValidationError as exc:
-            raise _incompatible_agent4_state("counterexample ledger", exc) from exc
-
-    def save_agent4_ledger(self, project_id: str, value: dict[str, Any]) -> None:
-        validated = CounterexampleLedger.model_validate(value)
-        self.write_json(
-            self.project_dir(project_id) / "state" / "agent4-ledger.json",
-            validated.model_dump(mode="json"),
-        )
-
-    def load_agent4_cache(self, project_id: str) -> dict[str, Any]:
-        path = self.project_dir(project_id) / "state" / "agent4-cache.json"
-        if not path.is_file():
-            return Agent4VerificationCache(
-                format_version=AGENT4_CACHE_FORMAT_VERSION,
-                verifier_revision=AGENT4_VERIFIER_REVISION,
-            ).model_dump(mode="json")
-        try:
-            return Agent4VerificationCache.model_validate_json(
-                path.read_text(encoding="utf-8")
-            ).model_dump(mode="json")
-        except ValidationError as exc:
-            raise _incompatible_agent4_state("verification cache", exc) from exc
-
-    def save_agent4_cache(self, project_id: str, value: dict[str, Any]) -> None:
-        validated = Agent4VerificationCache.model_validate(value)
-        self.write_json(
-            self.project_dir(project_id) / "state" / "agent4-cache.json",
-            validated.model_dump(mode="json"),
-        )
-
-    def save_agent4_last_valid_candidate(self, project_id: str, value: dict[str, Any]) -> None:
-        validated = CodeDraft.model_validate(value)
-        self.write_json(
-            self.project_dir(project_id) / "state" / "agent4-last-valid-candidate.json",
-            validated.model_dump(mode="json"),
-        )
-
-    def load_agent4_last_valid_candidate(self, project_id: str) -> dict[str, Any] | None:
-        path = self.project_dir(project_id) / "state" / "agent4-last-valid-candidate.json"
-        if not path.is_file():
-            return None
-        try:
-            return CodeDraft.model_validate_json(
-                path.read_text(encoding="utf-8")
-            ).model_dump(mode="json")
-        except ValidationError as exc:
-            raise _incompatible_agent4_state("last valid candidate", exc) from exc
-
-    def append_agent4_decision(self, project_id: str, entry: dict[str, Any]) -> None:
-        path = self.project_dir(project_id) / "logs" / "agent4-decisions.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
-
-    def load_agent4_decisions(self, project_id: str) -> list[dict[str, Any]]:
-        path = self.project_dir(project_id) / "logs" / "agent4-decisions.jsonl"
-        if not path.is_file():
-            return []
-        events: list[dict[str, Any]] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict):
-                events.append(value)
-        return events
+        release = self.load_code_release(project_id)
+        return None if release is None else release.revision_id
 
     def load_batch_manifest(self, project_id: str) -> dict[str, Any] | None:
         path = self.project_dir(project_id) / "state" / "batch.json"
@@ -374,30 +563,6 @@ class ProjectStorage:
 
     def save_batch_manifest(self, project_id: str, value: dict[str, Any]) -> None:
         self.write_json(self.project_dir(project_id) / "state" / "batch.json", value)
-
-    def append_agent4_timing(self, project_id: str, entry: dict[str, Any]) -> None:
-        """Append one stage-5 timing event without candidate or source content."""
-        path = self.project_dir(project_id) / "logs" / "agent4-timings.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        value = {"timestamp": datetime.now(UTC).isoformat(), **entry}
-        with path.open("a", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n")
-
-    def load_agent4_timings(self, project_id: str) -> list[dict[str, Any]]:
-        path = self.project_dir(project_id) / "logs" / "agent4-timings.jsonl"
-        if not path.is_file():
-            return []
-        events: list[dict[str, Any]] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict):
-                events.append(value)
-        return events
 
     def clear_directory(self, project_id: str, name: str) -> Path:
         if name not in {"preview", "data", "bin", "export"}:
@@ -416,6 +581,11 @@ class ProjectStorage:
         for child in path.iterdir():
             if child.is_file() and child.name.startswith(prefixes):
                 child.unlink()
+        return path
+
+    def save_generator_analysis(self, project_id: str, value: dict[str, Any]) -> Path:
+        path = self.project_dir(project_id) / "state" / "generator-analysis.json"
+        self.write_json(path, value)
         return path
 
     @staticmethod

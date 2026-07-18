@@ -11,8 +11,6 @@ from uuid import uuid4
 from app.config import Settings
 from app.errors import AppError
 from app.models import Stage, StageStatus, Subtask, SubtaskPlanDraft
-from app.services.counterexample_ledger import CounterexampleLedgerService
-from app.services.defects import defects_from_execution
 from app.services.project_service import ProjectService
 from app.services.runtime_parameters import profile_for_case, serialized_arguments
 from app.services.sandbox import GenerationJob, Sandbox, ValidationJob
@@ -58,16 +56,27 @@ class DatasetService:
             )
         plan = self._load_plan(project_id)
         selected = self._select_subtasks(plan, selected_subtask_ids)
-        code_revision = self.storage.current_revision(project_id)
-        if code_revision is None:
-            raise AppError("PREREQUISITE_REQUIRED", "缺少已确认的代码修订。", stage=5)
+        release = self.storage.verify_code_release(project_id)
+        if (
+            release.input_revision != record.input_revision
+            or release.subtasks_revision != record.subtasks_revision
+        ):
+            raise AppError(
+                "STALE_CODE",
+                "冻结的代码发布快照不对应当前 INPUT 和 SUBTASKS。",
+                stage=5,
+                status_code=409,
+            )
         manifest: dict[str, Any] = {
             "batch_id": uuid4().hex,
             "status": "generating",
             "workflow_revision": record.workflow_revision,
             "input_revision": record.input_revision,
             "subtasks_revision": record.subtasks_revision,
-            "code_revision": code_revision,
+            "code_revision": release.revision_id,
+            "code_content_sha256": release.content_sha256,
+            "generator_sha256": release.generator_sha256,
+            "validator_sha256": release.validator_sha256,
             "base_seed": base_seed,
             "selected_subtasks": [subtask.id for subtask in selected],
             "files": [],
@@ -112,11 +121,7 @@ class DatasetService:
                 for chunk in self._chunks(jobs, self.settings.runner_batch_size)
             )
         )
-        outcomes = {
-            outcome.output_relative: outcome
-            for batch in batches
-            for outcome in batch
-        }
+        outcomes = {outcome.output_relative: outcome for batch in batches for outcome in batch}
         generated_count = 0
         for job in jobs:
             subtask, internal_id, seed, stem = job_details[job.output_relative]
@@ -246,9 +251,7 @@ class DatasetService:
                             "subtask_id": subtask.id,
                             "case_id": internal_id,
                             "seed": batch_entry.get("seed"),
-                            "runtime_arguments": batch_entry.get(
-                                "runtime_arguments", {}
-                            ),
+                            "runtime_arguments": batch_entry.get("runtime_arguments", {}),
                         },
                     )
                 jobs.append(ValidationJob(input_relative, output_relative))
@@ -260,14 +263,9 @@ class DatasetService:
                 for chunk in self._chunks(jobs, self.settings.runner_batch_size)
             )
         )
-        outcomes = {
-            outcome.input_relative: outcome
-            for batch in batches
-            for outcome in batch
-        }
+        outcomes = {outcome.input_relative: outcome for batch in batches for outcome in batch}
         file_index = {
-            (item.get("subtask_id"), item.get("internal_id")): item
-            for item in manifest["files"]
+            (item.get("subtask_id"), item.get("internal_id")): item for item in manifest["files"]
         }
         validated_count = 0
         for job in jobs:
@@ -345,8 +343,7 @@ class DatasetService:
             )
         manifest = self.storage.load_batch_manifest(project_id)
         if manifest is not None and (
-            manifest.get("status") != "completed"
-            or not self._manifest_matches(record, manifest)
+            manifest.get("status") != "completed" or not self._manifest_matches(record, manifest)
         ):
             raise AppError(
                 "EXPORT_NOT_READY",
@@ -377,9 +374,7 @@ class DatasetService:
         if raw is None:
             raise AppError("PREREQUISITE_REQUIRED", "缺少子任务配置。", stage=4)
         plan = SubtaskPlanDraft.model_validate(raw)
-        missing = [
-            subtask.id for subtask in plan.subtasks if not subtask.runtime_parameters
-        ]
+        missing = [subtask.id for subtask in plan.subtasks if not subtask.runtime_parameters]
         if missing:
             raise AppError(
                 "PREREQUISITE_REQUIRED",
@@ -431,41 +426,17 @@ class DatasetService:
             "message": message,
             "checks": [check],
         }
-        defects = defects_from_execution(execution)
-        if len(defects) != 1:
-            raise AppError(
-                "AGENT4_DEFECT_NORMALIZATION_FAILED",
-                "后续阶段失败无法转换为唯一稳定缺陷。",
-                stage=5,
-            )
-        defect = defects[0]
-        revision = self.storage.current_revision(project_id)
-        if revision is None:
-            raise AppError(
-                "AGENT4_STATE_INCOMPATIBLE",
-                "后续阶段失败缺少当前阶段五候选修订。",
-                stage=5,
-                status_code=409,
-            )
-        ledger_service = CounterexampleLedgerService(self.storage)
-        ledger = ledger_service.load(project_id)
-        ledger_service.observe(
-            project_id,
-            ledger,
-            [defect],
-            revision,
-            closable_defect_ids=set(),
-        )
+        release = self.storage.verify_code_release(project_id)
         entry = {
             "code": code,
             "message": message,
-            "defect_id": defect.defect_id,
-            "defect": defect.model_dump(mode="json"),
             "workflow_revision": record.workflow_revision,
             "input_revision": record.input_revision,
             "subtasks_revision": record.subtasks_revision,
-            "code_revision": self.storage.current_revision(project_id),
+            "code_revision": release.revision_id,
+            "code_content_sha256": release.content_sha256,
             "check": check,
+            "execution": execution,
         }
         manifest = self.storage.load_batch_manifest(project_id)
         if manifest is not None:
@@ -492,11 +463,13 @@ class DatasetService:
         }.get(code, "unknown")
 
     def _manifest_matches(self, record: Any, manifest: dict[str, Any]) -> bool:
+        release = self.storage.verify_code_release(record.project_id)
         return (
             manifest.get("workflow_revision", 1) == record.workflow_revision
             and manifest.get("input_revision") == record.input_revision
             and manifest.get("subtasks_revision") == record.subtasks_revision
-            and manifest.get("code_revision") == self.storage.current_revision(record.project_id)
+            and manifest.get("code_revision") == release.revision_id
+            and manifest.get("code_content_sha256") == release.content_sha256
         )
 
     @staticmethod

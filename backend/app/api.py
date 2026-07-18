@@ -7,6 +7,7 @@ from fastapi.responses import FileResponse
 
 from app.errors import AppError
 from app.models import (
+    AutoRunRequest,
     DraftUpdate,
     GenerateRequest,
     ModelConfigurationUpdate,
@@ -17,7 +18,6 @@ from app.models import (
     UserConfirmation,
     ValidateRequest,
 )
-from app.services.timing_report import summarize_agent4_timings
 
 router = APIRouter()
 
@@ -77,7 +77,11 @@ async def create_project(payload: ProjectCreate, request: Request) -> dict:
 
 @router.get("/api/projects")
 async def list_projects(request: Request) -> dict:
-    return {"projects": request.app.state.projects.list_history()}
+    pipeline = request.app.state.pipeline
+    projects = request.app.state.projects.list_history()
+    for project in projects:
+        project["active_task"] = pipeline.project_lock(project["project_id"]).locked()
+    return {"projects": projects}
 
 
 @router.get("/api/projects/{project_id}")
@@ -87,9 +91,15 @@ async def get_project(project_id: str, request: Request) -> dict:
     drafts = {str(stage): storage.load_draft(project_id, stage) for stage in (3, 4, 5)}
     return {
         "project": record.model_dump(mode="json"),
+        "active_task": request.app.state.pipeline.project_lock(project_id).locked(),
         "input": storage.load_input(project_id).model_dump(mode="json"),
         "subtasks": (drafts["4"] or {}).get("subtasks", []),
         "drafts": drafts,
+        "code_release": (
+            release.model_dump(mode="json")
+            if (release := storage.load_code_release(project_id)) is not None
+            else None
+        ),
     }
 
 
@@ -114,34 +124,6 @@ async def delete_project(project_id: str, request: Request) -> dict:
     return {"deleted_project_id": deleted.project_id}
 
 
-@router.get("/api/projects/{project_id}/stage5/timings")
-async def get_stage5_timings(project_id: str, request: Request, run_id: str | None = None) -> dict:
-    request.app.state.projects.get(project_id)
-    events = request.app.state.storage.load_agent4_timings(project_id)
-    if run_id is not None:
-        events = [event for event in events if event.get("run_id") == run_id]
-    return {
-        "events": events,
-        "runs": summarize_agent4_timings(events),
-    }
-
-
-@router.get("/api/projects/{project_id}/stage5/decisions")
-async def get_stage5_decisions(
-    project_id: str, request: Request, run_id: str | None = None
-) -> dict:
-    request.app.state.projects.get(project_id)
-    storage = request.app.state.storage
-    events = storage.load_agent4_decisions(project_id)
-    if run_id is not None:
-        events = [event for event in events if event.get("run_id") == run_id]
-    return {
-        "events": events,
-        "counterexample_ledger": storage.load_agent4_ledger(project_id),
-        "last_valid_candidate": storage.load_agent4_last_valid_candidate(project_id),
-    }
-
-
 @router.put("/api/projects/{project_id}/solution")
 async def update_solution(project_id: str, payload: SolutionUpdate, request: Request) -> dict:
     record = request.app.state.projects.update_solution(project_id, payload)
@@ -162,6 +144,19 @@ async def compile_solution(project_id: str, request: Request) -> dict:
     return await request.app.state.pipeline.compile_solution(project_id)
 
 
+@router.post("/api/projects/{project_id}/auto-run")
+async def auto_run(project_id: str, payload: AutoRunRequest, request: Request) -> dict:
+    pipeline = request.app.state.pipeline
+    lock = pipeline.project_lock(project_id)
+    if lock.locked():
+        raise AppError(
+            "PROJECT_BUSY",
+            "项目已有任务正在运行。",
+            status_code=409,
+        )
+    return await pipeline.auto_run(project_id, payload.base_seed)
+
+
 @router.put("/api/projects/{project_id}/stages/{stage}/draft")
 async def update_draft(project_id: str, stage: int, payload: DraftUpdate, request: Request) -> dict:
     pipeline = request.app.state.pipeline
@@ -180,7 +175,7 @@ async def update_draft(project_id: str, stage: int, payload: DraftUpdate, reques
 
 @router.post("/api/projects/{project_id}/stages/{stage}/run")
 async def run_stage(
-    project_id: str, stage: int, _payload: StageRunRequest, request: Request
+    project_id: str, stage: int, payload: StageRunRequest, request: Request
 ) -> dict:
     lock = request.app.state.pipeline.project_lock(project_id)
     if lock.locked():
@@ -190,7 +185,9 @@ async def run_stage(
             stage=stage,
             status_code=409,
         )
-    return await request.app.state.pipeline.run_stage(project_id, stage)
+    return await request.app.state.pipeline.run_stage(
+        project_id, stage, user_instruction=payload.user_instruction
+    )
 
 
 @router.post("/api/projects/{project_id}/stages/{stage}/confirm")
